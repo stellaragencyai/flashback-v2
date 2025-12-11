@@ -1,0 +1,287 @@
+# config/subaccounts.yaml
+#
+# Flashback — Subaccount Registry (v2)
+#
+# This file declares all logical accounts Flashback cares about.
+# It MUST stay in sync with config/strategies.yaml (sub_uid, name, role, automation_mode).
+#
+# Mapping:
+#   - account_label: internal slug (flashback01..10, main)
+#   - sub_uid:       Bybit unified subaccount UID (or null for MAIN)
+
+version: 2
+notes: |
+  v2:
+    - Synced explicitly with strategies.yaml v4.
+    - Each entry maps:
+        * account_label  -> human-friendly slug ("main", "flashback01", ...)
+        * sub_uid        -> Bybit unified subaccount UID (or null for MAIN)
+        * role           -> strategy role (trend_follow, breakout_momentum, etc.)
+        * strategy_name  -> name from strategies.yaml
+        * ai_profile     -> should match strategies.yaml
+        * automation_mode-> should match strategies.yaml
+        * enable_tp_sl   -> whether TP/SL manager should manage exits
+        * enable_journal -> whether trade_journal should log executions
+        * enable_ai_stack-> whether supervisor_ai_stack should run for this label
+
+accounts:
+  # --------------------------------------------------------
+  # MAIN — Unified main account (manual entries, bot exits)
+  # --------------------------------------------------------
+  - account_label: main
+    sub_uid: null           # MAIN unified account (no sub UID)
+    role: main
+    strategy_name: main_manual
+    enabled: true
+
+    telegram_channel: main
+    risk_profile: main_manual
+
+    enable_tp_sl: true
+    enable_journal: true
+    enable_ai_stack: false
+
+    ai_profile: manual_v1
+    automation_mode: OFF
+
+    notes: |
+      Unified MAIN account. You enter manually, TP/SL manager can
+      manage exits using standard_5 / standard_10 profile (see strategies.yaml).
+      Executor/AI must not place live orders here.
+
+  # --------------------------------------------------------
+  # Sub1 — Trend-follow (primary clean trend follower)
+  # Bybit sub UID: 524630315
+  # --------------------------------------------------------
+  - account_label: flashback01
+    sub_uid: 524630315
+    role: trend_follow
+    strategy_name: Sub1_Trend
+    enabled: true
+
+    telegram_channel: sub1
+    risk_profile: default_sub
+
+    enable_tp_sl: true
+    enable_journal: true
+    enable_ai_stack: true
+
+    ai_profile: trend_v1
+    automation_mode: LEARN_DRY
+
+    notes: |
+      Primary clean trend follower. LEARN_DRY for now; AI + logging only.
+
+  # --------------------------------------------------------
+  # Sub2 — Breakout / Momentum
+  # Bybit sub UID: 524633243
+  # --------------------------------------------------------
+  - account_label: flashback02
+    sub_uid: 524633243
+    role: breakout_momentum
+    strategy_name: Sub2_Breakout
+    enabled: true
+
+    telegram_channel: sub2
+    risk_profile: default_sub
+
+    enable_tp_sl: true
+    enable_journal: true
+    enable_ai_stack: true
+
+    ai_profile: breakout_v1
+    automation_mode: LEARN_DRY
+
+    notes: |
+      Aggressive breakout / momentum hunter. Large symbol basket,
+      but currently LEARN_DRY (no live orders, AI watching only).
+
+  # --------------------------------------------------------
+  # Sub3 — Intraday scalp (majors + liquid alts)
+  # Bybit sub UID: 524634622
+  # --------------------------------------------------------
+  - account_label: flashback03
+    sub_uid: 524634622
+    role: scalp_intraday
+    strategy_name: Sub3_ScalpMajors
+    enabled: true
+
+    telegram_channel: sub3
+    risk_profile: default_sub
+
+    enable_tp_sl: true
+    enable_journal: true
+    enable_ai_stack: true
+
+    ai_profile: scalp_v1
+    automation_mode: LEARN_DRY
+
+    notes: |
+      Intraday scalps in majors/liquid alts. LEARN_DRY only until
+      fills and behavior are proven.
+
+  # --------------------------------------------------------
+  # Sub4 — Swing Reversion / Mean Reversion
+  # Bybit sub UID: 524636309
+  # --------------------------------------------------------
+  - account_label: flashback04
+    sub_uid: 524636309
+    role: swing_reversion
+    strategy_name: Sub4_SwingRevert
+    enabled: true
+
+    telegram_channel: sub4
+    risk_profile: default_sub
+
+    enable_tp_sl: true
+    enable_journal: true
+    enable_ai_stack: true
+
+    ai_profile: reversion_v1
+    automation_mode: LEARN_DRY
+
+    notes: |
+      1h/4h swing reversion on majors / big caps. LEARN_DRY,
+      with exit_profile custom_5_tbd for later tuning.
+
+  # --------------------------------------------------------
+  # Sub5 — HFT / Market-Maker
+  # Bybit sub UID: 524637467
+  # --------------------------------------------------------
+  - account_label: flashback05
+    sub_uid: 524637467
+    role: hft_market_maker
+    strategy_name: Sub5_HFT_MM
+    enabled: true
+
+    telegram_channel: sub5
+    risk_profile: hft_mm
+
+    enable_tp_sl: true
+    enable_journal: true
+    enable_ai_stack: true
+
+    ai_profile: hft_mm_v1
+    automation_mode: LEARN_DRY
+
+    notes: |
+      HFT / microstructure sandbox. LEARN_DRY only while we validate
+      PnL, latency and Portfolio Guard interactions.
+
+  # --------------------------------------------------------
+  # Sub6 — Microcap / Speculative
+  # Bybit sub UID: 524638768
+  # --------------------------------------------------------
+  - account_label: flashback06
+    sub_uid: 524638768
+    role: microcap_spec
+    strategy_name: Sub6_Speculative
+    enabled: true
+
+    telegram_channel: sub6
+    risk_profile: spec_small
+
+    enable_tp_sl: true
+    enable_journal: true
+    enable_ai_stack: true
+
+    ai_profile: spec_v1
+    automation_mode: LEARN_DRY
+
+    notes: |
+      Chaos pen for degen pairs. LEARN_DRY for now, later candidate
+      for LIVE_CANARY with tight risk.
+
+  # --------------------------------------------------------
+  # Sub7 — Canary / Experimental
+  # Bybit sub UID: 524649709
+  # --------------------------------------------------------
+  - account_label: flashback07
+    sub_uid: 524649709
+    role: canary_experimental
+    strategy_name: Sub7_Canary
+    enabled: true
+
+    telegram_channel: sub7
+    risk_profile: canary_low_risk
+
+    enable_tp_sl: true
+    enable_journal: true
+    enable_ai_stack: true
+
+    ai_profile: canary_v1
+    automation_mode: LEARN_DRY
+
+    notes: |
+      First AI canary lane. Currently LEARN_DRY with low risk_pct per trade,
+      standard_5 exits, used for early AI behavior logging and training.
+
+  # --------------------------------------------------------
+  # Sub8 — Swing Multi-Asset
+  # Bybit sub UID: 524650929
+  # --------------------------------------------------------
+  - account_label: flashback08
+    sub_uid: 524650929
+    role: swing_multi
+    strategy_name: Sub8_SwingMulti
+    enabled: true
+
+    telegram_channel: sub8
+    risk_profile: swing_default
+
+    enable_tp_sl: true
+    enable_journal: true
+    enable_ai_stack: true
+
+    ai_profile: swing_v1
+    automation_mode: LEARN_DRY
+
+    notes: |
+      Broad swing universe for AI pattern learning. LEARN_DRY only.
+
+  # --------------------------------------------------------
+  # Sub9 — Intraday Range / Mean Reversion
+  # Bybit sub UID: 524693375
+  # --------------------------------------------------------
+  - account_label: flashback09
+    sub_uid: 524693375
+    role: range_intraday
+    strategy_name: Sub9_Range
+    enabled: true
+
+    telegram_channel: sub9
+    risk_profile: default_sub
+
+    enable_tp_sl: true
+    enable_journal: true
+    enable_ai_stack: true
+
+    ai_profile: range_v1
+    automation_mode: LEARN_DRY
+
+    notes: |
+      Intraday range-fade lab on majors + high-liquidity alts.
+
+  # --------------------------------------------------------
+  # Sub10 — Manual / No automation
+  # Bybit sub UID: 524700541
+  # --------------------------------------------------------
+  - account_label: flashback10
+    sub_uid: 524700541
+    role: manual_discretionary
+    strategy_name: Sub10_ManualOnly
+    enabled: false
+
+    telegram_channel: sub10
+    risk_profile: manual_only
+
+    enable_tp_sl: true
+    enable_journal: true
+    enable_ai_stack: false
+
+    ai_profile: manual_only
+    automation_mode: OFF
+
+    notes: |
+      Fully discretionary sandbox. No executor automation.
+      TP/SL may still manage exits depending on how you wire it later.

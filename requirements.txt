@@ -1,0 +1,35 @@
+python-dotenv==1.0.1
+requests==2.32.3
+orjson==3.10.7
+python-telegram-bot==13.15
+pytz==2024.1
+pandas
+numpy
+scikit-learn
+joblib
+
+# Core serialization / JSON
+orjson
+
+# HTTP client
+requests
+
+# Env management (.env support)
+python-dotenv
+
+# YAML config
+PyYAML
+
+# Websockets
+websockets
+websocket-client
+
+# Async HTTP (used in some AI / WS tools)
+aiohttp
+
+# Timezone handling
+pytz
+
+# ML stack for AI policies
+scikit-learn
+joblib
