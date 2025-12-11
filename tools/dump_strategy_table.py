@@ -1,9 +1,18 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Flashback — Strategy Table Dumper
+Flashback — Strategy Table Dumper (v5 strategies.yaml layout)
 
-Produces a readable table of strategies with:
+Assumes config/strategies.yaml:
+
+    version: 5
+    notes: ...
+    subaccounts:
+      - name: Sub1_Trend
+        account_label: flashback01
+        ...
+
+Prints a simple table so you can eyeball:
     - strategy name
     - account_label
     - role
@@ -32,7 +41,10 @@ def log(msg: str) -> None:
     print(msg)
 
 
-def load_strategies() -> Dict[str, Dict[str, Any]]:
+def load_strategies_v5() -> Dict[str, Dict[str, Any]]:
+    """
+    Load strategies from v5 strategies.yaml using 'subaccounts:' list at root.
+    """
     if not STRATEGIES_YAML.exists():
         log(f"[ERROR] strategies.yaml not found at {STRATEGIES_YAML}")
         return {}
@@ -40,16 +52,25 @@ def load_strategies() -> Dict[str, Dict[str, Any]]:
     with STRATEGIES_YAML.open("r", encoding="utf-8") as f:
         data = yaml.safe_load(f)
 
-    if isinstance(data, dict):
-        if "strategies" in data and isinstance(data["strategies"], dict):
-            return data["strategies"]
-        # Fallback: treat root as strategies mapping if it "looks like" one
-        maybe_all_dict = all(isinstance(v, dict) for v in data.values())
-        if maybe_all_dict and "version" not in data and "notes" not in data:
-            return data
+    if not isinstance(data, dict):
+        log("[ERROR] strategies.yaml is not a mapping at root.")
+        return {}
 
-    log("[WARN] Could not infer strategies layout; expected 'strategies:' mapping or pure mapping.")
-    return {}
+    sub_node = data.get("subaccounts")
+    if not isinstance(sub_node, list):
+        log("[ERROR] strategies.yaml does not contain 'subaccounts:' list at root.")
+        return {}
+
+    out: Dict[str, Dict[str, Any]] = {}
+    for idx, item in enumerate(sub_node):
+        if not isinstance(item, dict):
+            continue
+        name = item.get("name") or item.get("strategy") or item.get("id") or f"sub_{idx}"
+        out[str(name)] = item
+
+    if not out:
+        log("[ERROR] strategies.yaml/subaccounts list is empty or un-parseable.")
+    return out
 
 
 def stringify_list(value: Any) -> str:
@@ -126,13 +147,11 @@ def print_table(rows: List[Dict[str, str]]) -> None:
         "ai_profile",
     ]
 
-    # Compute column widths
     col_widths = {h: len(h) for h in headers}
     for row in rows:
         for h in headers:
             col_widths[h] = max(col_widths[h], len(row.get(h, "")))
 
-    # Build format string
     sep = " | "
     header_line = sep.join(h.ljust(col_widths[h]) for h in headers)
     divider_line = "-+-".join("-" * col_widths[h] for h in headers)
@@ -146,7 +165,7 @@ def print_table(rows: List[Dict[str, str]]) -> None:
 
 
 def main() -> int:
-    strategies = load_strategies()
+    strategies = load_strategies_v5()
     if not strategies:
         return 1
 
