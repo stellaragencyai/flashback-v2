@@ -1,3 +1,5 @@
+# config/bots.yaml
+#
 # Flashback — Bot Registry
 #
 # Each entry defines a bot module and whether supervisor should manage it.
@@ -27,7 +29,7 @@ bots:
     module: app.bots.sub_exec_notifier
     enabled: true
 
-  # add more as needed:
+  # Future bots:
   # - name: profit_sweeper
   #   module: app.bots.profit_sweeper
   #   enabled: false

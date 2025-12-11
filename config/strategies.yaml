@@ -31,7 +31,8 @@ notes: |
     - Sub7_Canary promoted to LIVE_CANARY (first AI canary lane).
     - Sub10 remains manual-only (automation OFF).
     - main_manual strategy added for MAIN unified account so TP/SL
-      manager can attach standard_5 exit ladders to manual trades.
+      manager can attach standard_5 / standard_10 exit ladders to
+      manual trades.
 
 subaccounts:
   # --------------------------------------------------------

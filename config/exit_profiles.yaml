@@ -14,7 +14,7 @@
 #
 
 profiles:
-  STANDARD_5:
+  standard_5: &standard_5
     tps:
       - { rr: 1.0, size_pct: 0.20 }
       - { rr: 2.0, size_pct: 0.20 }
@@ -24,7 +24,22 @@ profiles:
     sl:
       rr: -1.0
 
-  AGGRESSIVE_7:
+  standard_10: &standard_10
+    tps:
+      - { rr: 0.5, size_pct: 0.10 }
+      - { rr: 1.0, size_pct: 0.10 }
+      - { rr: 1.5, size_pct: 0.10 }
+      - { rr: 2.0, size_pct: 0.10 }
+      - { rr: 2.5, size_pct: 0.10 }
+      - { rr: 3.0, size_pct: 0.10 }
+      - { rr: 3.5, size_pct: 0.10 }
+      - { rr: 4.0, size_pct: 0.10 }
+      - { rr: 4.5, size_pct: 0.10 }
+      - { rr: 5.0, size_pct: 0.10 }
+    sl:
+      rr: -1.0
+
+  aggressive_7: &aggressive_7
     tps:
       - { rr: 0.75, size_pct: 0.20 }
       - { rr: 1.5,  size_pct: 0.15 }
@@ -36,10 +51,24 @@ profiles:
     sl:
       rr: -1.0
 
-  SCALP_3:
+  scalp_3: &scalp_3
     tps:
       - { rr: 0.75, size_pct: 0.40 }
       - { rr: 1.5,  size_pct: 0.35 }
       - { rr: 2.5,  size_pct: 0.25 }
     sl:
       rr: -1.0
+
+# Flat aliases so tools that only read top-level keys
+# still see the profile names directly.
+standard_5:
+  <<: *standard_5
+
+standard_10:
+  <<: *standard_10
+
+aggressive_7:
+  <<: *aggressive_7
+
+scalp_3:
+  <<: *scalp_3
