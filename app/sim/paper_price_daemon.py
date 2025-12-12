@@ -29,6 +29,8 @@ import json
 from pathlib import Path
 from typing import Dict, Any
 
+from app.sim.paper_broker import PaperBroker  # type: ignore
+
 try:
     from app.core.config import settings  # type: ignore
     ROOT: Path = settings.ROOT  # type: ignore
@@ -55,12 +57,9 @@ except Exception:
                 handler.setFormatter(fmt)
                 logger_.addHandler(handler)
             logger_.setLevel(logging.INFO)
-            return logger_
-
 log = get_logger("paper_price_daemon")
 
-# PaperBroker
-from app.sim.paper_broker import PaperBroker  # type: ignore
+# Heartbeat (optional)
 
 # Heartbeat (optional)
 try:

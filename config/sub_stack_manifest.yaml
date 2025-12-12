@@ -1,0 +1,103 @@
+# config/sub_stack_manifest.yaml
+#
+# Flashback — Subaccount Stack Manifest (v1)
+#
+# Purpose
+# -------
+# Declare, per account_label, which parts of the stack are expected to be active.
+#
+# Fields:
+#   ws:            "shared" | "none"
+#   tp_sl_manager: "enabled" | "disabled"
+#   ai_stack:      "enabled" | "disabled"
+#   executor:      "enabled" | "disabled"
+#   mode:          "OFF" | "LEARN_DRY" | "LEARN_PAPER" | "LIVE_CANARY" | "LIVE_FULL" | "MANUAL"
+#
+# Notes:
+#   - 'mode' here is the *intended* account-level mode, separate from per-strategy automation_mode.
+#   - MANUAL = no auto entries, but positions should still be tracked, TP/SL may still operate.
+
+version: 1
+notes: |
+  v1:
+    - Initial manifest for main + flashback01..10.
+    - 'ws' is shared for unified Bybit account.
+    - Executor disabled for flashback10 (manual-only sandbox).
+
+accounts:
+  main:
+    ws: "shared"
+    tp_sl_manager: "enabled"
+    ai_stack: "enabled"
+    executor: "enabled"
+    mode: "LIVE_CANARY"
+
+  flashback01:
+    ws: "shared"
+    tp_sl_manager: "enabled"
+    ai_stack: "enabled"
+    executor: "enabled"
+    mode: "LEARN_DRY"
+
+  flashback02:
+    ws: "shared"
+    tp_sl_manager: "enabled"
+    ai_stack: "enabled"
+    executor: "enabled"
+    mode: "LEARN_DRY"
+
+  flashback03:
+    ws: "shared"
+    tp_sl_manager: "enabled"
+    ai_stack: "enabled"
+    executor: "enabled"
+    mode: "LEARN_DRY"
+
+  flashback04:
+    ws: "shared"
+    tp_sl_manager: "enabled"
+    ai_stack: "enabled"
+    executor: "enabled"
+    mode: "LEARN_DRY"
+
+  flashback05:
+    ws: "shared"
+    tp_sl_manager: "enabled"
+    ai_stack: "enabled"
+    executor: "enabled"
+    mode: "LEARN_DRY"
+
+  flashback06:
+    ws: "shared"
+    tp_sl_manager: "enabled"
+    ai_stack: "enabled"
+    executor: "enabled"
+    mode: "LEARN_DRY"
+
+  flashback07:
+    ws: "shared"
+    tp_sl_manager: "enabled"
+    ai_stack: "enabled"
+    executor: "enabled"
+    mode: "LEARN_DRY"
+
+  flashback08:
+    ws: "shared"
+    tp_sl_manager: "enabled"
+    ai_stack: "enabled"
+    executor: "enabled"
+    mode: "LEARN_DRY"
+
+  flashback09:
+    ws: "shared"
+    tp_sl_manager: "enabled"
+    ai_stack: "enabled"
+    executor: "enabled"
+    mode: "LEARN_DRY"
+
+  flashback10:
+    ws: "shared"
+    tp_sl_manager: "enabled"
+    ai_stack: "enabled"
+    executor: "disabled"    # manual-only entries, but still tracked
+    mode: "MANUAL"

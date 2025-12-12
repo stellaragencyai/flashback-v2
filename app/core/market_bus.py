@@ -134,7 +134,7 @@ def get_orderbook_snapshot(symbol: str) -> Dict[str, Any]:
             "bids": [],
             "asks": [],
             "ts_ms": 0,
-            "updated_ms": data.get("updated_ms", 0) or 0,
+            "updated_ms": int(data.get("updated_ms", 0) or 0),
         }
 
     bids = ob.get("bids") or []
@@ -226,6 +226,9 @@ def get_recent_trades(symbol: str, limit: int = 100) -> List[Dict[str, Any]]:
     data = _load_json(TRADES_PATH)
     symbols = data.get("symbols") or {}
     blk = symbols.get(sym) or {}
+    if not isinstance(blk, dict):
+        return []
+
     trades = blk.get("trades") or []
     if not isinstance(trades, list):
         return []

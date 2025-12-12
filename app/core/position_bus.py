@@ -152,7 +152,7 @@ def _normalize_entry(
         )
         sub_uid = str(sub_uid)
 
-        acct_label = str(row.get("account_label") or label or ACCOUNT_LABEL).strip()
+        acct_label = str(row.get("account_label") or label or "main").strip()
         cat = str(row.get("category") or category or "linear").lower()
 
         return {
@@ -305,11 +305,17 @@ def get_positions_for_label(
 ) -> List[Dict[str, Any]]:
     """
     Main entry point: return normalized positions for a given label + category.
+
+    IMPORTANT SAFETY DEFAULT:
+      - If label is None/empty, we default to "main" (NOT ACCOUNT_LABEL).
+        This prevents legacy callers from accidentally managing a subaccount.
+      - If you want the current process label, call get_positions_for_current_label()
+        or pass label=ACCOUNT_LABEL explicitly.
     """
     effective_label = label if isinstance(label, str) else None
-    if not effective_label:
-        effective_label = ACCOUNT_LABEL
-    label = effective_label
+    if not effective_label or not effective_label.strip():
+        effective_label = "main"
+    label = effective_label.strip()
 
     if max_age_seconds is None:
         max_age_seconds = _POSITION_BUS_MAX_AGE_SECONDS
@@ -335,6 +341,7 @@ def get_positions_for_label(
     if not allow_rest_fallback:
         return []
 
+    # NOTE: REST fallback is only supported for MAIN right now.
     if label.lower() != "main":
         return []
 
@@ -403,10 +410,12 @@ def get_positions_snapshot(
     """
     Compatibility alias used by tp_sl_manager and other modules.
     Returns normalized rows in canonical schema.
+
+    SAFETY:
+      - If label is None, default is "main" (see get_positions_for_label()).
     """
-    effective_label = label or ACCOUNT_LABEL
     return get_positions_for_label(
-        label=effective_label,
+        label=label,
         category=category,
         max_age_seconds=max_age_seconds,
         allow_rest_fallback=allow_rest_fallback,

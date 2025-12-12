@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Flashback — Paper Broker (LEARN_DRY engine, v1.1)
+Flashback — Paper Broker (LEARN_DRY engine, v1.2)
 
 Purpose
 -------
@@ -78,11 +78,9 @@ except Exception:  # pragma: no cover
                 "%(asctime)s [%(levelname)s] [%(name)s] %(message)s"
             )
             handler.setFormatter(fmt)
-            logger_.addHandler(handler)
+        logger_.addHandler(handler)
         logger_.setLevel(logging.INFO)
         return logger_
-
-log = get_logger("paper_broker")
 
 try:
     from app.core.flashback_common import record_heartbeat  # type: ignore
@@ -90,10 +88,18 @@ except Exception:  # pragma: no cover
     def record_heartbeat(name: str) -> None:  # type: ignore[override]
         return None
 
-from app.ai.ai_events_spine import (  # type: ignore
-    build_outcome_record,
-    publish_ai_event,
-)
+try:
+    from app.ai.ai_events_spine import (  # type: ignore
+        build_outcome_record,
+        publish_ai_event,
+    )
+except Exception:  # pragma: no cover
+    def build_outcome_record(*args: Any, **kwargs: Any) -> Dict[str, Any]:  # type: ignore
+        return {}
+    def publish_ai_event(*args: Any, **kwargs: Any) -> None:  # type: ignore
+        pass
+
+log = get_logger("paper_broker")
 
 
 def _now_ms() -> int:
@@ -159,8 +165,14 @@ def _load_strategy_for_label(account_label: str) -> Dict[str, Any]:
     data = yaml.safe_load(cfg_path.read_text(encoding="utf-8")) or {}
     subs = data.get("subaccounts") or []
 
+    # Prefer exact account_label match
     for sub in subs:
         if str(sub.get("account_label")) == account_label:
+            return sub
+
+    # Fallback: match on name if nothing else
+    for sub in subs:
+        if str(sub.get("name")) == account_label:
             return sub
 
     raise ValueError(f"No strategy config found for account_label={account_label!r}")
@@ -413,7 +425,10 @@ class PaperBroker:
         # Optional setup logging (normally handled by executor_v2)
         if log_setup:
             try:
-                from app.ai.ai_events_spine import build_setup_context, publish_ai_event  # type: ignore
+                from app.ai.ai_events_spine import (  # type: ignore
+                    build_setup_context,
+                    publish_ai_event as _pub_setup,
+                )
 
                 setup_event = build_setup_context(
                     trade_id=trade_id_final,
@@ -426,7 +441,7 @@ class PaperBroker:
                     ai_profile=self._state.ai_profile,
                     extra=extra,
                 )
-                publish_ai_event(setup_event)
+                _pub_setup(setup_event)
             except Exception as e:
                 log.warning("[paper_broker] Optional setup logging failed: %r", e)
 
@@ -474,23 +489,31 @@ class PaperBroker:
         if exit_price <= 0:
             raise ValueError("exit_price must be > 0")
 
+        equity_before = float(self._state.equity)
+
         if pos.side == "long":
             pnl = (exit_price - pos.entry_price) * pos.size
         else:
             pnl = (pos.entry_price - exit_price) * pos.size
 
         r_mult: Optional[float] = None
-        if pos.risk_usd and pos.risk_usd != 0:
+        if pos.risk_usd is not None and pos.risk_usd != 0:
             r_mult = pnl / pos.risk_usd
 
+        now_ms = _now_ms()
         pos.exit_price = float(exit_price)
         pos.exit_reason = exit_reason
-        pos.closed_ms = _now_ms()
+        pos.closed_ms = now_ms
         pos.pnl_usd = float(pnl)
         pos.r_multiple = r_mult
 
         # Update equity
         self._state.equity += float(pnl)
+        equity_after = float(self._state.equity)
+
+        trade_duration_ms: Optional[int] = None
+        if pos.opened_ms is not None:
+            trade_duration_ms = now_ms - pos.opened_ms
 
         outcome_event = build_outcome_record(
             trade_id=pos.trade_id,
@@ -509,6 +532,11 @@ class PaperBroker:
                 "setup_type": pos.setup_type,
                 "timeframe": pos.timeframe,
                 "ai_profile": pos.ai_profile,
+                "opened_ms": pos.opened_ms,
+                "closed_ms": pos.closed_ms,
+                "trade_duration_ms": trade_duration_ms,
+                "equity_before": equity_before,
+                "equity_after": equity_after,
             },
         )
         publish_ai_event(outcome_event)

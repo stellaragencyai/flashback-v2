@@ -54,23 +54,29 @@ from typing import Dict, List, Tuple, Any, Optional
 
 try:
     import requests  # type: ignore
+
     _HAS_REQUESTS = True
 except Exception:
     # Fallback to stdlib if `requests` is not installed
     import urllib.request as _urllib_request  # type: ignore
     import urllib.parse as _urllib_parse      # type: ignore
     import json as _json_fallback
+
     _HAS_REQUESTS = False
 
 from dotenv import load_dotenv
 
+# ---------- Telegram notifier ----------
+
+from app.core.notifier_bot import get_notifier
+
 # ---------- AI logging (optional) ----------
 
-_HAS_AI_HOOKS = False
 try:
     from app.core.ai_hooks import log_signal_from_engine as _real_log_signal_from_engine  # type: ignore
     _HAS_AI_HOOKS = True
 except Exception:
+    _HAS_AI_HOOKS = False
     # Stub if ai_hooks / ai_store not wired yet
     def _real_log_signal_from_engine(
         *,
@@ -94,10 +100,6 @@ except Exception:
 
 # Unified alias
 log_signal_from_engine = _real_log_signal_from_engine
-
-# ---------- Telegram notifier ----------
-
-from app.core.notifier_bot import get_notifier
 
 # ---------- Strategy registry ----------
 
@@ -223,7 +225,7 @@ def fetch_recent_klines(
         ts_ms = int(row[0])
         o = float(row[1])
         h = float(row[2])
-        l = float(row[3])
+        low = float(row[3])
         c = float(row[4])
         v = float(row[5])
         klines.append(
@@ -231,7 +233,7 @@ def fetch_recent_klines(
                 "ts_ms": ts_ms,
                 "open": o,
                 "high": h,
-                "low": l,
+                "low": low,
                 "close": c,
                 "volume": v,
             }
@@ -296,11 +298,18 @@ def tf_display(tf: str) -> str:
 
 # ---------- JSONL export for auto_executor ----------
 
+def _slug_from_reason(prefix: str, side_text: str, reason: str) -> str:
+    base = reason.strip().lower().replace(" ", "_")
+    return f"{prefix}_{side_text.lower()}_{base}"
+
+
 def append_signal_jsonl(
+    *,
     symbol: str,
     side_text: str,
     tf_label: str,
     bar_ts: int,
+    price: Optional[float],
     reason: str,
     debug: Dict[str, Any],
     sub_uid: Optional[str] = None,
@@ -308,17 +317,27 @@ def append_signal_jsonl(
 ) -> None:
     """
     Append a single JSONL line in the format expected by auto_executor.
+
+    Fields we care about:
+        - symbol
+        - side      ("Buy"/"Sell")
+        - timeframe ("5m", "15m", etc.)
+        - price     (approx last close)
+        - setup_type (based on reason)
+        - ts_ms     (bar start/end)
+    Extra fields are fine; executor just ignores them.
     """
     if side_text not in ("LONG", "SHORT"):
         return
 
     side_exec = "Buy" if side_text == "LONG" else "Sell"
-
+    setup_type = _slug_from_reason("ma", side_text, reason)
     payload: Dict[str, Any] = {
         "symbol": symbol,
         "side": side_exec,
         "timeframe": tf_label,
         "reason": reason,
+        "setup_type": setup_type,
         "ts_ms": bar_ts,
         "est_rr": 0.25,
         "debug": {
@@ -329,6 +348,10 @@ def append_signal_jsonl(
             "ma": debug.get("ma"),
         },
     }
+
+    # Critical: executor sizing logic needs a price
+    if price is not None:
+        payload["price"] = float(price)
 
     if sub_uid is not None:
         payload["sub_uid"] = str(sub_uid)
@@ -505,6 +528,7 @@ def main() -> None:
 
             latest_bar = candles[-1]
             bar_ts = latest_bar["ts_ms"]
+            last_close = latest_bar["close"]
 
             # Only act once per bar for this (symbol, timeframe)
             last_ts = last_signal_bar.get(key)
@@ -523,8 +547,7 @@ def main() -> None:
 
             tf_label = tf_display(tf)
             reason = debug.get("reason", "n/a")
-            last_c = debug.get("last_close")
-            ma = debug.get("ma")
+            ma_val = debug.get("ma")
 
             applicable_strats: List[Dict[str, Any]] = strat_list or []
 
@@ -534,7 +557,7 @@ def main() -> None:
                     f"📡 *Signal Engine v2* — {symbol} / {tf_label}\n"
                     f"Side: *{side}*\n"
                     f"Strategies: `{strat_names_str}`\n"
-                    f"Last close: `{last_c}` | MA({len([c['close'] for c in candles[-MA_LOOKBACK:]])}): `{ma}`\n"
+                    f"Last close: `{last_close}` | MA({len([c['close'] for c in candles[-MA_LOOKBACK:]])}): `{ma_val}`\n"
                     f"Reason: `{reason}`\n"
                     f"(No orders placed here; executors handle trades.)"
                 )
@@ -542,7 +565,7 @@ def main() -> None:
                 msg = (
                     f"📡 *Signal Engine v2* — {symbol} / {tf_label}\n"
                     f"Side: *{side}*\n"
-                    f"Last close: `{last_c}` | MA({len([c['close'] for c in candles[-MA_LOOKBACK:]])}): `{ma}`\n"
+                    f"Last close: `{last_close}` | MA({len([c['close'] for c in candles[-MA_LOOKBACK:]])}): `{ma_val}`\n"
                     f"Reason: `{reason}`\n"
                     f"(No orders placed here; executors handle trades, generic universe.)"
                 )
@@ -602,6 +625,7 @@ def main() -> None:
                         side_text=side,
                         tf_label=tf_label,
                         bar_ts=bar_ts,
+                        price=last_close,
                         reason=reason,
                         debug=debug,
                         sub_uid=sub_uid,
@@ -635,6 +659,7 @@ def main() -> None:
                     side_text=side,
                     tf_label=tf_label,
                     bar_ts=bar_ts,
+                    price=last_close,
                     reason=reason,
                     debug=debug,
                     sub_uid=None,

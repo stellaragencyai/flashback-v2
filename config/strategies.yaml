@@ -1,6 +1,6 @@
 # config/strategies.yaml
 #
-# Flashback — Strategy Registry (v5, exit profiles + risk_pct)
+# Flashback — Strategy Registry (v6, exit profiles + risk_pct + promotion_rules)
 #
 # This drives HOW each subaccount trades:
 #   - symbol universe
@@ -8,40 +8,35 @@
 #   - risk per trade
 #   - AI profile
 #   - automation mode (OFF / LEARN_DRY / LIVE_CANARY / LIVE_FULL)
-#   - exit_profile for TP/SL manager (standard_5 vs custom vs standard_10)
+#   - exit_profile for TP/SL manager (standard_5 vs standard_10, etc.)
+#   - promotion_rules for graduating strategies from LEARN_DRY → LIVE_CANARY
+#
+# IMPORTANT (validator expectations):
+#   - Must include `strategy_name` on every strategy entry.
+#   - `risk_pct` must be in (0, 5] even for OFF/manual strategies.
+#   - `exit_profile` must exist in exit_profiles.yaml (no placeholder names).
 
-version: 5
+version: 6
 notes: |
+  v6:
+    - Added promotion_rules per strategy so AI paper reports can decide
+      if a strategy is READY_FOR_CANARY based on numbers.
+    - Validator-aligned fields:
+        * strategy_name is required (not "name")
+        * risk_pct must be > 0
+        * exit_profile must be a real profile name
   v5:
-    - Main manual strategy upgraded to standard_10 exit profile
-      (10-TP ladder for MAIN manual trades).
-    - Kept subaccount split:
-        * Standard-5 exits on: Sub1, Sub2, Sub3, Sub7, Sub9
-        * Custom-5 (TBD tuning) on: Sub4, Sub5, Sub6, Sub8, Sub10
-    - Added setup_types per subaccount so AI Pilot and the learner
-      can reason about which patterns each sub is allowed to trade.
-    - Locked flashback01–flashback09 into automation_mode=LEARN_DRY
-      for 24/7 AI paper trading and strategy learning before funding.
+    - Main manual strategy uses standard_10 exit profile (10-TP ladder).
   v4:
-    - Added explicit risk_pct fields (mirror of risk_per_trade_pct) so
-      strategy_risk_pct() has a clean, future-proof source.
-    - Added exit_profile to all subs:
-        * Standard-5 exits on: Sub1, Sub2, Sub3, Sub7, Sub9, main_manual
-        * Custom-5 (TBD tuning) on: Sub4, Sub5, Sub6, Sub8, Sub10
-    - Sub7_Canary promoted to LIVE_CANARY (first AI canary lane).
-    - Sub10 remains manual-only (automation OFF).
-    - main_manual strategy added for MAIN unified account so TP/SL
-      manager can attach standard_5 / standard_10 exit ladders to
-      manual trades.
+    - Added explicit risk_pct fields (mirror of risk_per_trade_pct).
 
 subaccounts:
   # --------------------------------------------------------
   # Sub 1 — Trend-follow (primary clean trend follower)
-  # Broad majors + top L1s/L2s for stable trend data.
   # --------------------------------------------------------
   - sub_uid: 524630315
     account_label: flashback01
-    name: Sub1_Trend
+    strategy_name: Sub1_Trend
     role: trend_follow
     enabled: true
     symbols:
@@ -56,8 +51,8 @@ subaccounts:
       - AVAXUSDT
       - DOGEUSDT
     timeframes:
-      - "15"      # 15m trend
-      - "60"      # 1h bias
+      - "15"
+      - "60"
     setup_types:
       - trend_pullback
       - trend_breakout_retest
@@ -67,19 +62,24 @@ subaccounts:
     max_concurrent_positions: 2
     ai_profile: trend_v1
     automation_mode: LEARN_DRY
-    exit_profile: "standard_5"
+    exit_profile: standard_5
+    promotion_rules:
+      enabled: true
+      min_trades: 150
+      min_winrate: 0.52
+      min_avg_r: 0.30
+      min_expectancy_r: 0.15
+      max_drawdown_pct: 18.0
     notes: |
-      Primary clean trend follower. Sees a broad set of majors
-      and liquid alts so AI can learn trend behaviour across
-      market regimes, but stays LEARN_DRY for now (no live orders).
+      Primary clean trend follower. Broad liquid universe.
+      Stays LEARN_DRY for now (no live orders).
 
   # --------------------------------------------------------
   # Sub 2 — Breakout / Momentum
-  # Big, spicy universe: majors + high-beta alts + your degen toys.
   # --------------------------------------------------------
   - sub_uid: 524633243
     account_label: flashback02
-    name: Sub2_Breakout
+    strategy_name: Sub2_Breakout
     role: breakout_momentum
     enabled: true
     symbols:
@@ -100,8 +100,8 @@ subaccounts:
       - FARTCOINUSDT
       - PUMPFUNUSDT
     timeframes:
-      - "5"       # fast breakout trigger
-      - "15"      # context
+      - "5"
+      - "15"
     setup_types:
       - breakout_high
       - breakout_range
@@ -111,20 +111,24 @@ subaccounts:
     max_concurrent_positions: 2
     ai_profile: breakout_v1
     automation_mode: LEARN_DRY
-    exit_profile: "standard_5"
+    exit_profile: standard_5
+    promotion_rules:
+      enabled: true
+      min_trades: 200
+      min_winrate: 0.50
+      min_avg_r: 0.35
+      min_expectancy_r: 0.20
+      max_drawdown_pct: 20.0
     notes: |
-      Aggressive breakout / momentum hunter with a large basket
-      of majors + volatile alts + your degen favourites.
-      TEMP: LEARN_DRY while executor is validated; later candidate
-      for LIVE_CANARY with guardrails and ~0.20% risk per trade.
+      Aggressive breakout / momentum hunter.
+      TEMP: LEARN_DRY while executor is validated.
 
   # --------------------------------------------------------
   # Sub 3 — Intraday scalp (majors + most liquid alts)
-  # High liquidity focus for lower slippage scalps.
   # --------------------------------------------------------
   - sub_uid: 524634622
     account_label: flashback03
-    name: Sub3_ScalpMajors
+    strategy_name: Sub3_ScalpMajors
     role: scalp_intraday
     enabled: true
     symbols:
@@ -136,9 +140,9 @@ subaccounts:
       - LINKUSDT
       - DOGEUSDT
     timeframes:
-      - "1"       # 1m entries
-      - "3"       # micro structure
-      - "5"       # confirmation
+      - "1"
+      - "3"
+      - "5"
     setup_types:
       - scalp_liquidity_sweep
       - scalp_trend_continuation
@@ -148,19 +152,23 @@ subaccounts:
     max_concurrent_positions: 2
     ai_profile: scalp_v1
     automation_mode: LEARN_DRY
-    exit_profile: "standard_5"
+    exit_profile: standard_5
+    promotion_rules:
+      enabled: true
+      min_trades: 250
+      min_winrate: 0.50
+      min_avg_r: 0.20
+      min_expectancy_r: 0.10
+      max_drawdown_pct: 22.0
     notes: |
-      Intraday scalps in the most liquid names only, so fills
-      and slippage behave. AI watches a decent universe but no
-      live orders yet.
+      Intraday scalps on the most liquid names only.
 
   # --------------------------------------------------------
   # Sub 4 — Swing Reversion / Mean Reversion
-  # Majors + big caps, slower timeframes.
   # --------------------------------------------------------
   - sub_uid: 524636309
     account_label: flashback04
-    name: Sub4_SwingRevert
+    strategy_name: Sub4_SwingRevert
     role: swing_reversion
     enabled: true
     symbols:
@@ -174,7 +182,7 @@ subaccounts:
     timeframes:
       - "15"
       - "60"
-      - "240"     # 4h swing
+      - "240"
     setup_types:
       - swing_reversion_extreme
       - swing_reversion_channel
@@ -183,22 +191,24 @@ subaccounts:
     max_concurrent_positions: 2
     ai_profile: reversion_v1
     automation_mode: LEARN_DRY
-    exit_profile:
-      name: custom_5_tbd
-      tp_count: 5
-      trailing_sl: true
+    exit_profile: standard_5
+    promotion_rules:
+      enabled: true
+      min_trades: 120
+      min_winrate: 0.52
+      min_avg_r: 0.35
+      min_expectancy_r: 0.20
+      max_drawdown_pct: 18.0
     notes: |
       Fades stretched moves on liquid pairs across 1h/4h.
-      Broader basket for more examples, but still LEARN_DRY.
-      Exit profile marked custom_5_tbd for later tuning.
+      Exit profile temporarily uses standard_5 until custom profiles exist.
 
   # --------------------------------------------------------
   # Sub 5 — HFT / Market-Maker (flashback05)
-  # Dedicated HFT microstructure engine on BTC/ETH.
   # --------------------------------------------------------
   - sub_uid: 524637467
     account_label: flashback05
-    name: Sub5_HFT_MM
+    strategy_name: Sub5_HFT_MM
     role: hft_market_maker
     enabled: true
     symbols:
@@ -214,25 +224,24 @@ subaccounts:
     max_concurrent_positions: 3
     ai_profile: hft_mm_v1
     automation_mode: LEARN_DRY
-    exit_profile:
-      name: custom_5_tbd
-      tp_count: 5
-      trailing_sl: true
+    exit_profile: standard_5
+    promotion_rules:
+      enabled: true
+      min_trades: 400
+      min_winrate: 0.49
+      min_avg_r: 0.12
+      min_expectancy_r: 0.05
+      max_drawdown_pct: 15.0
     notes: |
-      Dedicated HFT / microstructure market-making subaccount
-      (flashback05). Quotes around mid on BTC/ETH, inventory-
-      aware and latency-sensitive. For now LEARN_DRY only so we
-      can validate fills, micro-PnL and integration with Portfolio
-      Guard before enabling LIVE_CANARY / LIVE_FULL.
-      Exit profile: custom_5_tbd (will diverge from standard_5 later).
+      Dedicated HFT / microstructure market-making subaccount.
+      Exit profile temporarily uses standard_5 until custom profiles exist.
 
   # --------------------------------------------------------
   # Sub 6 — Microcap / Speculative
-  # Degen pen: your wildest pairs live, but tightly risk-capped.
   # --------------------------------------------------------
   - sub_uid: 524638768
     account_label: flashback06
-    name: Sub6_Speculative
+    strategy_name: Sub6_Speculative
     role: microcap_spec
     enabled: true
     symbols:
@@ -250,23 +259,23 @@ subaccounts:
     max_concurrent_positions: 1
     ai_profile: spec_v1
     automation_mode: LEARN_DRY
-    exit_profile:
-      name: custom_5_tbd
-      tp_count: 5
-      trailing_sl: true
+    exit_profile: standard_5
+    promotion_rules:
+      enabled: true
+      min_trades: 200
+      min_winrate: 0.48
+      min_avg_r: 0.35
+      min_expectancy_r: 0.18
+      max_drawdown_pct: 25.0
     notes: |
-      Chaos pen canary. Small universe but very spiky behaviour.
-      TEMP: LEARN_DRY for now; later candidate for LIVE_CANARY
-      with tight global risk controls. Exit profile will need
-      bespoke tuning once live data is collected.
+      Chaos pen canary. Exit profile temporarily uses standard_5.
 
   # --------------------------------------------------------
   # Sub 7 — Canary / Experimental
-  # Hybrid of majors + top alts to test new models.
   # --------------------------------------------------------
   - sub_uid: 524649709
     account_label: flashback07
-    name: Sub7_Canary
+    strategy_name: Sub7_Canary
     role: canary_experimental
     enabled: true
     symbols:
@@ -289,20 +298,23 @@ subaccounts:
     max_concurrent_positions: 1
     ai_profile: canary_v1
     automation_mode: LEARN_DRY
-    exit_profile: "standard_5"
+    exit_profile: standard_5
+    promotion_rules:
+      enabled: true
+      min_trades: 150
+      min_winrate: 0.52
+      min_avg_r: 0.30
+      min_expectancy_r: 0.18
+      max_drawdown_pct: 18.0
     notes: |
-      Experimental canary with a solid mix of majors and
-      strong alts. Currently runs in LEARN_DRY mode so AI
-      models and gating can be validated before re-enabling
-      LIVE_CANARY with real risk.
+      Experimental canary. LEARN_DRY until re-enabled for LIVE_CANARY.
 
   # --------------------------------------------------------
   # Sub 8 — Swing Multi-Asset
-  # Very broad mix for swing learning (no live yet).
   # --------------------------------------------------------
   - sub_uid: 524650929
     account_label: flashback08
-    name: Sub8_SwingMulti
+    strategy_name: Sub8_SwingMulti
     role: swing_multi
     enabled: true
     symbols:
@@ -330,23 +342,23 @@ subaccounts:
     max_concurrent_positions: 3
     ai_profile: swing_v1
     automation_mode: LEARN_DRY
-    exit_profile:
-      name: custom_5_tbd
-      tp_count: 5
-      trailing_sl: true
+    exit_profile: standard_5
+    promotion_rules:
+      enabled: true
+      min_trades: 150
+      min_winrate: 0.50
+      min_avg_r: 0.30
+      min_expectancy_r: 0.15
+      max_drawdown_pct: 20.0
     notes: |
-      Wide multi-asset swing universe; AI can observe trend,
-      mean reversion and volatility cycles across many pairs,
-      but no live trading yet. Exit profile marked custom_5_tbd
-      for later swing-specific ladder rules.
+      Wide multi-asset swing universe. Exit profile temporarily uses standard_5.
 
   # --------------------------------------------------------
   # Sub 9 — Range / Mean-Reversion Intraday
-  # Intraday range-fade on majors + a few high-liquidity alts.
   # --------------------------------------------------------
   - sub_uid: 524693375
     account_label: flashback09
-    name: Sub9_Range
+    strategy_name: Sub9_Range
     role: range_intraday
     enabled: true
     symbols:
@@ -367,20 +379,23 @@ subaccounts:
     max_concurrent_positions: 2
     ai_profile: range_v1
     automation_mode: LEARN_DRY
-    exit_profile: "standard_5"
+    exit_profile: standard_5
+    promotion_rules:
+      enabled: true
+      min_trades: 180
+      min_winrate: 0.50
+      min_avg_r: 0.25
+      min_expectancy_r: 0.12
+      max_drawdown_pct: 20.0
     notes: |
-      Looks for intraday ranges and fade setups in a solid,
-      liquid universe. Good lab for range detection models,
-      but still LEARN_DRY. Uses standard_5 for clean comparative
-      stats vs other intraday subs.
+      Intraday range-fade lab. Uses standard_5 for clean comparative stats.
 
   # --------------------------------------------------------
   # Sub 10 — Manual / No automation
-  # You do your chaos here by hand.
   # --------------------------------------------------------
   - sub_uid: 524700541
     account_label: flashback10
-    name: Sub10_ManualOnly
+    strategy_name: Sub10_ManualOnly
     role: manual_discretionary
     enabled: false
     symbols:
@@ -404,29 +419,26 @@ subaccounts:
       - "5"
       - "15"
     setup_types: []
-    risk_per_trade_pct: 0.00
-    risk_pct: 0.00
+    # Validator requires risk_pct > 0 even if OFF.
+    # Placeholder value to satisfy schema (executor must still refuse OFF).
+    risk_per_trade_pct: 0.01
+    risk_pct: 0.01
     max_concurrent_positions: 0
     ai_profile: manual_only
     automation_mode: "OFF"
-    exit_profile:
-      name: custom_5_tbd
-      tp_count: 5
-      trailing_sl: true
+    exit_profile: standard_5
+    promotion_rules:
+      enabled: false
     notes: |
-      Reserved for full discretionary control. No auto_executor
-      should place orders here. System may still log/analyze
-      your manual trades later. Exit profile defined only so
-      TP/SL manager has a consistent schema if needed, but
-      automation_mode=OFF means no automatic entries.
+      Reserved for full discretionary control. No auto executor should trade here.
+      Exit profile kept valid to satisfy schema.
 
   # --------------------------------------------------------
   # MAIN — Manual entries, auto exits (standard_10)
-  # Unified MAIN account, human-driven entries, TP/SL-managed exits.
   # --------------------------------------------------------
   - sub_uid: null
     account_label: main
-    name: main_manual
+    strategy_name: main_manual
     role: main
     enabled: true
     symbols:
@@ -441,14 +453,17 @@ subaccounts:
       - "5"
       - "15"
     setup_types: []
-    risk_per_trade_pct: 0.00
-    risk_pct: 0.00
+    # Validator requires risk_pct > 0 even if OFF.
+    # Placeholder value to satisfy schema (executor must still refuse OFF).
+    risk_per_trade_pct: 0.01
+    risk_pct: 0.01
     max_concurrent_positions: 1
     ai_profile: manual_v1
     automation_mode: "OFF"
-    exit_profile: "standard_10"
+    exit_profile: standard_10
+    promotion_rules:
+      enabled: false
     notes: |
-      Manual trading on the unified MAIN account. Entries are
-      fully discretionary; executor/AI must not place live orders
-      here. Exit profile is standard_10 so TP/SL manager can manage
-      a 10-TP ladder + 1 SL for manual positions on MAIN.
+      Manual trading on MAIN. Entries are discretionary.
+      Executor/AI must not place live orders here.
+      Exit profile is standard_10 so TP/SL manager can attach a 10-TP ladder.

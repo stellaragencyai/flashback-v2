@@ -1,29 +1,26 @@
-# app/bots/tp_sl_manager.py
-# Flashback — TP/SL Manager v6.10 (10-TP capable, main=standard_10)
-#
-# Mode summary
-# ------------
-# HTTP mode:
-#   - Uses app.core.position_bus.get_positions_snapshot(...)
-#   - That prefers WS-fed state/positions_bus.json if fresh
-#   - Falls back to REST list_open_positions(category="linear") for label "main"
-#
-# WS mode (unchanged):
-#   - Connects directly to BYBIT_WS_PRIVATE_URL
-#   - Subscribes to "position" private topic
-#   - Feeds positions from WS pushes only
-#
-# Keeps:
-#   - Exit profiles (standard_10 / standard_7 / standard_5 / aggressive_7 / scalp_3)
-#   - Up to 10-TP ladders, manual TP/SL override logic
-#   - Trailing SL, ATR-based spacing, safety gap from market
-#   - HTTP polling + optional direct WS mode
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+Flashback — TP/SL Manager v6.12 (strategy API compatible, safer defaults)
+
+Patched (Step 2):
+- Position bus is now called with explicit label=ACCOUNT_LABEL (no more label=None).
+- max_age_seconds now respects TPM_BUS_MAX_AGE_SEC for deterministic BUS vs REST behavior.
+
+Keeps:
+- Strategy API compatibility: supports get_strategy_for_sub OR get_strategy_by_sub_uid
+- Safer default exit profile = standard_5 (avoids phantom standard_7)
+- Your telemetry + stable sizing logic
+"""
 
 import os
 import time
 import json
 from decimal import Decimal
-from typing import Dict, Tuple, List, Optional
+from pathlib import Path
+from typing import Dict, Tuple, List, Optional, Any
+
+import yaml  # type: ignore
 
 from app.core.flashback_common import (
     bybit_get,
@@ -43,20 +40,23 @@ from app.core.flashback_common import (
     alert_bot_error,
 )
 
-# Position bus (HTTP mode reads positions via this)
 from app.core.position_bus import get_positions_snapshot as bus_get_positions_snapshot
 
-# Optional websocket support (websocket-client) for direct TP/SL WS mode
 try:
     import websocket  # type: ignore
 except ImportError:
     websocket = None
 
-# Strategy registry (for per-sub exit profiles)
 try:
-    from app.core import strategies as strat_mod  # expects get_strategy_for_sub(sub_uid)
+    from app.core import strategies as strat_mod
 except Exception:
     strat_mod = None  # type: ignore
+
+try:
+    from app.core.config import settings
+except Exception:
+    settings = None  # type: ignore
+
 
 # ---- Spacing params from common module if present ----
 try:
@@ -67,61 +67,162 @@ except Exception:
     TP5_MAX_PCT = Decimal("6.0")
     R_MIN_TICKS = 3
 
+
 CATEGORY = "linear"
 QUOTE = "USDT"
 
-# Max number of TP rungs the engine supports.
-# Profiles (standard_5, standard_7, standard_10, etc.) choose how many they use.
 CORE_TP_COUNT = 10
-
-# Polling cadence (HTTP mode only + safety watchdog)
 POLL_SECONDS = int(os.getenv("TPM_POLL_SECONDS", "2"))
-
-# WebSocket toggle (direct private WS for TP/SL manager itself)
 USE_WS = os.getenv("TPM_USE_WEBSOCKET", "false").strip().lower() == "true"
-
-# Respect manual TP modifications (prices) or not
 _RESPECT_MANUAL_TPS = os.getenv("TPM_RESPECT_MANUAL_TPS", "true").strip().lower() == "true"
-
-# Trailing SL config
 _TRAIL_R_MULT = Decimal(os.getenv("TPM_TRAIL_R_MULT", "1.0"))
-
-# SL distance multiplier (relative to base R)
 SL_R_MULT = Decimal(os.getenv("TPM_SL_R_MULT", "2.2"))
 
-# Minimum TP gap in ticks from current price for auto-managed TPs
+TRAILING_ENABLED = os.getenv("TPM_TRAILING_ENABLED", "true").strip().lower() == "true"
+
 try:
     _MIN_TP_GAP_TICKS = int(os.getenv("TPM_MIN_TP_GAP_TICKS", "5"))
 except Exception:
     _MIN_TP_GAP_TICKS = 5
 
-# ATR cache: symbol -> (ts, atr)
 _ATR_CACHE_TTL = int(os.getenv("TPM_ATR_CACHE_SEC", "60"))
 _ATR_CACHE: Dict[str, Tuple[float, Decimal]] = {}
 
-# Manual TP override per symbol: if True, we do NOT amend TP prices for that symbol.
 _MANUAL_TP_MODE: Dict[str, bool] = {}
-
-# Manual SL override per symbol: if True, we do NOT call set_stop_loss for that symbol.
 _MANUAL_SL_MODE: Dict[str, bool] = {}
-
-# Trailing SL state per symbol:
-#   symbol -> {
-#       "entry": Decimal,
-#       "base_sl": Decimal,
-#       "best": Decimal,
-#   }
 _TRAIL_STATE: Dict[str, Dict[str, Decimal]] = {}
 
-# Default exit profile (used if strategy lookup fails or is absent)
-# NOTE:
-#   - Main account is explicitly overridden to standard_10 in _get_exit_profile_for_position.
-#   - This default mostly applies to subs without configured exit_profile.
-DEFAULT_EXIT_PROFILE = {
-    "name": "standard_7",
-    "tp_count": 7,
-    "trailing_sl": True,
-}
+_LAST_SET_SL: Dict[str, Decimal] = {}
+
+_EXIT_CACHE_TTL = int(os.getenv("TPM_EXIT_CACHE_SEC", "30"))
+_EXIT_CACHE: Dict[str, Any] = {"ts": 0.0, "profiles": {}}
+
+# SAFER: your strategies.yaml and validator are standard_5 / standard_10 driven.
+DEFAULT_EXIT_PROFILE_NAME = os.getenv("TPM_DEFAULT_EXIT_PROFILE", "standard_5").strip() or "standard_5"
+
+TPM_STATUS_EVERY_SEC = int(os.getenv("TPM_STATUS_EVERY_SEC", "10"))
+TPM_VERBOSE_STATUS = os.getenv("TPM_VERBOSE_STATUS", "true").strip().lower() == "true"
+
+POSITIONS_BUS_PATH_ENV = os.getenv("POSITIONS_BUS_PATH", "")  # optional override
+
+
+def _project_root() -> Path:
+    if settings is not None and getattr(settings, "ROOT", None) is not None:
+        return Path(settings.ROOT)
+    return Path(__file__).resolve().parents[2]
+
+
+def _file_age_seconds(path: Path) -> Optional[float]:
+    try:
+        if not path.exists():
+            return None
+        return max(0.0, time.time() - path.stat().st_mtime)
+    except Exception:
+        return None
+
+
+def _mask_key(s: Optional[str]) -> str:
+    if not s:
+        return "(missing)"
+    s = str(s).strip()
+    if len(s) <= 6:
+        return "***"
+    return f"{s[:3]}***{s[-3:]}"
+
+
+def _cred_presence_snapshot() -> Dict[str, str]:
+    return {
+        "BYBIT_API_KEY": _mask_key(os.getenv("BYBIT_API_KEY")),
+        "BYBIT_MAIN_API_KEY": _mask_key(os.getenv("BYBIT_MAIN_API_KEY")),
+        "BYBIT_MAIN_WEBSOCKET_KEY": _mask_key(os.getenv("BYBIT_MAIN_WEBSOCKET_KEY")),
+        "TG_BOT_TOKEN": "***" if os.getenv("TG_BOT_TOKEN") else "(missing)",
+        "TG_CHAT_ID": "***" if os.getenv("TG_CHAT_ID") else "(missing)",
+        "BYBIT_WS_PRIVATE_URL": os.getenv("BYBIT_WS_PRIVATE_URL", BYBIT_WS_PRIVATE_URL),
+    }
+
+
+def _telemetry_paths(label: str) -> Tuple[Path, Path]:
+    root = _project_root()
+    state_dir = root / "state"
+    positions_path = Path(POSITIONS_BUS_PATH_ENV) if POSITIONS_BUS_PATH_ENV.strip() else (state_dir / "positions_bus.json")
+    hb_path = state_dir / f"ws_switchboard_heartbeat_{label}.txt"
+    return positions_path, hb_path
+
+
+def _print_boot_banner(mode: str, label: str) -> None:
+    pos_path, hb_path = _telemetry_paths(label)
+    creds = _cred_presence_snapshot()
+
+    print("\n" + "=" * 80)
+    print("[tp_sl_manager] BOOT")
+    print("  version               : v6.12 + step2_label_aware_bus")
+    print(f"  ACCOUNT_LABEL         : {label}")
+    print(f"  CATEGORY              : {CATEGORY}")
+    print(f"  MODE                  : {mode}")
+    print(f"  TPM_USE_WEBSOCKET     : {USE_WS}")
+    print(f"  POLL_SECONDS          : {POLL_SECONDS}")
+    print(f"  TRAILING_ENABLED      : {TRAILING_ENABLED}")
+    print(f"  TPM_RESPECT_MANUAL_TPS: {_RESPECT_MANUAL_TPS}")
+    print(f"  DEFAULT_EXIT_PROFILE  : {DEFAULT_EXIT_PROFILE_NAME}")
+    print(f"  positions_bus.json    : {pos_path}")
+    print(f"  ws_switchboard hb     : {hb_path}")
+    print("  creds (sanitized)     :")
+    for k, v in creds.items():
+        print(f"    - {k}: {v}")
+    print("=" * 80 + "\n")
+
+
+def _infer_position_source(label: str, bus_max_age_sec: Optional[float]) -> Tuple[str, Optional[float], Optional[float]]:
+    pos_path, hb_path = _telemetry_paths(label)
+    pos_age = _file_age_seconds(pos_path)
+    hb_age = _file_age_seconds(hb_path)
+
+    if pos_age is None:
+        return "REST_FALLBACK(or BUS missing)", pos_age, hb_age
+
+    if bus_max_age_sec is None:
+        return ("BUS_WS" if pos_age <= 30 else "REST_FALLBACK(likely)"), pos_age, hb_age
+
+    if pos_age <= bus_max_age_sec:
+        return "BUS_WS", pos_age, hb_age
+
+    return "REST_FALLBACK(likely)", pos_age, hb_age
+
+
+# ---------------------------------------------------------------------------
+# Exit profiles loader
+# ---------------------------------------------------------------------------
+
+def _load_exit_profiles() -> Dict[str, dict]:
+    now = time.time()
+    ts = float(_EXIT_CACHE.get("ts", 0.0) or 0.0)
+    if now - ts < _EXIT_CACHE_TTL and isinstance(_EXIT_CACHE.get("profiles"), dict):
+        return _EXIT_CACHE["profiles"]
+
+    path = _project_root() / "config" / "exit_profiles.yaml"
+    if not path.exists():
+        alert_bot_error("tp_sl_manager", f"Missing exit_profiles.yaml at {path}", "ERROR")
+        _EXIT_CACHE["ts"] = now
+        _EXIT_CACHE["profiles"] = {}
+        return {}
+
+    try:
+        with path.open("r", encoding="utf-8") as f:
+            data = yaml.safe_load(f) or {}
+        if not isinstance(data, dict):
+            raise ValueError("exit_profiles.yaml root must be a dict")
+        profiles = data.get("profiles") or {}
+        if not isinstance(profiles, dict):
+            raise ValueError("exit_profiles.yaml must contain 'profiles:' mapping")
+        out = {str(k): v for k, v in profiles.items() if isinstance(v, dict)}
+        _EXIT_CACHE["ts"] = now
+        _EXIT_CACHE["profiles"] = out
+        return out
+    except Exception as e:
+        alert_bot_error("tp_sl_manager", f"Failed to load exit_profiles.yaml: {e}", "ERROR")
+        _EXIT_CACHE["ts"] = now
+        _EXIT_CACHE["profiles"] = {}
+        return {}
 
 
 def _open_orders(symbol: str) -> List[dict]:
@@ -130,7 +231,6 @@ def _open_orders(symbol: str) -> List[dict]:
 
 
 def _tp_orders(orders: List[dict], side_now: str) -> List[dict]:
-    # TP = reduce-only limits on opposite side
     opp = "Sell" if side_now.lower() == "buy" else "Buy"
     return [
         o for o in orders
@@ -142,9 +242,6 @@ def _tp_orders(orders: List[dict], side_now: str) -> List[dict]:
 
 
 def _get_atr(symbol: str, entry: Decimal) -> Decimal:
-    """
-    Cached ATR(14) on 1h. Fallback to synthetic 0.2% R if missing.
-    """
     now = time.time()
     cached = _ATR_CACHE.get(symbol)
     if cached is not None:
@@ -154,209 +251,26 @@ def _get_atr(symbol: str, entry: Decimal) -> Decimal:
 
     atr_val = atr14(symbol, interval="60")
     if atr_val <= 0:
-        # Fallback: synthetic ~0.2% band; we'll transform into R later.
         atr_val = entry * Decimal("0.002")
 
     _ATR_CACHE[symbol] = (now, atr_val)
     return atr_val
 
 
-def _compute_exit_grid(
-    symbol: str,
-    side_now: str,
-    entry: Decimal,
-    tp_count: int,
-) -> Tuple[Decimal, List[Decimal]]:
-    """
-    Returns (stop_loss_price, [tp1..tpN]) snapped to valid tick.
-
-    Spacing logic (simplified but still ATR-aware):
-      - Base R_base = max(ATR * ATR_MULT, R_MIN_TICKS * tick)
-      - SL distance uses R_sl = R_base * SL_R_MULT  (wider stop)
-      - We compute a maximum TP distance:
-          • max_tp_dist_atr = ATR * TP5_MAX_ATR_MULT
-          • max_tp_dist_pct = entry * (TP5_MAX_PCT / 100)
-        and choose the smaller of the two.
-      - Grid is then **evenly spaced** from entry out to max_dist / or tp_count * R_base,
-        whichever is tighter.
-      - This guarantees equal spacing v1: each rung is the same distance apart.
-    """
-    if tp_count <= 0:
-        tp_count = 1
-    if tp_count > CORE_TP_COUNT:
-        tp_count = CORE_TP_COUNT
-
+def _compute_R_base(symbol: str, entry: Decimal) -> Decimal:
     tick, _step, _min_notional = get_ticks(symbol)
-
     atr = _get_atr(symbol, entry)
     if atr <= 0:
         atr = entry * Decimal("0.002")
 
-    # Base R distance
     R_base = atr * Decimal(ATR_MULT)
-
-    # Enforce minimum ticks
     min_R = tick * Decimal(R_MIN_TICKS)
     if R_base < min_R:
         R_base = min_R
-
-    # Separate distances for TP vs SL
-    R_sl = R_base * SL_R_MULT
-
-    # Cap furthest TP
-    max_tp_dist_atr = atr * Decimal(TP5_MAX_ATR_MULT)
-    max_tp_dist_pct = entry * (Decimal(TP5_MAX_PCT) / Decimal(100))
-    max_tp_dist_cap = min(max_tp_dist_atr, max_tp_dist_pct)
-
-    # Natural grid if we don't hit the cap
-    natural_max_dist = R_base * Decimal(tp_count)
-    max_dist = min(natural_max_dist, max_tp_dist_cap)
-
-    # Ensure we don't end up with zero distance
-    if max_dist <= 0:
-        max_dist = R_base * Decimal(tp_count)
-
-    step = max_dist / Decimal(tp_count)
-
-    if side_now.lower() == "buy":
-        sl = entry - R_sl
-        tps = [entry + step * Decimal(i) for i in range(1, tp_count + 1)]
-    else:
-        sl = entry + R_sl
-        tps = [entry - step * Decimal(i) for i in range(1, tp_count + 1)]
-
-    # Snap to tick
-    sl = psnap(sl, tick)
-    tps = [psnap(px, tick) for px in tps]
-    return sl, tps
-
-
-def _get_exit_profile_for_position(p: dict) -> Dict[str, object]:
-    """
-    Determine exit profile for a given position using strategy config when possible.
-
-    Supports two shapes in strategies.yaml:
-
-      exit_profile:
-        name: standard_7
-        tp_count: 7
-        trailing_sl: true
-
-      exit_profile: "standard_5"
-
-    Rules:
-      - MAIN account (no sub_uid OR account_label == "main"):
-          -> standard_10 (10 TP ladder, trailing SL)
-      - Subaccounts:
-          -> use strategy exit_profile if available
-          -> otherwise fall back to DEFAULT_EXIT_PROFILE
-    """
-    profile: Dict[str, object] = dict(DEFAULT_EXIT_PROFILE)
-
-    # Detect main account: no sub_uid AND account_label/main-ish
-    account_label = (
-        p.get("account_label")
-        or p.get("label")
-        or p.get("account_label_slug")
-        or ""
-    )
-
-    sub_uid_raw = (
-        p.get("sub_uid")
-        or p.get("subAccountId")
-        or p.get("accountId")
-        or p.get("subId")
-    )
-
-    sub_uid = str(sub_uid_raw) if sub_uid_raw not in (None, "") else ""
-
-    is_main = False
-    if not sub_uid:
-        # No sub_uid → treat as main unless label explicitly says otherwise
-        if str(account_label).lower() in ("", "main", "unified_main", "primary"):
-            is_main = True
-
-    if is_main:
-        # Hard rule: main gets standard_10 by default
-        profile["name"] = "standard_10"
-        profile["tp_count"] = 10
-        profile["trailing_sl"] = True
-        return profile
-
-    # From here on, it's a subaccount
-    if strat_mod is None:
-        return profile
-
-    if not sub_uid:
-        return profile
-
-    # Cleaned-up strategy lookup (no NameError hack)
-    try:
-        strat = strat_mod.get_strategy_for_sub(str(sub_uid))
-    except Exception:
-        strat = None
-
-    if not strat:
-        return profile
-
-    cfg = strat.get("exit_profile") or strat.get("exitProfile")
-
-    # Helper for mapping profile name -> tp_count / trailing flag
-    def _apply_name_only(name_raw: str) -> None:
-        name_norm = name_raw.strip().lower()
-        if name_norm == "standard_7":
-            profile["name"] = "standard_7"
-            profile["tp_count"] = 7
-            profile["trailing_sl"] = True
-        elif name_norm == "standard_5":
-            profile["name"] = "standard_5"
-            profile["tp_count"] = 5
-            profile["trailing_sl"] = True
-        elif name_norm == "standard_10":
-            profile["name"] = "standard_10"
-            profile["tp_count"] = 10
-            profile["trailing_sl"] = True
-        elif name_norm == "aggressive_7":
-            profile["name"] = "aggressive_7"
-            profile["tp_count"] = 7
-            profile["trailing_sl"] = True
-        elif name_norm == "scalp_3":
-            profile["name"] = "scalp_3"
-            profile["tp_count"] = 3
-            profile["trailing_sl"] = True
-        else:
-            # Unknown name: keep default but store label
-            profile["name"] = name_raw
-
-    if isinstance(cfg, dict):
-        name = cfg.get("name")
-        if isinstance(name, str):
-            _apply_name_only(name)
-
-        if "tp_count" in cfg:
-            try:
-                tp_count_val = int(cfg["tp_count"])
-                if tp_count_val > 0:
-                    # Hard cap at CORE_TP_COUNT so grid doesn't exceed 10 rungs
-                    profile["tp_count"] = min(tp_count_val, CORE_TP_COUNT)
-            except Exception:
-                pass
-
-        if "trailing_sl" in cfg:
-            profile["trailing_sl"] = bool(cfg["trailing_sl"])
-
-    elif isinstance(cfg, str):
-        _apply_name_only(cfg)
-
-    return profile
+    return R_base
 
 
 def _safe_tp_price(symbol: str, side_now: str, target_px: Decimal) -> Decimal:
-    """
-    Enforce a minimum distance between TP price and current market price.
-    We do not distort spacing aggressively; we only nudge the whole ladder away
-    from the market when needed in _sync_tp_ladder.
-    """
     try:
         if _MIN_TP_GAP_TICKS <= 0:
             return target_px
@@ -382,18 +296,8 @@ def _safe_tp_price(symbol: str, side_now: str, target_px: Decimal) -> Decimal:
         return target_px
 
 
-def _compute_trailing_sl(
-    symbol: str,
-    side_now: str,
-    entry: Decimal,
-    base_sl: Decimal,
-    tps: List[Decimal],
-    trailing_enabled: bool,
-) -> Decimal:
-    """
-    Compute a trailing SL based on best favorable price and R distance.
-    """
-    if not trailing_enabled or _TRAIL_R_MULT <= 0:
+def _compute_trailing_sl(symbol: str, side_now: str, entry: Decimal, base_sl: Decimal, first_r_dist: Decimal) -> Decimal:
+    if not TRAILING_ENABLED or _TRAIL_R_MULT <= 0:
         return base_sl
 
     try:
@@ -401,26 +305,14 @@ def _compute_trailing_sl(
     except Exception:
         return base_sl
 
-    if price <= 0:
+    if price <= 0 or first_r_dist <= 0:
         return base_sl
 
-    if tps:
-        R = abs(tps[0] - entry)
-    else:
-        R = abs(entry - base_sl)
-
-    if R <= 0:
-        return base_sl
-
-    trail_dist = R * _TRAIL_R_MULT
+    trail_dist = first_r_dist * _TRAIL_R_MULT
 
     state = _TRAIL_STATE.get(symbol)
     if state is None or state.get("entry") != entry or state.get("base_sl") != base_sl:
-        state = {
-            "entry": entry,
-            "base_sl": base_sl,
-            "best": price,
-        }
+        state = {"entry": entry, "base_sl": base_sl, "best": price}
     else:
         best = state.get("best", entry)
         if side_now.lower() == "buy":
@@ -442,25 +334,13 @@ def _compute_trailing_sl(
 
     tick, _step, _ = get_ticks(symbol)
     sl_new = psnap(sl_new, tick)
-
     _TRAIL_STATE[symbol] = state
     return sl_new
 
 
-def _amend_tp_order(
-    symbol: str,
-    order: dict,
-    new_qty: Optional[Decimal],
-    new_price: Optional[Decimal],
-    side_now: Optional[str] = None,
-) -> None:
-    """
-    Amend a single TP order in place via REST /v5/order/amend.
-    """
-    body: Dict[str, str] = {
-        "category": CATEGORY,
-        "symbol": symbol,
-    }
+def _amend_tp_order(symbol: str, order: dict, new_qty: Optional[Decimal], new_price: Optional[Decimal], side_now: Optional[str] = None) -> None:
+    body: Dict[str, str] = {"category": CATEGORY, "symbol": symbol}
+
     order_id = order.get("orderId")
     link_id = order.get("orderLinkId")
     if order_id:
@@ -484,13 +364,7 @@ def _amend_tp_order(
 
 
 def _cancel_tp_order(symbol: str, order: dict) -> None:
-    """
-    Cancel a single TP order via REST /v5/order/cancel.
-    """
-    body: Dict[str, str] = {
-        "category": CATEGORY,
-        "symbol": symbol,
-    }
+    body: Dict[str, str] = {"category": CATEGORY, "symbol": symbol}
     order_id = order.get("orderId")
     link_id = order.get("orderLinkId")
     if order_id:
@@ -506,187 +380,7 @@ def _cancel_tp_order(symbol: str, order: dict) -> None:
         alert_bot_error("tp_sl_manager", f"{symbol} cancel error: {e}", "WARN")
 
 
-def _detect_manual_override(
-    symbol: str,
-    tpo: List[dict],
-    target_tps: List[Decimal],
-    core_count: int,
-) -> bool:
-    """
-    Heuristic: if a majority of TP prices deviate from our ideal grid by more than
-    ~2 ticks, assume the user manually moved them and enter manual TP mode.
-    """
-    if not tpo or not target_tps:
-        return False
-
-    tick, _step, _ = get_ticks(symbol)
-    cur_prices = sorted(Decimal(o["price"]) for o in tpo)
-    tgt_sorted = sorted(target_tps)
-
-    n = min(len(cur_prices), len(tgt_sorted), core_count)
-    if n == 0:
-        return False
-
-    mismatches = 0
-    for i in range(n):
-        if abs(cur_prices[i] - tgt_sorted[i]) > (tick * 2):
-            mismatches += 1
-
-    return mismatches >= 2
-
-
-def _sync_tp_ladder(
-    symbol: str,
-    side_now: str,
-    size: Decimal,
-    tps: List[Decimal],
-    tp_count: int,
-) -> None:
-    """
-    Ensure we have a TP ladder (up to CORE_TP_COUNT) with:
-      - equal qty per rung
-      - evenly spaced grid (tps passed in already equal spacing)
-      - NO partial patchy ladders.
-
-    Behaviour:
-      - If no existing TPs: build fresh ladder.
-      - If manual override detected: keep user prices, only rebalance qty.
-      - If auto mode:
-          * Amend existing orders toward target grid.
-          * Cancel extras.
-          * Create missing rungs.
-    """
-    if tp_count <= 0:
-        tp_count = 1
-    if tp_count > CORE_TP_COUNT:
-        tp_count = CORE_TP_COUNT
-
-    tick, step, _ = get_ticks(symbol)
-    target_tps = tps[:tp_count]
-
-    # Base per-rung quantity
-    each_default = qdown(size / Decimal(tp_count), step)
-    if each_default <= 0:
-        # Too small to split properly; fall back to a single mid TP if possible.
-        if target_tps:
-            mid_idx = min(len(target_tps) - 1, tp_count // 2)
-            mid_tp = target_tps[mid_idx]
-        else:
-            mid_tp = tps[0] if tps else None
-        if mid_tp is not None:
-            safe_mid = _safe_tp_price(symbol, side_now, mid_tp)
-            try:
-                place_reduce_tp(symbol, side_now, qdown(size, step), safe_mid)
-            except Exception as e:
-                alert_bot_error("tp_sl_manager", f"{symbol} single-TP create error: {e}", "WARN")
-        return
-
-    orders_all = _open_orders(symbol)
-    tpo = _tp_orders(orders_all, side_now)
-
-    # No TPs at all: build a fresh ladder
-    if not tpo:
-        _MANUAL_TP_MODE.pop(symbol, None)
-        # shift entire ladder away from market if needed (but keep spacing)
-        tps_sorted = sorted(target_tps)
-        shifted = tps_sorted
-        if tps_sorted:
-            base_safe = _safe_tp_price(symbol, side_now, tps_sorted[0])
-            delta = base_safe - tps_sorted[0]
-            shifted = [psnap(px + delta, tick) for px in tps_sorted]
-
-        for px in shifted:
-            try:
-                place_reduce_tp(symbol, side_now, each_default, px)
-            except Exception as e:
-                alert_bot_error("tp_sl_manager", f"{symbol} TP create error: {e}", "WARN")
-        return
-
-    manual_mode = _MANUAL_TP_MODE.get(symbol, False)
-
-    # Manual TP override detection
-    if _RESPECT_MANUAL_TPS and not manual_mode:
-        if _detect_manual_override(symbol, tpo, target_tps, CORE_TP_COUNT):
-            manual_mode = True
-            _MANUAL_TP_MODE[symbol] = True
-            try:
-                send_tg(
-                    f"✋ Manual TP override detected for {symbol}. "
-                    f"Bot will respect your TP prices until you cancel them or flatten."
-                )
-            except Exception:
-                pass
-
-    # Manual mode: keep prices, only rebalance qty if needed
-    if manual_mode and _RESPECT_MANUAL_TPS:
-        n = len(tpo)
-        if n <= 0:
-            _MANUAL_TP_MODE.pop(symbol, None)
-            return
-
-        each_manual = qdown(size / Decimal(n), step)
-        if each_manual <= 0:
-            return
-
-        for o in tpo:
-            current_qty = Decimal(o["qty"])
-            if current_qty != each_manual:
-                _amend_tp_order(
-                    symbol,
-                    o,
-                    new_qty=each_manual,
-                    new_price=None,
-                    side_now=None,
-                )
-        return
-
-    # --- Full auto mode (no manual override) below ---
-    # Policy: adjust in-place rather than nuking all orders each poll.
-
-    tps_sorted = sorted(target_tps)
-    shifted = tps_sorted
-    if tps_sorted:
-        base_safe = _safe_tp_price(symbol, side_now, tps_sorted[0])
-        delta = base_safe - tps_sorted[0]
-        shifted = [psnap(px + delta, tick) for px in tps_sorted]
-
-    # Sort existing TP orders by price to align with our grid
-    try:
-        tpo_sorted = sorted(tpo, key=lambda o: Decimal(str(o.get("price", "0"))))
-    except Exception:
-        tpo_sorted = tpo
-
-    # Amend existing ones to match our equal ladder
-    n_common = min(len(tpo_sorted), len(shifted))
-    for i in range(n_common):
-        o = tpo_sorted[i]
-        target_px = shifted[i]
-        _amend_tp_order(
-            symbol,
-            o,
-            new_qty=each_default,
-            new_price=target_px,
-            side_now=side_now,
-        )
-
-    # If there are extra old TPs beyond tp_count, cancel them
-    if len(tpo_sorted) > len(shifted):
-        for o in tpo_sorted[len(shifted):]:
-            _cancel_tp_order(symbol, o)
-
-    # If we need more rungs than we currently have, create the missing ones
-    if len(shifted) > len(tpo_sorted):
-        for px in shifted[len(tpo_sorted):]:
-            try:
-                place_reduce_tp(symbol, side_now, each_default, px)
-            except Exception as e:
-                alert_bot_error("tp_sl_manager", f"{symbol} TP create (extra rung) error: {e}", "WARN")
-
-
 def _extract_existing_sl(p: dict) -> Optional[Decimal]:
-    """
-    Best-effort extraction of the current stop-loss price from a position dict.
-    """
     raw = (
         p.get("stopLoss")
         or p.get("stopLossPrice")
@@ -701,17 +395,300 @@ def _extract_existing_sl(p: dict) -> Optional[Decimal]:
         return None
 
 
-def _ensure_exits_for_position(
-    p: dict,
-    seen_state: Dict[str, Tuple[Decimal, Decimal]],
-) -> None:
-    """
-    For a single position record, ensure SL + TP ladder exist and are balanced with size.
-    """
-    symbol = p["symbol"]
-    side_now = p["side"]  # "Buy"/"Sell"
-    entry = Decimal(str(p["avgPrice"]))
+def _strategy_exit_profile_from_any(strategy_obj: Any) -> Optional[str]:
+    if isinstance(strategy_obj, dict):
+        ep = strategy_obj.get("exit_profile") or strategy_obj.get("exitProfile")
+        if isinstance(ep, str) and ep.strip():
+            return ep.strip()
+        return None
 
+    try:
+        ep = getattr(strategy_obj, "exit_profile", None)
+        if isinstance(ep, str) and ep.strip():
+            return ep.strip()
+    except Exception:
+        pass
+
+    return None
+
+
+def _get_exit_profile_name_for_position(p: dict) -> str:
+    account_label = (p.get("account_label") or p.get("label") or p.get("account_label_slug") or "").strip()
+
+    sub_uid_raw = (p.get("sub_uid") or p.get("subAccountId") or p.get("accountId") or p.get("subId"))
+    sub_uid = str(sub_uid_raw) if sub_uid_raw not in (None, "") else ""
+
+    is_main = False
+    if not sub_uid and account_label.lower() in ("", "main", "unified_main", "primary"):
+        is_main = True
+    if is_main:
+        return "standard_10"
+
+    if strat_mod is None:
+        return DEFAULT_EXIT_PROFILE_NAME
+
+    strategy_obj = None
+    try:
+        if sub_uid and hasattr(strat_mod, "get_strategy_for_sub"):
+            strategy_obj = strat_mod.get_strategy_for_sub(sub_uid)  # type: ignore
+    except Exception:
+        strategy_obj = None
+
+    if strategy_obj is None:
+        try:
+            if sub_uid and hasattr(strat_mod, "get_strategy_by_sub_uid"):
+                strategy_obj = strat_mod.get_strategy_by_sub_uid(sub_uid)  # type: ignore
+        except Exception:
+            strategy_obj = None
+
+    if strategy_obj is None:
+        try:
+            if account_label and hasattr(strat_mod, "get_strategy_for_label"):
+                strategy_obj = strat_mod.get_strategy_for_label(account_label)  # type: ignore
+        except Exception:
+            strategy_obj = None
+
+    ep = _strategy_exit_profile_from_any(strategy_obj)
+    if ep:
+        return ep
+
+    return DEFAULT_EXIT_PROFILE_NAME
+
+
+def _compute_exits_from_profile(symbol: str, side_now: str, entry: Decimal, profile_name: str) -> Tuple[Decimal, List[Decimal], List[Decimal]]:
+    profiles = _load_exit_profiles()
+    prof = profiles.get(profile_name)
+
+    if not isinstance(prof, dict):
+        alert_bot_error(
+            "tp_sl_manager",
+            f"{symbol}: unknown exit_profile '{profile_name}', using '{DEFAULT_EXIT_PROFILE_NAME}'",
+            "WARN",
+        )
+        prof = profiles.get(DEFAULT_EXIT_PROFILE_NAME)
+
+    if not isinstance(prof, dict):
+        raise RuntimeError("No valid exit profiles loaded (exit_profiles.yaml broken/missing)")
+
+    tps = prof.get("tps") or []
+    sl = prof.get("sl") or {}
+
+    if not isinstance(tps, list) or not isinstance(sl, dict):
+        raise ValueError(f"exit_profile '{profile_name}' invalid shape")
+
+    tick, _step, _ = get_ticks(symbol)
+    atr = _get_atr(symbol, entry)
+    if atr <= 0:
+        atr = entry * Decimal("0.002")
+
+    R_base = _compute_R_base(symbol, entry)
+
+    max_tp_dist_atr = atr * Decimal(TP5_MAX_ATR_MULT)
+    max_tp_dist_pct = entry * (Decimal(TP5_MAX_PCT) / Decimal(100))
+    max_tp_cap = min(max_tp_dist_atr, max_tp_dist_pct)
+
+    rr_list: List[Decimal] = []
+    sz_list: List[Decimal] = []
+    for tp in tps[:CORE_TP_COUNT]:
+        if not isinstance(tp, dict):
+            continue
+        rr = tp.get("rr")
+        sz = tp.get("size_pct")
+        try:
+            rr_d = Decimal(str(rr))
+            sz_d = Decimal(str(sz))
+        except Exception:
+            continue
+        if rr_d <= 0 or sz_d <= 0:
+            continue
+        rr_list.append(rr_d)
+        sz_list.append(sz_d)
+
+    if not rr_list:
+        rr_list = [Decimal("1.0")]
+        sz_list = [Decimal("1.0")]
+
+    sz_sum = sum(sz_list)
+    if sz_sum <= 0:
+        sz_list = [Decimal("1.0") / Decimal(len(sz_list)) for _ in sz_list]
+    else:
+        sz_list = [s / sz_sum for s in sz_list]
+
+    furthest_rr = max(rr_list)
+    natural_furthest = furthest_rr * R_base
+    scale = Decimal("1.0")
+    if natural_furthest > max_tp_cap and max_tp_cap > 0:
+        scale = max_tp_cap / natural_furthest
+
+    sl_rr_raw = sl.get("rr", -1.0)
+    try:
+        sl_rr = Decimal(str(sl_rr_raw))
+    except Exception:
+        sl_rr = Decimal("-1.0")
+    if sl_rr >= 0:
+        sl_rr = -abs(sl_rr) if sl_rr != 0 else Decimal("-1.0")
+
+    sl_dist = abs(sl_rr) * R_base * SL_R_MULT
+
+    if side_now.lower() == "buy":
+        sl_px = entry - sl_dist
+        tp_prices = [entry + (rr * R_base * scale) for rr in rr_list]
+        tp_prices = sorted(tp_prices)
+    else:
+        sl_px = entry + sl_dist
+        tp_prices = [entry - (rr * R_base * scale) for rr in rr_list]
+        tp_prices = sorted(tp_prices, reverse=True)
+
+    sl_px = psnap(sl_px, tick)
+    tp_prices = [psnap(px, tick) for px in tp_prices]
+
+    return sl_px, tp_prices, sz_list
+
+
+def _detect_manual_override(symbol: str, side_now: str, tpo: List[dict], target_tps: List[Decimal]) -> bool:
+    if not tpo or not target_tps:
+        return False
+
+    tick, _step, _ = get_ticks(symbol)
+
+    try:
+        cur = [Decimal(str(o.get("price", "0"))) for o in tpo]
+        cur = [c for c in cur if c > 0]
+    except Exception:
+        return False
+
+    if side_now.lower() == "buy":
+        cur_sorted = sorted(cur)
+        tgt_sorted = sorted(target_tps)
+    else:
+        cur_sorted = sorted(cur, reverse=True)
+        tgt_sorted = sorted(target_tps, reverse=True)
+
+    n = min(len(cur_sorted), len(tgt_sorted))
+    if n <= 0:
+        return False
+
+    mismatches = 0
+    for i in range(n):
+        if abs(cur_sorted[i] - tgt_sorted[i]) > (tick * 2):
+            mismatches += 1
+    return mismatches >= 2
+
+
+def _split_qty_by_pcts(size: Decimal, pcts: List[Decimal], step: Decimal) -> List[Decimal]:
+    if size <= 0 or not pcts:
+        return []
+
+    target_total = qdown(size, step)
+    if target_total <= 0:
+        return []
+
+    qtys = [qdown(target_total * pct, step) for pct in pcts]
+    s = sum(qtys)
+
+    rem = target_total - s
+    if rem > 0 and qtys:
+        qtys[-1] = qdown(qtys[-1] + rem, step)
+
+    if qtys and qtys[-1] <= 0:
+        qtys[-1] = qdown(target_total - sum(qtys[:-1]), step)
+
+    return qtys
+
+
+def _sync_tp_ladder(symbol: str, side_now: str, size: Decimal, target_tps: List[Decimal], target_qtys: List[Decimal]) -> None:
+    tick, step, _ = get_ticks(symbol)
+
+    pairs = [(px, q) for px, q in zip(target_tps, target_qtys) if q > 0]
+    if not pairs:
+        return
+
+    tps = [px for px, _ in pairs]
+    qtys = [q for _, q in pairs]
+
+    orders_all = _open_orders(symbol)
+    tpo = _tp_orders(orders_all, side_now)
+
+    if not tpo:
+        _MANUAL_TP_MODE.pop(symbol, None)
+        if tps:
+            base_safe = _safe_tp_price(symbol, side_now, tps[0])
+            delta = base_safe - tps[0]
+            tps = [psnap(px + delta, tick) for px in tps]
+
+        for px, q in zip(tps, qtys):
+            try:
+                place_reduce_tp(symbol, side_now, q, px)
+            except Exception as e:
+                alert_bot_error("tp_sl_manager", f"{symbol} TP create error: {e}", "WARN")
+        return
+
+    manual_mode = _MANUAL_TP_MODE.get(symbol, False)
+
+    if _RESPECT_MANUAL_TPS and not manual_mode:
+        if _detect_manual_override(symbol, side_now, tpo, tps):
+            manual_mode = True
+            _MANUAL_TP_MODE[symbol] = True
+            try:
+                send_tg(
+                    f"✋ Manual TP override detected for {symbol}. "
+                    f"Bot will respect your TP prices until you cancel them or flatten."
+                )
+            except Exception:
+                pass
+
+    if manual_mode and _RESPECT_MANUAL_TPS:
+        n = len(tpo)
+        if n <= 0:
+            _MANUAL_TP_MODE.pop(symbol, None)
+            return
+
+        each = qdown(size / Decimal(n), step)
+        if each <= 0:
+            return
+
+        for o in tpo:
+            try:
+                cur_qty = Decimal(str(o.get("qty", "0")))
+            except Exception:
+                cur_qty = Decimal("0")
+            if cur_qty != each:
+                _amend_tp_order(symbol, o, new_qty=each, new_price=None, side_now=None)
+        return
+
+    if tps:
+        base_safe = _safe_tp_price(symbol, side_now, tps[0])
+        delta = base_safe - tps[0]
+        tps = [psnap(px + delta, tick) for px in tps]
+
+    try:
+        if side_now.lower() == "buy":
+            tpo_sorted = sorted(tpo, key=lambda o: Decimal(str(o.get("price", "0"))))
+        else:
+            tpo_sorted = sorted(tpo, key=lambda o: Decimal(str(o.get("price", "0"))), reverse=True)
+    except Exception:
+        tpo_sorted = tpo
+
+    n_common = min(len(tpo_sorted), len(tps))
+    for i in range(n_common):
+        _amend_tp_order(symbol, tpo_sorted[i], new_qty=qtys[i], new_price=tps[i], side_now=side_now)
+
+    if len(tpo_sorted) > len(tps):
+        for o in tpo_sorted[len(tps):]:
+            _cancel_tp_order(symbol, o)
+
+    if len(tps) > len(tpo_sorted):
+        for px, q in zip(tps[len(tpo_sorted):], qtys[len(tpo_sorted):]):
+            try:
+                place_reduce_tp(symbol, side_now, q, px)
+            except Exception as e:
+                alert_bot_error("tp_sl_manager", f"{symbol} TP create (extra rung) error: {e}", "WARN")
+
+
+def _ensure_exits_for_position(p: dict, seen_state: Dict[str, Tuple[Decimal, Decimal, Decimal]]) -> None:
+    symbol = p["symbol"]
+    side_now = p["side"]
+    entry = Decimal(str(p["avgPrice"]))
     size = Decimal(str(p["size"]))
 
     if size <= 0:
@@ -719,18 +696,16 @@ def _ensure_exits_for_position(
         _MANUAL_TP_MODE.pop(symbol, None)
         _MANUAL_SL_MODE.pop(symbol, None)
         _TRAIL_STATE.pop(symbol, None)
+        _LAST_SET_SL.pop(symbol, None)
         return
 
-    prev_state = seen_state.get(symbol)
-    state = (entry, size)
+    profile_name = _get_exit_profile_name_for_position(p)
 
-    exit_profile = _get_exit_profile_for_position(p)
-    tp_count = int(exit_profile.get("tp_count", CORE_TP_COUNT) or CORE_TP_COUNT)
-    trailing_sl = bool(exit_profile.get("trailing_sl", True))
+    base_sl, tp_prices, tp_pcts = _compute_exits_from_profile(symbol, side_now, entry, profile_name)
+    tick, step, _ = get_ticks(symbol)
 
-    base_sl, tps_full = _compute_exit_grid(symbol, side_now, entry, tp_count)
+    tp_qtys = _split_qty_by_pcts(size, tp_pcts, step)
 
-    tick, _step, _ = get_ticks(symbol)
     existing_sl = _extract_existing_sl(p)
     manual_sl_mode = _MANUAL_SL_MODE.get(symbol, False)
 
@@ -754,29 +729,29 @@ def _ensure_exits_for_position(
             _MANUAL_SL_MODE.pop(symbol, None)
             manual_sl_mode = False
 
+    first_r_dist = abs(tp_prices[0] - entry) if tp_prices else _compute_R_base(symbol, entry)
+
     if manual_sl_mode and existing_sl is not None:
         sl_effective = existing_sl
     else:
-        sl_effective = _compute_trailing_sl(
-            symbol=symbol,
-            side_now=side_now,
-            entry=entry,
-            base_sl=base_sl,
-            tps=tps_full,
-            trailing_enabled=trailing_sl,
-        )
-        set_stop_loss(symbol, sl_effective)
+        sl_effective = _compute_trailing_sl(symbol, side_now, entry, base_sl, first_r_dist)
+        last_set = _LAST_SET_SL.get(symbol)
+        if last_set is None or abs(last_set - sl_effective) > (tick * 1):
+            set_stop_loss(symbol, sl_effective)
+            _LAST_SET_SL[symbol] = sl_effective
 
-    # Always ensure ladder shape matches current size/profile
-    _sync_tp_ladder(symbol, side_now, size, tps_full, tp_count=tp_count)
+    _sync_tp_ladder(symbol, side_now, size, tp_prices, tp_qtys)
 
-    if prev_state != state:
-        used_tps = tps_full[:tp_count]
+    prev = seen_state.get(symbol)
+    state = (entry, size, sl_effective)
+
+    if prev != state:
         try:
+            used = [f"{px}({q})" for px, q in zip(tp_prices, tp_qtys)]
             send_tg(
                 f"🎯 Exits set {symbol} {side_now} | size {size} | "
-                f"profile {exit_profile.get('name')} | "
-                f"SL {sl_effective} | TPs {', '.join(map(str, used_tps))}"
+                f"profile {profile_name} | SL {sl_effective} | "
+                f"TPs {', '.join(used)}"
             )
         except Exception:
             pass
@@ -784,43 +759,43 @@ def _ensure_exits_for_position(
     seen_state[symbol] = state
 
 
-# ---------------------------------------------------------------------------
-# HTTP polling mode (position-bus powered)
-# ---------------------------------------------------------------------------
-
 def _loop_http_poll() -> None:
-    """
-    Polls positions every POLL_SECONDS and ensures exits are attached.
+    label = os.getenv("ACCOUNT_LABEL", "main").strip() or "main"
+    _print_boot_banner(mode="HTTP + position_bus (with REST fallback)", label=label)
 
-    HTTP mode now uses position_bus.get_positions_snapshot(), which:
-      - Reads state/positions_bus.json if fresh enough.
-      - Falls back to REST list_open_positions(category="linear") for MAIN
-        when snapshot is missing/stale, and updates positions_bus.json.
-    """
-    label = os.getenv("ACCOUNT_LABEL", "main")
-    # Console + Telegram so you *know* it's online
-    print(f"[tp_sl_manager] ONLINE in HTTP + position_bus mode | label={label} | poll={POLL_SECONDS}s")
     try:
-        send_tg(
-            f"🎛 Flashback TP/SL Manager ONLINE (HTTP + position_bus, label={label}, {POLL_SECONDS}s)."
-        )
+        send_tg(f"🎛 Flashback TP/SL Manager ONLINE (HTTP+position_bus, label={label}, poll={POLL_SECONDS}s).")
     except Exception:
         pass
 
-    seen: Dict[str, Tuple[Decimal, Decimal]] = {}
+    seen: Dict[str, Tuple[Decimal, Decimal, Decimal]] = {}
+    last_status_print = 0.0
+
+    BUS_MAX_AGE_SEC = float(os.getenv("TPM_BUS_MAX_AGE_SEC", "10"))
 
     while True:
         record_heartbeat("tp_sl_manager")
         try:
-            # label=None means "use ACCOUNT_LABEL" inside position_bus
+            # ✅ Step 2: Explicit label routing (NO more label=None)
             positions = bus_get_positions_snapshot(
-                label=None,
+                label=label,
                 category=CATEGORY,
-                max_age_seconds=None,      # let position_bus decide age or use its default
+                max_age_seconds=int(BUS_MAX_AGE_SEC),
                 allow_rest_fallback=True,
             )
-            current_symbols = set()
 
+            now = time.time()
+            if TPM_VERBOSE_STATUS and (now - last_status_print) >= TPM_STATUS_EVERY_SEC:
+                src, pos_age, hb_age = _infer_position_source(label, bus_max_age_sec=BUS_MAX_AGE_SEC)
+                print(
+                    f"[tp_sl_manager] status | label={label} | mode=HTTP | source={src} | "
+                    f"positions_bus_age={('MISSING' if pos_age is None else f'{pos_age:.2f}s')} | "
+                    f"ws_hb_age={('MISSING' if hb_age is None else f'{hb_age:.2f}s')} | "
+                    f"positions={len(positions)}"
+                )
+                last_status_print = now
+
+            current_symbols = set()
             for p in positions:
                 symbol = p.get("symbol")
                 if not symbol:
@@ -834,24 +809,16 @@ def _loop_http_poll() -> None:
                     _MANUAL_TP_MODE.pop(s, None)
                     _MANUAL_SL_MODE.pop(s, None)
                     _TRAIL_STATE.pop(s, None)
+                    _LAST_SET_SL.pop(s, None)
 
             time.sleep(POLL_SECONDS)
+
         except Exception as e:
             alert_bot_error("tp_sl_manager", f"HTTP loop error: {e}", "ERROR")
             time.sleep(5)
 
 
-# ---------------------------------------------------------------------------
-# WebSocket mode: private stream for positions (direct WS)
-# ---------------------------------------------------------------------------
-
-def _handle_ws_position_message(
-    msg: dict,
-    seen: Dict[str, Tuple[Decimal, Decimal]],
-) -> None:
-    """
-    Handle a Bybit private 'position' topic push.
-    """
+def _handle_ws_position_message(msg: dict, seen: Dict[str, Tuple[Decimal, Decimal, Decimal]]) -> None:
     topic = msg.get("topic", "")
     if "position" not in topic:
         return
@@ -876,6 +843,7 @@ def _handle_ws_position_message(
             _MANUAL_TP_MODE.pop(symbol, None)
             _MANUAL_SL_MODE.pop(symbol, None)
             _TRAIL_STATE.pop(symbol, None)
+            _LAST_SET_SL.pop(symbol, None)
             continue
 
         norm = {
@@ -894,33 +862,29 @@ def _handle_ws_position_message(
             _MANUAL_TP_MODE.pop(s, None)
             _MANUAL_SL_MODE.pop(s, None)
             _TRAIL_STATE.pop(s, None)
+            _LAST_SET_SL.pop(s, None)
 
 
 def _loop_ws() -> None:
-    """
-    WebSocket-only main loop:
-    - Connects to BYBIT_WS_PRIVATE_URL
-    - Authenticates using shared auth builder
-    - Subscribes to "position" private topic
-    """
     if websocket is None:
         raise RuntimeError("websocket-client is not installed. pip install websocket-client")
 
-    label = os.getenv("ACCOUNT_LABEL", "main")
-    print(f"[tp_sl_manager] ONLINE in WebSocket mode | label={label}")
+    label = os.getenv("ACCOUNT_LABEL", "main").strip() or "main"
+    _print_boot_banner(mode="DIRECT WS (private: position)", label=label)
+
     try:
         send_tg(f"🎛 Flashback TP/SL Manager ONLINE (WebSocket mode, label={label}).")
     except Exception:
         pass
 
-    seen: Dict[str, Tuple[Decimal, Decimal]] = {}
+    seen: Dict[str, Tuple[Decimal, Decimal, Decimal]] = {}
+    last_status_print = 0.0
 
     while True:
         ws = None
         try:
             ws = websocket.create_connection(BYBIT_WS_PRIVATE_URL, timeout=5)
 
-            # Auth using shared helper (correct Bybit v5 format)
             auth_msg = build_ws_auth_payload_main()
             ws.send(json.dumps(auth_msg))
 
@@ -929,8 +893,7 @@ def _loop_ws() -> None:
             if resp.get("success") is False or resp.get("retCode", 0) != 0:
                 raise RuntimeError(f"WS auth failed: {resp}")
 
-            sub = {"op": "subscribe", "args": ["position"]}
-            ws.send(json.dumps(sub))
+            ws.send(json.dumps({"op": "subscribe", "args": ["position"]}))
 
             last_ping = time.time()
 
@@ -938,6 +901,10 @@ def _loop_ws() -> None:
                 record_heartbeat("tp_sl_manager")
 
                 now = time.time()
+                if TPM_VERBOSE_STATUS and (now - last_status_print) >= TPM_STATUS_EVERY_SEC:
+                    print(f"[tp_sl_manager] status | label={label} | mode=WS | connected=true")
+                    last_status_print = now
+
                 if now - last_ping > 15:
                     ws.send(json.dumps({"op": "ping"}))
                     last_ping = now
@@ -947,10 +914,8 @@ def _loop_ws() -> None:
                     raise RuntimeError("WS closed")
 
                 msg = json.loads(raw)
-
                 if msg.get("op") in ("pong", "ping"):
                     continue
-
                 if "topic" in msg and "position" in msg["topic"]:
                     _handle_ws_position_message(msg, seen=seen)
 
@@ -965,24 +930,13 @@ def _loop_ws() -> None:
                     pass
 
 
-# ---------------------------------------------------------------------------
-# Entry point
-# ---------------------------------------------------------------------------
-
-def loop():
-    """
-    Entry point called by supervisor.
-    Chooses WebSocket mode or HTTP poll mode depending on TPM_USE_WEBSOCKET.
-
-    - HTTP mode: uses position_bus.get_positions_snapshot() (WS-fed file + REST fallback).
-    - WS mode  : uses direct private WS and ignores position_bus.
-    """
+def loop() -> None:
     if USE_WS:
         try:
             _loop_ws()
         except Exception as e:
-                alert_bot_error("tp_sl_manager", f"WS hard failure, falling back to HTTP: {e}", "ERROR")
-                _loop_http_poll()
+            alert_bot_error("tp_sl_manager", f"WS hard failure, falling back to HTTP: {e}", "ERROR")
+            _loop_http_poll()
     else:
         _loop_http_poll()
 

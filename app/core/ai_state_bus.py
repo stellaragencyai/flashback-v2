@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Flashback — AI State Bus (WS-first account + market snapshot, hardened)
+Flashback — AI State Bus (WS-first account + market snapshot, hardened) — Snapshot v2
 
 Purpose
 -------
@@ -15,7 +15,7 @@ Provide AI / signal engines with a SINGLE, structured snapshot of:
 - Positions (per ACCOUNT_LABEL):
     • raw WS-fed rows (via position_bus)
     • by-symbol map for quick lookup
-    • snapshot_age_sec  (freshness of positions_bus.json)
+    • snapshot_age_sec (freshness of positions_bus.json)
 
 - Market data (WS-first where available):
     • last_price_ws_first
@@ -24,16 +24,20 @@ Provide AI / signal engines with a SINGLE, structured snapshot of:
     • recent public trades (optional)
     • orderbook / trades bus ages (if market_bus exposes them)
 
-Everything is WS-first where possible and falls back gracefully.
+Snapshot v2 additions
+---------------------
+- schema_version = 2
+- freshness block + safety block (is_safe + reasons)
+- stable return type (dict, not tuple)
 """
 
 from __future__ import annotations
 
+import os
 import time
 from decimal import Decimal
 from typing import Any, Dict, List, Optional, Tuple
 
-# Core account / risk primitives & WS-first prices
 from app.core.flashback_common import (
     get_equity_usdt,
     get_mmr_pct,
@@ -45,14 +49,12 @@ from app.core.flashback_common import (
     record_heartbeat,
 )
 
-# Positions via WS-first position_bus
 from app.core.position_bus import (
     get_positions_for_current_label,
     get_position_map_for_label,
     get_snapshot as _pos_get_snapshot,
 )
 
-# Market bus (WS orderbook + trades); optional import for robustness
 try:
     from app.core import market_bus as _market_bus  # type: ignore
 except Exception:
@@ -60,24 +62,20 @@ except Exception:
 
 
 CATEGORY = "linear"
+SNAPSHOT_SCHEMA_VERSION = 2
+
+# Staleness thresholds (seconds) – tweak later via env
+_POS_MAX_AGE_SEC = float(os.getenv("AI_POS_MAX_AGE_SEC", "8") or "8")
+_OB_MAX_AGE_SEC = float(os.getenv("AI_OB_MAX_AGE_SEC", "5") or "5")
+_TR_MAX_AGE_SEC = float(os.getenv("AI_TR_MAX_AGE_SEC", "8") or "8")
 
 
 # ---------------------------------------------------------------------------
-# Internal helpers
+# Helpers
 # ---------------------------------------------------------------------------
 
 def _now_ms() -> int:
     return int(time.time() * 1000)
-
-
-def _decimal_or_none(val: Any) -> Optional[Decimal]:
-    if val is None:
-        return None
-    try:
-        d = Decimal(str(val))
-        return d
-    except Exception:
-        return None
 
 
 def _decimal_to_str(d: Optional[Decimal]) -> Optional[str]:
@@ -86,10 +84,27 @@ def _decimal_to_str(d: Optional[Decimal]) -> Optional[str]:
     return str(d)
 
 
+def _safe_str(val: Any) -> Optional[str]:
+    if val is None:
+        return None
+    try:
+        return str(val)
+    except Exception:
+        return None
+
+
+def _to_float(val: Any) -> Optional[float]:
+    try:
+        if val is None:
+            return None
+        return float(val)
+    except Exception:
+        return None
+
+
 def _account_state() -> Dict[str, Any]:
     """
     Return core account state (REST-driven, WS-agnostic).
-
     All numeric fields are stringified so downstream JSON is stable.
     """
     eq = get_equity_usdt()
@@ -119,16 +134,14 @@ def _positions_state() -> Dict[str, Any]:
           "snapshot_age_sec": float | None
         }
     """
-    # 1) Try to get snapshot age
     snap_age_sec: Optional[float] = None
     try:
-        snap, age = _pos_get_snapshot()
+        _snap, age = _pos_get_snapshot()
         if age is not None:
             snap_age_sec = float(age)
     except Exception:
         snap_age_sec = None
 
-    # 2) WS-first rows / map with REST fallback (per position_bus rules)
     rows = get_positions_for_current_label(
         category=CATEGORY,
         max_age_seconds=None,
@@ -141,13 +154,12 @@ def _positions_state() -> Dict[str, Any]:
         allow_rest_fallback=True,
     )
 
-    # Normalize keys to UPPER symbols
     norm_map: Dict[str, Dict[str, Any]] = {}
-    for k, v in pos_map.items():
+    for k, v in (pos_map or {}).items():
         norm_map[str(k).upper()] = v
 
     return {
-        "raw": rows,
+        "raw": rows or [],
         "by_symbol": norm_map,
         "snapshot_age_sec": snap_age_sec,
     }
@@ -156,7 +168,6 @@ def _positions_state() -> Dict[str, Any]:
 def _market_bus_ages() -> Tuple[Optional[float], Optional[float]]:
     """
     Try to expose global orderbook / trades bus ages, if market_bus provides them.
-
     Returns (orderbook_bus_age_sec, trades_bus_age_sec).
     """
     if _market_bus is None:
@@ -165,20 +176,19 @@ def _market_bus_ages() -> Tuple[Optional[float], Optional[float]]:
     ob_age: Optional[float] = None
     tr_age: Optional[float] = None
 
-    # Prefer explicit age helpers if present
     try:
         if hasattr(_market_bus, "orderbook_bus_age_sec"):
-            ob_age_val = _market_bus.orderbook_bus_age_sec()  # type: ignore[attr-defined]
-            if ob_age_val is not None:
-                ob_age = float(ob_age_val)
+            v = _market_bus.orderbook_bus_age_sec()  # type: ignore[attr-defined]
+            if v is not None:
+                ob_age = float(v)
     except Exception:
         ob_age = None
 
     try:
         if hasattr(_market_bus, "trades_bus_age_sec"):
-            tr_age_val = _market_bus.trades_bus_age_sec()  # type: ignore[attr-defined]
-            if tr_age_val is not None:
-                tr_age = float(tr_age_val)
+            v = _market_bus.trades_bus_age_sec()  # type: ignore[attr-defined]
+            if v is not None:
+                tr_age = float(v)
     except Exception:
         tr_age = None
 
@@ -194,8 +204,7 @@ def _symbol_market_block(
 ) -> Dict[str, Any]:
     """
     Build a per-symbol market snapshot block.
-
-    Uses WS-first sources where possible, falls back gracefully when WS missing.
+    Uses WS-first sources where possible, falls back gracefully.
     """
     sym = symbol.upper()
     last_px = last_price_ws_first(sym)
@@ -211,7 +220,6 @@ def _symbol_market_block(
             if include_orderbook and hasattr(_market_bus, "get_orderbook_snapshot"):
                 ob = _market_bus.get_orderbook_snapshot(sym)  # type: ignore[attr-defined]
                 if isinstance(ob, dict):
-                    # Trim depth for AI; they don't need 50 levels.
                     bids = ob.get("bids") or ob.get("b") or []
                     asks = ob.get("asks") or ob.get("a") or []
                     ob_block = {
@@ -220,31 +228,107 @@ def _symbol_market_block(
                         "ts_ms": ob.get("ts_ms", 0),
                         "updated_ms": ob.get("updated_ms", 0),
                     }
-                    ob_updated_ms = ob_block["updated_ms"]
+                    try:
+                        ob_updated_ms = int(ob_block.get("updated_ms") or 0) or None
+                    except Exception:
+                        ob_updated_ms = None
 
             if include_trades and hasattr(_market_bus, "get_recent_trades"):
                 trades = _market_bus.get_recent_trades(sym, limit=trades_limit)  # type: ignore[attr-defined]
                 if isinstance(trades, list):
                     trades_block = trades
-                # If market_bus exposes a single updated_ms, we use that
+
                 if hasattr(_market_bus, "trades_bus_updated_ms"):
                     try:
                         trades_updated_ms = _market_bus.trades_bus_updated_ms()  # type: ignore[attr-defined]
+                        if trades_updated_ms is not None:
+                            trades_updated_ms = int(trades_updated_ms)
                     except Exception:
                         trades_updated_ms = None
         except Exception:
-            # If anything explodes, we just return what we already have.
             pass
 
     return {
         "symbol": sym,
-        "last_price": str(last_px),
+        "last_price": _safe_str(last_px),
         "spread_bps": _decimal_to_str(spread_bps_val),
         "orderbook": ob_block,
         "trades": trades_block,
         "orderbook_updated_ms": ob_updated_ms,
         "trades_updated_ms": trades_updated_ms,
     }
+
+
+def _evaluate_snapshot_safety(
+    *,
+    positions_bus_age_sec: Optional[float],
+    orderbook_bus_age_sec: Optional[float],
+    trades_bus_age_sec: Optional[float],
+) -> Dict[str, Any]:
+    """
+    Decide whether snapshot is "safe enough" to trade on.
+    This is intentionally conservative.
+
+    Rule: If a bus age exists and exceeds threshold -> unsafe.
+    """
+    reasons: List[str] = []
+    is_safe = True
+
+    if positions_bus_age_sec is not None and positions_bus_age_sec > _POS_MAX_AGE_SEC:
+        is_safe = False
+        reasons.append(
+            f"positions_bus_stale ({positions_bus_age_sec:.2f}s > {_POS_MAX_AGE_SEC:.2f}s)"
+        )
+
+    if orderbook_bus_age_sec is not None and orderbook_bus_age_sec > _OB_MAX_AGE_SEC:
+        is_safe = False
+        reasons.append(
+            f"orderbook_bus_stale ({orderbook_bus_age_sec:.2f}s > {_OB_MAX_AGE_SEC:.2f}s)"
+        )
+
+    if trades_bus_age_sec is not None and trades_bus_age_sec > _TR_MAX_AGE_SEC:
+        is_safe = False
+        reasons.append(
+            f"trades_bus_stale ({trades_bus_age_sec:.2f}s > {_TR_MAX_AGE_SEC:.2f}s)"
+        )
+
+    return {
+        "is_safe": bool(is_safe),
+        "reasons": reasons,
+        "thresholds_sec": {
+            "positions": _POS_MAX_AGE_SEC,
+            "orderbook": _OB_MAX_AGE_SEC,
+            "trades": _TR_MAX_AGE_SEC,
+        },
+    }
+
+
+def validate_snapshot_v2(snapshot: Dict[str, Any]) -> Tuple[bool, List[str]]:
+    """
+    Lightweight schema validation. We keep it strict on core keys
+    and flexible on the rest to avoid breaking iteration.
+
+    Returns (ok, errors).
+    """
+    errors: List[str] = []
+    if not isinstance(snapshot, dict):
+        return False, ["snapshot_not_dict"]
+
+    sv = snapshot.get("schema_version")
+    if sv != SNAPSHOT_SCHEMA_VERSION:
+        errors.append(f"schema_version_expected_{SNAPSHOT_SCHEMA_VERSION}_got_{sv}")
+
+    for key in ("ts_ms", "account", "positions", "symbols", "freshness", "safety"):
+        if key not in snapshot:
+            errors.append(f"missing_key:{key}")
+
+    # sanity types
+    if "freshness" in snapshot and not isinstance(snapshot.get("freshness"), dict):
+        errors.append("freshness_not_dict")
+    if "safety" in snapshot and not isinstance(snapshot.get("safety"), dict):
+        errors.append("safety_not_dict")
+
+    return (len(errors) == 0), errors
 
 
 # ---------------------------------------------------------------------------
@@ -259,22 +343,18 @@ def build_symbol_state(
     include_orderbook: bool = True,
 ) -> Dict[str, Any]:
     """
-    Build a focused state snapshot for a SINGLE symbol:
+    Focused state snapshot for a SINGLE symbol.
 
-    {
-      "ts_ms": ...,
-      "account": {...},
-      "position": { ... or None ... },
-      "market": {
-          "symbol": "BTCUSDT",
-          "last_price": "12345.6",
-          "spread_bps": "3.2" or None,
-          "orderbook": { "bids": [...], "asks": [...], ... } or None,
-          "trades": [ ... ] or None,
-          "orderbook_updated_ms": ...,
-          "trades_updated_ms": ...,
-      }
-    }
+    Returns dict:
+        {
+          "schema_version": 2,
+          "ts_ms": ...,
+          "account": {...},
+          "position": {... or None},
+          "market": {...},
+          "freshness": {...bus ages...},
+          "safety": {...is_safe, reasons, thresholds...}
+        }
     """
     record_heartbeat("ai_state_bus_symbol")
     sym = symbol.upper()
@@ -291,11 +371,30 @@ def build_symbol_state(
         trades_limit=trades_limit,
     )
 
+    # Bus ages / safety, same semantics as global snapshot
+    pos_age_sec = _to_float(positions.get("snapshot_age_sec"))
+    ob_age_sec, tr_age_sec = _market_bus_ages()
+
+    freshness = {
+        "positions_bus_age_sec": pos_age_sec,
+        "orderbook_bus_age_sec": _to_float(ob_age_sec),
+        "trades_bus_age_sec": _to_float(tr_age_sec),
+    }
+
+    safety = _evaluate_snapshot_safety(
+        positions_bus_age_sec=freshness["positions_bus_age_sec"],
+        orderbook_bus_age_sec=freshness["orderbook_bus_age_sec"],
+        trades_bus_age_sec=freshness["trades_bus_age_sec"],
+    )
+
     return {
+        "schema_version": SNAPSHOT_SCHEMA_VERSION,
         "ts_ms": _now_ms(),
         "account": account,
         "position": pos,
         "market": market,
+        "freshness": freshness,
+        "safety": safety,
     }
 
 
@@ -309,30 +408,15 @@ def build_ai_snapshot(
     """
     Build a global AI snapshot for current ACCOUNT_LABEL.
 
-    Parameters
-    ----------
-    focus_symbols : Optional[List[str]]
-        If provided, only include these symbols in the `symbols` block.
-        If None, we include:
-          - all symbols with open positions.
-    include_trades : bool
-        If True, include recent public trades per symbol (up to trades_limit).
-    trades_limit : int
-        Max number of trades per symbol when include_trades=True.
-    include_orderbook : bool
-        If True, attach trimmed orderbook (bids/asks) for each symbol.
-
-    Returns
-    -------
-    dict
+    Returns dict (NOT tuple):
         {
+          "schema_version": 2,
           "ts_ms": ...,
           "account": {...},
           "positions": {...},
           "symbols": {...},
-          "positions_bus_age_sec": float | None,
-          "orderbook_bus_age_sec": float | None,
-          "trades_bus_age_sec": float | None,
+          "freshness": {...bus ages...},
+          "safety": {...is_safe, reasons, thresholds...}
         }
     """
     record_heartbeat("ai_state_bus_global")
@@ -340,8 +424,7 @@ def build_ai_snapshot(
     account = _account_state()
     positions = _positions_state()
 
-    # Global bus ages for AI Pilot / policies
-    pos_age_sec = positions.get("snapshot_age_sec")
+    pos_age_sec = _to_float(positions.get("snapshot_age_sec"))
     ob_age_sec, tr_age_sec = _market_bus_ages()
 
     # Determine which symbols to include in market view
@@ -352,8 +435,7 @@ def build_ai_snapshot(
             if s_norm:
                 symbols_set.add(s_norm)
     else:
-        # Default: all open-position symbols
-        for s in positions.get("by_symbol", {}).keys():
+        for s in (positions.get("by_symbol", {}) or {}).keys():
             symbols_set.add(str(s).upper())
 
     symbols_block: Dict[str, Dict[str, Any]] = {}
@@ -365,12 +447,26 @@ def build_ai_snapshot(
             trades_limit=trades_limit,
         )
 
-    return {
+    freshness = {
+        "positions_bus_age_sec": pos_age_sec,
+        "orderbook_bus_age_sec": _to_float(ob_age_sec),
+        "trades_bus_age_sec": _to_float(tr_age_sec),
+    }
+
+    safety = _evaluate_snapshot_safety(
+        positions_bus_age_sec=freshness["positions_bus_age_sec"],
+        orderbook_bus_age_sec=freshness["orderbook_bus_age_sec"],
+        trades_bus_age_sec=freshness["trades_bus_age_sec"],
+    )
+
+    snap: Dict[str, Any] = {
+        "schema_version": SNAPSHOT_SCHEMA_VERSION,
         "ts_ms": _now_ms(),
         "account": account,
         "positions": positions,
         "symbols": symbols_block,
-        "positions_bus_age_sec": pos_age_sec,
-        "orderbook_bus_age_sec": ob_age_sec,
-        "trades_bus_age_sec": tr_age_sec,
+        "freshness": freshness,
+        "safety": safety,
     }
+
+    return snap

@@ -702,7 +702,7 @@ async def handle_strategy_signal(
         positions_view: Optional[Dict[str, Any]] = None
         try:
             pos_rows = bus_get_positions_snapshot(
-                label=None,
+                label=account_label,
                 category="linear",
                 max_age_seconds=10,
                 allow_rest_fallback=True,
@@ -749,6 +749,8 @@ async def handle_strategy_signal(
         # Regime tag (hook) if the signal provides one
         regime_tag = sig.get("regime") or sig.get("market_regime")
 
+        setup_type_val = str(sig.get("setup_type") or "unknown")
+
         features_payload: Dict[str, Any] = {
             **ai_features,
             "schema_version": "setup_features_v1",
@@ -773,6 +775,7 @@ async def handle_strategy_signal(
             "qty": float(qty_capped),
             "stop_pct_for_size": float(stop_pct_for_size),
             "train_mode": "DRY_RUN_V1" if is_training_mode else "LIVE_OR_CANARY",
+            "setup_type": setup_type_val,
         }
 
         if regime_tag is not None:
@@ -785,7 +788,7 @@ async def handle_strategy_signal(
             symbol=symbol,
             sub_uid=sub_uid,
             strategy_name=strat_cfg.get("name", strat_name),
-            setup_type=str(sig.get("setup_type") or "unknown"),
+            setup_type=setup_type_val,
             mode=trade_mode,
             features=features_payload,
         )
@@ -798,7 +801,7 @@ async def handle_strategy_signal(
                 account_label=account_label,
                 strategy=strat_cfg.get("name", strat_name),
                 features=features_payload,
-                setup_type=str(sig.get("setup_type") or "unknown"),
+                setup_type=setup_type_val,
                 timeframe=str(tf),
                 ai_profile=strat_cfg.get("ai_profile") or None,
                 extra={
@@ -908,7 +911,7 @@ async def handle_strategy_signal(
                 entry_price=price_f,
                 stop_price=stop_price,
                 take_profit_price=take_profit_price,
-                setup_type=str(sig.get("setup_type") or "unknown"),
+                setup_type=setup_type_val,
                 timeframe=str(tf),
                 features=features_for_paper,
                 extra={

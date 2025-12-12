@@ -1,45 +1,16 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Flashback — AI Pilot v2.2
+Flashback — AI Pilot v2.3 (Snapshot v2 + validation)
 
 Role
 ----
-Thin coordinator sitting on top of:
-  • app.core.ai_state_bus.build_ai_snapshot()   (state aggregation)
+Coordinator over:
+  • app.core.ai_state_bus.build_ai_snapshot() (Snapshot v2)
   • AI policies (sample + core)
-  • AI actions file (AI_ACTIONS_PATH JSONL)     (writes AI "decisions" to a bus)
-  • flashback_common.record_heartbeat()        (liveness for supervisor/status)
+  • AI actions JSONL bus
 
-Energy:
-  • DRY-RUN ONLY by default.
-  • No direct order placement. Execution is delegated to ai_action_router
-    (→ ExecSignal queue) or other executors later.
-
-Env
----
-ACCOUNT_LABEL                 (default: "main")
-AI_PILOT_ENABLED              (default: "true")
-AI_PILOT_POLL_SECONDS         (default: "3")
-AI_PILOT_DRY_RUN              (default: "true")
-
-# Policy toggles
-AI_PILOT_SAMPLE_POLICY        (default: "false")  # uses app.ai.ai_policy_sample
-AI_PILOT_CORE_POLICY          (default: "false")  # uses app.ai.ai_policy_core
-
-# Action writing
-AI_PILOT_WRITE_ACTIONS        (default: "false")  # if true, writes to AI_ACTIONS_PATH
-
-# AI actions bus path
-AI_ACTIONS_PATH               (default: "state/ai_actions.jsonl")
-
-Usage
------
-Typically launched by supervisor_ai_stack:
-
-    from app.bots.ai_pilot import loop as ai_pilot_loop
-
-    ai_pilot_loop()
+Default DRY-RUN.
 """
 
 from __future__ import annotations
@@ -47,14 +18,18 @@ from __future__ import annotations
 import os
 import time
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List
 
 import orjson
 
-# Builder for schema-compliant AIAction objects
 from app.core.ai_action_builder import build_trade_action_from_sample
+from app.core.ai_state_bus import build_ai_snapshot, validate_snapshot_v2
+from app.core.flashback_common import (
+    send_tg,
+    record_heartbeat,
+    alert_bot_error,
+)
 
-# Logging (robust)
 try:
     from app.core.log import get_logger
 except Exception:  # pragma: no cover
@@ -64,42 +39,23 @@ except Exception:  # pragma: no cover
         logger_ = logging.getLogger(name)
         if not logger_.handlers:
             handler = logging.StreamHandler()
-            fmt = logging.Formatter(
-                "%(asctime)s [%(levelname)s] [%(name)s] %(message)s"
-            )
+            fmt = logging.Formatter("%(asctime)s [%(levelname)s] [%(name)s] %(message)s")
             handler.setFormatter(fmt)
-        logger_.addHandler(handler)
-        logger_.setLevel(logging.INFO)
+            logger_.addHandler(handler)
         return logger_
-
 
 logger = get_logger("ai_pilot")
 
-# Core helpers
-from app.core.flashback_common import (
-    send_tg,
-    record_heartbeat,
-    alert_bot_error,
-)
-
-from app.core.ai_state_bus import build_ai_snapshot
-
-# Optional sample policy
 try:
     from app.ai.ai_policy_sample import evaluate_state as sample_evaluate_state
 except Exception:  # pragma: no cover
     sample_evaluate_state = None  # type: ignore[assignment]
 
-# Optional core policy
 try:
     from app.ai.ai_policy_core import evaluate_state as core_evaluate_state
 except Exception:  # pragma: no cover
     core_evaluate_state = None  # type: ignore[assignment]
 
-
-# ---------------------------------------------------------------------------
-# Env helpers
-# ---------------------------------------------------------------------------
 
 def _env_bool(name: str, default: str = "false") -> bool:
     raw = os.getenv(name, default).strip().lower()
@@ -119,14 +75,11 @@ AI_PILOT_ENABLED: bool = _env_bool("AI_PILOT_ENABLED", "true")
 POLL_SECONDS: int = _env_int("AI_PILOT_POLL_SECONDS", "3")
 DRY_RUN: bool = _env_bool("AI_PILOT_DRY_RUN", "true")
 
-# Policy toggles
 USE_SAMPLE_POLICY: bool = _env_bool("AI_PILOT_SAMPLE_POLICY", "false")
 USE_CORE_POLICY: bool = _env_bool("AI_PILOT_CORE_POLICY", "false")
 
-# Action writing toggle
 WRITE_ACTIONS: bool = _env_bool("AI_PILOT_WRITE_ACTIONS", "false")
 
-# AI actions file path (aligned with ai_action_router + tools)
 try:
     from app.core.config import settings  # type: ignore
     default_actions_path = getattr(settings, "AI_ACTIONS_PATH", "state/ai_actions.jsonl")
@@ -140,20 +93,10 @@ AI_ACTIONS_FILE: Path = Path(_actions_path_str).resolve()
 AI_ACTIONS_FILE.parent.mkdir(parents=True, exist_ok=True)
 
 
-# ---------------------------------------------------------------------------
-# State builders / helpers
-# ---------------------------------------------------------------------------
-
 def _build_ai_state() -> Dict[str, Any]:
     """
-    Wrap ai_state_bus.build_ai_snapshot() into a policy-friendly dict.
-
-    Policies do NOT need to know about internal bus layout; they get:
-      - label, dry_run
-      - account summary
-      - flat positions list
-      - light telemetry about buses (ages)
-      - raw_snapshot for advanced logic
+    Build policy-friendly ai_state.
+    Includes snapshot_v2 (validated) for advanced consumers.
     """
     snap = build_ai_snapshot(
         focus_symbols=None,
@@ -162,16 +105,18 @@ def _build_ai_state() -> Dict[str, Any]:
         include_orderbook=True,
     )
 
+    ok, errors = validate_snapshot_v2(snap)
+    if not ok:
+        # hard fail (safer). policies should not run on malformed snapshots.
+        raise RuntimeError(f"snapshot_v2_invalid: {errors}")
+
     account = snap.get("account") or {}
     pos_block = snap.get("positions") or {}
     positions_by_symbol = pos_block.get("by_symbol") or {}
     positions_list: List[Dict[str, Any]] = list(positions_by_symbol.values())
 
-    buses = {
-        "positions_bus_age_sec": snap.get("positions_bus_age_sec"),
-        "orderbook_bus_age_sec": snap.get("orderbook_bus_age_sec"),
-        "trades_bus_age_sec": snap.get("trades_bus_age_sec"),
-    }
+    freshness = snap.get("freshness") or {}
+    safety = snap.get("safety") or {}
 
     ai_state: Dict[str, Any] = {
         "label": ACCOUNT_LABEL,
@@ -182,35 +127,14 @@ def _build_ai_state() -> Dict[str, Any]:
             "open_positions": len(positions_list),
         },
         "positions": positions_list,
-        "buses": buses,
-        "raw_snapshot": snap,
+        "buses": freshness,          # keep name for backward compatibility
+        "safety": safety,            # NEW: policies can stop trading when unsafe
+        "snapshot_v2": snap,         # NEW: canonical snapshot v2
     }
     return ai_state
 
 
-# ---------------------------------------------------------------------------
-# Policy runners
-# ---------------------------------------------------------------------------
-
 def _run_sample_policy(ai_state: Dict[str, Any]) -> List[Dict[str, Any]]:
-    """
-    Run the sample policy (if available) and return a list of
-    schema-compliant AIAction dicts.
-
-    Legacy sample policies may return "advice_only" dicts with fields like:
-        {
-            "type": "advice_only",
-            "reason": "sample_policy",
-            "label": "main",
-            "symbol": "WETUSDT",
-            "side": "Buy",
-            "size": "382.0",
-            "dry_run": True,
-        }
-
-    This function adapts those into proper AIAction objects using
-    build_trade_action_from_sample(...).
-    """
     if not USE_SAMPLE_POLICY:
         return []
     if sample_evaluate_state is None:
@@ -227,11 +151,9 @@ def _run_sample_policy(ai_state: Dict[str, Any]) -> List[Dict[str, Any]]:
             if not isinstance(raw, dict):
                 continue
 
-            # Heuristic: treat any dict with symbol + side as a trade candidate.
             symbol = raw.get("symbol")
             side = raw.get("side")
             if not symbol or not side:
-                # Pure advisory or malformed; ignore for now.
                 continue
 
             reason = str(raw.get("reason") or "sample_policy")
@@ -266,15 +188,6 @@ def _run_sample_policy(ai_state: Dict[str, Any]) -> List[Dict[str, Any]]:
 
 
 def _run_core_policy(ai_state: Dict[str, Any]) -> List[Dict[str, Any]]:
-    """
-    Run the core policy (if available) and return its actions list.
-
-    For now we assume core policies either:
-      - already emit schema-compliant AIAction dicts, or
-      - are disabled while being developed.
-
-    We simply pass through any dicts they return.
-    """
     if not USE_CORE_POLICY:
         return []
     if core_evaluate_state is None:
@@ -291,27 +204,8 @@ def _run_core_policy(ai_state: Dict[str, Any]) -> List[Dict[str, Any]]:
         return []
 
 
-# ---------------------------------------------------------------------------
-# Action dispatch → AI_ACTIONS_PATH
-# ---------------------------------------------------------------------------
-
 def _dispatch_actions(actions: List[Dict[str, Any]], *, label: str) -> int:
-    """
-    Write actions to the AI actions JSONL bus (AI_ACTIONS_PATH).
-
-    Each action is expected to already be CLOSE to a schema-compliant
-    AIAction. We ensure:
-
-        - ts_ms        present
-        - account_label present
-        - source       set to "ai_pilot"
-        - dry_run      reflects AI_PILOT_DRY_RUN
-
-    Then we append one JSON object per line to AI_ACTIONS_FILE.
-    """
-    if not actions:
-        return 0
-    if not WRITE_ACTIONS:
+    if not actions or not WRITE_ACTIONS:
         return 0
 
     now_ms = int(time.time() * 1000)
@@ -323,8 +217,6 @@ def _dispatch_actions(actions: List[Dict[str, Any]], *, label: str) -> int:
                 if not isinstance(raw, dict):
                     continue
                 a = dict(raw)
-
-                # Ensure critical metadata exists
                 a.setdefault("ts_ms", now_ms)
                 a.setdefault("account_label", label)
                 a["source"] = "ai_pilot"
@@ -342,33 +234,19 @@ def _dispatch_actions(actions: List[Dict[str, Any]], *, label: str) -> int:
     return written
 
 
-# ---------------------------------------------------------------------------
-# Main loop
-# ---------------------------------------------------------------------------
-
 def loop() -> None:
-    """
-    Main AI Pilot loop.
-
-    Every POLL_SECONDS:
-      - Record heartbeat
-      - Build ai_state
-      - Run enabled policies (sample + core)
-      - Optionally write actions to AI_ACTIONS_PATH
-    """
     if not AI_PILOT_ENABLED:
         logger.warning("AI Pilot is disabled via AI_PILOT_ENABLED=false. Exiting loop().")
         return
 
-    mode_bits = []
-    mode_bits.append("DRY-RUN" if DRY_RUN else "LIVE?")
+    mode_bits = ["DRY-RUN" if DRY_RUN else "LIVE?"]
     if USE_SAMPLE_POLICY:
         mode_bits.append("sample_policy")
     if USE_CORE_POLICY:
         mode_bits.append("core_policy")
     if WRITE_ACTIONS:
         mode_bits.append("write_actions")
-    mode_str = ", ".join(mode_bits) if mode_bits else "idle"
+    mode_str = ", ".join(mode_bits)
 
     try:
         send_tg(
@@ -376,12 +254,8 @@ def loop() -> None:
             f"({mode_str}, poll={POLL_SECONDS}s)"
         )
     except Exception:
-        logger.info(
-            "AI Pilot started for label=%s (%s, poll=%ss)",
-            ACCOUNT_LABEL,
-            mode_str,
-            POLL_SECONDS,
-        )
+        logger.info("AI Pilot started for label=%s (%s, poll=%ss)",
+                    ACCOUNT_LABEL, mode_str, POLL_SECONDS)
 
     logger.info(
         "AI Pilot loop starting (label=%s, poll=%ss, dry_run=%s, sample_policy=%s, "
@@ -402,37 +276,32 @@ def loop() -> None:
         try:
             ai_state = _build_ai_state()
 
-            total_actions_written = 0
+            # Hard safety stop (foundation for Task #13)
+            safety = ai_state.get("safety") or {}
+            if safety.get("is_safe") is False:
+                logger.warning("🚫 Snapshot unsafe, skipping policy eval: %s", safety.get("reasons"))
+            else:
+                total_written = 0
 
-            # 1) Sample policy (toy, advisory → adapted into AIAction)
-            sample_actions = _run_sample_policy(ai_state)
-            if sample_actions:
-                written = _dispatch_actions(sample_actions, label=ACCOUNT_LABEL)
-                total_actions_written += written
+                sample_actions = _run_sample_policy(ai_state)
+                total_written += _dispatch_actions(sample_actions, label=ACCOUNT_LABEL)
 
-            # 2) Core policy (real brain scaffold)
-            core_actions = _run_core_policy(ai_state)
-            if core_actions:
-                written = _dispatch_actions(core_actions, label=ACCOUNT_LABEL)
-                total_actions_written += written
+                core_actions = _run_core_policy(ai_state)
+                total_written += _dispatch_actions(core_actions, label=ACCOUNT_LABEL)
 
-            if total_actions_written > 0:
-                logger.info(
-                    "AI Pilot emitted actions for label=%s "
-                    "(sample=%d, core=%d, written=%d)",
-                    ACCOUNT_LABEL,
-                    len(sample_actions),
-                    len(core_actions),
-                    total_actions_written,
-                )
+                if total_written > 0:
+                    logger.info(
+                        "AI Pilot emitted actions (sample=%d, core=%d, written=%d)",
+                        len(sample_actions),
+                        len(core_actions),
+                        total_written,
+                    )
 
         except Exception as e:
             alert_bot_error("ai_pilot", f"loop error: {e}", "ERROR")
 
-        # Simple pacing
         elapsed = time.time() - t0
-        sleep_sec = max(0.5, POLL_SECONDS - elapsed)
-        time.sleep(sleep_sec)
+        time.sleep(max(0.5, POLL_SECONDS - elapsed))
 
 
 if __name__ == "__main__":

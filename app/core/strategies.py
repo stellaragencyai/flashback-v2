@@ -4,43 +4,15 @@
 app.core.strategies
 
 Flashback — Strategy Registry Loader & Gate
-
-- Loads config/strategies.yaml
-- Normalizes "subaccounts" entries into Strategy objects
-- Provides helper functions for:
-    * listing all strategies
-    * looking up strategies by symbol / timeframe
-    * deciding which strategies are allowed to trade LIVE vs LEARN_DRY
-
-YAML shape (v5):
-
-version: 5
-notes: |
-  ...
-subaccounts:
-  - sub_uid: 524630315        # or null for MAIN
-    account_label: flashback01 # or "main" for MAIN
-    name: Sub1_Trend
-    role: trend_follow
-    enabled: true
-    symbols: [BTCUSDT, ETHUSDT, SOLUSDT]
-    timeframes: ["15", "60"]
-    risk_per_trade_pct: 0.25
-    risk_pct: 0.25
-    max_concurrent_positions: 1
-    ai_profile: trend_v1
-    automation_mode: LEARN_DRY
-    exit_profile: standard_5
-    notes: | ...
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import List, Dict, Optional, Iterable
+from typing import List, Dict, Optional
 
-import yaml  # make sure PyYAML is installed
+import yaml  # type: ignore
 
 from app.core.config import settings
 from app.core.logger import get_logger
@@ -49,10 +21,6 @@ log = get_logger("strategies")
 
 CONFIG_PATH = Path(settings.ROOT) / "config" / "strategies.yaml"
 
-
-# ---------------------------------------------------------------------------
-# Data model
-# ---------------------------------------------------------------------------
 
 @dataclass
 class Strategy:
@@ -69,11 +37,10 @@ class Strategy:
     ai_profile: str
     automation_mode: str
     exit_profile: Optional[object]
-    raw: Dict  # keep raw dict for extra fields (notes, etc.)
+    raw: Dict
 
     @property
     def id(self) -> str:
-        """Human-friendly id used in logs."""
         label_part = self.account_label or "no_label"
         uid_part = f"{self.sub_uid}" if self.sub_uid is not None else "MAIN"
         return f"{self.name} [{label_part} | {uid_part}]"
@@ -84,38 +51,26 @@ class Strategy:
 
     @property
     def is_learn_dry(self) -> bool:
-        """AI + logging only, no live orders."""
         return self.automation_mode.upper() == "LEARN_DRY"
 
     @property
     def is_live_canary(self) -> bool:
-        """Tiny real trades (your Sub7_Canary)."""
         return self.automation_mode.upper() == "LIVE_CANARY"
 
     @property
     def is_live_full(self) -> bool:
-        """Future full live mode."""
         return self.automation_mode.upper() == "LIVE_FULL"
 
     @property
     def can_trade_live(self) -> bool:
-        """Should executor actually place real orders for this strategy?"""
         return self.is_live_canary or self.is_live_full
 
     @property
     def wants_ai_eval(self) -> bool:
-        """
-        Should this strategy be sent through AI gate / feature logging?
-        LEARN_DRY + LIVE_* both want AI evaluation.
-        """
         if self.is_off:
             return False
-        return True  # LEARN_DRY, LIVE_CANARY, LIVE_FULL
+        return True
 
-
-# ---------------------------------------------------------------------------
-# Load & cache
-# ---------------------------------------------------------------------------
 
 _STRATEGIES_CACHE: Optional[List[Strategy]] = None
 
@@ -140,9 +95,7 @@ def _parse_strategies(data: Dict) -> List[Strategy]:
         if not isinstance(raw, dict):
             continue
 
-        # sub_uid may be null for MAIN manual strategy
         sub_uid_raw = raw.get("sub_uid")
-        sub_uid: Optional[int]
         if sub_uid_raw in (None, "", "null"):
             sub_uid = None
         else:
@@ -170,31 +123,28 @@ def _parse_strategies(data: Dict) -> List[Strategy]:
 
         account_label = str(raw.get("account_label") or "").strip()
         if not account_label:
-            # Sensible fallback: MAIN for sub_uid None, otherwise sub_<uid>
-            if sub_uid is None:
-                account_label = "main"
-            else:
-                account_label = f"sub_{sub_uid}"
+            account_label = "main" if sub_uid is None else f"sub_{sub_uid}"
 
         exit_profile = raw.get("exit_profile")
 
-        s = Strategy(
-            sub_uid=sub_uid,
-            account_label=account_label,
-            name=name,
-            role=role,
-            enabled=enabled,
-            symbols=symbols,
-            timeframes=timeframes,
-            risk_per_trade_pct=risk_per_trade_pct,
-            risk_pct=risk_pct,
-            max_concurrent_positions=max_concurrent_positions,
-            ai_profile=ai_profile,
-            automation_mode=automation_mode,
-            exit_profile=exit_profile,
-            raw=raw,
+        strategies.append(
+            Strategy(
+                sub_uid=sub_uid,
+                account_label=account_label,
+                name=name,
+                role=role,
+                enabled=enabled,
+                symbols=symbols,
+                timeframes=timeframes,
+                risk_per_trade_pct=risk_per_trade_pct,
+                risk_pct=risk_pct,
+                max_concurrent_positions=max_concurrent_positions,
+                ai_profile=ai_profile,
+                automation_mode=automation_mode,
+                exit_profile=exit_profile,
+                raw=raw,
+            )
         )
-        strategies.append(s)
 
     log.info(
         "Loaded %d strategies from %s (version=%s)",
@@ -212,64 +162,27 @@ def _ensure_loaded() -> None:
         _STRATEGIES_CACHE = _parse_strategies(data)
 
 
-# ---------------------------------------------------------------------------
-# Public API
-# ---------------------------------------------------------------------------
-
 def all_sub_strategies() -> List[Strategy]:
-    """
-    Return all strategies (including disabled / OFF ones).
-    """
     _ensure_loaded()
     return list(_STRATEGIES_CACHE or [])
 
 
 def enabled_strategies() -> List[Strategy]:
-    """
-    Return only strategies with enabled == True (regardless of automation_mode).
-    """
     return [s for s in all_sub_strategies() if s.enabled]
 
 
 def strategies_for_symbol_timeframe(symbol: str, timeframe: str) -> List[Strategy]:
-    """
-    Return all ENABLED strategies that care about this symbol+timeframe.
-    """
     sym = symbol.upper()
     tf = str(timeframe).strip()
-    out: List[Strategy] = []
-
-    for s in enabled_strategies():
-        if sym in s.symbols and tf in s.timeframes:
-            out.append(s)
-
-    return out
+    return [s for s in enabled_strategies() if sym in s.symbols and tf in s.timeframes]
 
 
 def live_strategies_for_signal(symbol: str, timeframe: str) -> List[Strategy]:
-    """
-    Return strategies that BOTH:
-      - are enabled
-      - match symbol/timeframe
-      - are in LIVE_CANARY or LIVE_FULL mode (real orders allowed)
-    """
-    return [
-        s
-        for s in strategies_for_symbol_timeframe(symbol, timeframe)
-        if s.can_trade_live
-    ]
+    return [s for s in strategies_for_symbol_timeframe(symbol, timeframe) if s.can_trade_live]
 
 
 def ai_strategies_for_signal(symbol: str, timeframe: str) -> List[Strategy]:
-    """
-    Return strategies that should be evaluated by AI gate / feature logging
-    for this symbol+timeframe (LEARN_DRY + LIVE_*).
-    """
-    return [
-        s
-        for s in strategies_for_symbol_timeframe(symbol, timeframe)
-        if s.wants_ai_eval
-    ]
+    return [s for s in strategies_for_symbol_timeframe(symbol, timeframe) if s.wants_ai_eval]
 
 
 def get_strategy_by_sub_uid(sub_uid: int) -> Optional[Strategy]:
@@ -277,3 +190,17 @@ def get_strategy_by_sub_uid(sub_uid: int) -> Optional[Strategy]:
         if s.sub_uid == sub_uid:
             return s
     return None
+
+
+def get_strategy_for_sub(sub_uid: str) -> Optional[Dict]:
+    """
+    Compatibility helper used by tp_sl_manager.py.
+    Returns the raw dict from strategies.yaml for this sub_uid.
+    """
+    try:
+        uid = int(sub_uid)
+    except Exception:
+        return None
+
+    s = get_strategy_by_sub_uid(uid)
+    return s.raw if s else None

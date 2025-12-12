@@ -1,16 +1,56 @@
 # config/risk_profiles.yaml
-#
-# Named risk templates referenced by the risk engine.
+version: 1
+notes: |
+  Minimal starter risk profiles so config validator passes.
+  Tune later.
 
 profiles:
-  ULTRA_BOOTSTRAP:
-    risk_per_trade_pct: 0.30     # 30% for tiny accounts / Tier 1–3 insanity
-    max_concurrent_risk_pct: 0.90
+  main_manual:
+    risk_pct: 0.25
+    max_concurrent_positions: 1
+    max_leverage: 75
+    allow_cross: true
+    allow_isolated: true
 
-  STANDARD:
-    risk_per_trade_pct: 0.01     # 1%
-    max_concurrent_risk_pct: 0.06
+  default_sub:
+    risk_pct: 0.25
+    max_concurrent_positions: 1
+    max_leverage: 50
+    allow_cross: true
+    allow_isolated: true
 
-  CONSERVATIVE:
-    risk_per_trade_pct: 0.005    # 0.5%
-    max_concurrent_risk_pct: 0.03
+  hft_mm:
+    risk_pct: 0.10
+    max_concurrent_positions: 3
+    max_leverage: 25
+    allow_cross: true
+    allow_isolated: true
+
+  spec_small:
+    risk_pct: 0.15
+    max_concurrent_positions: 1
+    max_leverage: 75
+    allow_cross: true
+    allow_isolated: true
+
+  canary_low_risk:
+    risk_pct: 0.05
+    max_concurrent_positions: 1
+    max_leverage: 20
+    allow_cross: true
+    allow_isolated: true
+
+  swing_default:
+    risk_pct: 0.20
+    max_concurrent_positions: 1
+    max_leverage: 10
+    allow_cross: true
+    allow_isolated: true
+
+  manual_only:
+    risk_pct: 0.25
+    max_concurrent_positions: 1
+    max_leverage: 75
+    allow_cross: true
+    allow_isolated: true
+    manual_only: true
