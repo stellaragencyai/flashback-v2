@@ -1,14 +1,42 @@
-# venvs and Python junk
-.venv/
+# ---- Python ----
 __pycache__/
 *.pyc
+*.pyo
+*.pyd
+*.log
 
-# secrets & state
-.env
-app/state/
-app/logs/
+# ---- Virtual envs ----
+.venv/
+venv/
+ENV/
 
-# OS/editor trash
+# ---- Tool caches ----
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.cache/
+
+# ---- Editors ----
+.vscode/
+.idea/
+
+# ---- OS ----
 .DS_Store
 Thumbs.db
-.vscode/
+
+# ---- Local state / runtime artifacts ----
+state/**
+logs/**
+tmp/**
+*.zip
+
+# Keep folder structure / placeholders if you want
+!state/.gitkeep
+!logs/.gitkeep
+!tmp/.gitkeep
+
+# ---- Large data files (add more if needed) ----
+*.jsonl
+*.parquet
+*.csv
+*.ndjson
