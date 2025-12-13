@@ -1,42 +1,58 @@
-# ---- Python ----
+# ===============================
+# ENV / SECRETS
+# ===============================
+.env
+.env.*
+
+# ===============================
+# PYTHON
+# ===============================
 __pycache__/
 *.pyc
 *.pyo
 *.pyd
-*.log
-
-# ---- Virtual envs ----
 .venv/
 venv/
-ENV/
 
-# ---- Tool caches ----
-.pytest_cache/
-.mypy_cache/
-.ruff_cache/
-.cache/
+# ===============================
+# RUNTIME STATE (NEVER COMMIT)
+# ===============================
+state/
+state_RUNTIME_HOLD/
+signals/
+logs/
+tmp/
 
-# ---- Editors ----
-.vscode/
-.idea/
+# ===============================
+# DATA / MODELS
+# ===============================
+*.jsonl
+*.cursor
+*.db
+models/
 
-# ---- OS ----
+# ===============================
+# OS / EDITOR
+# ===============================
 .DS_Store
 Thumbs.db
+.vscode/
 
-# ---- Local state / runtime artifacts ----
-state/**
-logs/**
-tmp/**
-*.zip
+.env
+app/state/
+state_RUNTIME_HOLD/
+tmp/
+logs/
+state/
 
-# Keep folder structure / placeholders if you want
-!state/.gitkeep
-!logs/.gitkeep
-!tmp/.gitkeep
-
-# ---- Large data files (add more if needed) ----
+state/
+logs/
+signals/
+tmp/
+state_RUNTIME_HOLD/
+app/state/
 *.jsonl
-*.parquet
-*.csv
-*.ndjson
+*.cursor
+*.db
+.env
+
