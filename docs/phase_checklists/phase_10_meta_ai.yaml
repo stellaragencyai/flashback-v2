@@ -1,0 +1,32 @@
+phase: Phase 10 — Multi-AI Non-Human Ecosystem
+
+checklist:
+  - id: P10-01
+    task: Governance spec exists (what AI can change, what requires approval)
+    status: NOT_DONE
+    evidence: docs/phase_10_governance.md defines permissions + rollback rules
+
+  - id: P10-02
+    task: Meta-AI package exists with clear agent boundaries
+    status: NOT_DONE
+    evidence: app/meta_ai/ contains separate agents (policy, strategy, risk, ops, allocator)
+
+  - id: P10-03
+    task: Experiment registry exists (A/B, cohorts, promotion rules)
+    status: NOT_DONE
+    evidence: config/experiments.yaml + tooling to record experiment ids in datasets/logs
+
+  - id: P10-04
+    task: Automatic rollback mechanism exists for bad promotions
+    status: NOT_DONE
+    evidence: model/strategy promotions can be reverted automatically on performance deterioration
+
+  - id: P10-05
+    task: Capital allocator agent exists (subaccount allocation policy)
+    status: NOT_DONE
+    evidence: allocator reads performance + risk budgets and recommends/executes allocations safely
+
+  - id: P10-06
+    task: Ops self-healing exists (restart dead workers, detect drift, safe stop)
+    status: NOT_DONE
+    evidence: meta ops agent monitors health signals and enforces safe mode without human babysitting
