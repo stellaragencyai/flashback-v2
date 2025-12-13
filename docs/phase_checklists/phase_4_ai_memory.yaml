@@ -1,0 +1,42 @@
+phase: Phase 4 — AI Memory & Journal System
+
+checklist:
+  - id: P4-01
+    task: AI events spine exists as canonical event writer
+    status: DONE
+    evidence: app/ai/ai_events_spine.py exists and is used for AI event persistence
+
+  - id: P4-02
+    task: Outcome joiner exists and produces OutcomeRecord events
+    status: DONE
+    evidence: app/ai/outcome_joiner.py exists and joins executions into outcomes
+
+  - id: P4-03
+    task: Journal worker persists SetupContext and outcomes to disk
+    status: DONE
+    evidence: app/ai/ai_journal_worker.py persists AI events into JSONL logs
+
+  - id: P4-04
+    task: Setup memory builder exists (features + outcomes → labeled dataset)
+    status: DONE
+    evidence: app/tools/setup_memory_builder.py produces state/setup_memory.jsonl (or canonical path)
+
+  - id: P4-05
+    task: Coverage report exists (setups/outcomes/merged/orphans)
+    status: NOT_DONE
+    evidence: one canonical tool prints X setups, Y outcomes, Z merged, A/B orphans
+
+  - id: P4-06
+    task: Result bucketing enforced
+    status: NOT_DONE
+    evidence: setup_memory rows require r_multiple and result_bucket in fixed enum
+
+  - id: P4-07
+    task: End-to-end chain runs in normal stack routine
+    status: NOT_DONE
+    evidence: supervisor/run_all includes outcome_joiner + journal worker in a documented command
+
+  - id: P4-08
+    task: Memory sanity tool exists and is authoritative
+    status: DONE
+    evidence: app/tools/ai_memory_sanity.py exists and flags mismatch thresholds clearly

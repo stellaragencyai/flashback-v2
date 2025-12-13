@@ -1,0 +1,42 @@
+phase: Phase 6 — AI Policy Layer (Decision Intelligence)
+
+checklist:
+  - id: P6-01
+    task: Policy config exists and is readable/writable
+    status: DONE
+    evidence: app/ai/setup_memory_policy.py reads/writes state/setup_policy.json (or canonical)
+
+  - id: P6-02
+    task: AI executor gate exists and enforces policy
+    status: DONE
+    evidence: app/ai/ai_executor_gate.py is used by executor to allow/deny actions
+
+  - id: P6-03
+    task: Policy log exists (audit trail of allow/deny)
+    status: DONE
+    evidence: decisions written to policy log JSONL (canonical path)
+
+  - id: P6-04
+    task: Drift monitor exists
+    status: DONE
+    evidence: app/ai/drift_watch.py computes recent performance stats
+
+  - id: P6-05
+    task: Policy dashboard summary exists
+    status: NOT_DONE
+    evidence: tool prints allowed/denied breakdown by strategy and denial reasons
+
+  - id: P6-06
+    task: Policy tuner is consolidated to one canonical script/module
+    status: NOT_DONE
+    evidence: no duplicated policy tuning scripts; one clear entrypoint exists
+
+  - id: P6-07
+    task: Drift alerts wired to Telegram (safe warnings)
+    status: NOT_DONE
+    evidence: drift deterioration triggers TG alert and optional safe-mode flag
+
+  - id: P6-08
+    task: Safe policy update workflow exists (suggestion vs apply)
+    status: NOT_DONE
+    evidence: tuner writes suggestions and requires explicit human approval to apply changes

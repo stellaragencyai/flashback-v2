@@ -1,0 +1,42 @@
+phase: Phase 9 — Fully Automated, Self-Learning Trading Organism
+
+checklist:
+  - id: P9-01
+    task: Builders exist (feature store + setup memory)
+    status: DONE
+    evidence: feature_store_builder + setup_memory_builder exist and produce canonical outputs
+
+  - id: P9-02
+    task: Model training script exists
+    status: DONE
+    evidence: app/ai/train_models.py exists and outputs model artifacts
+
+  - id: P9-03
+    task: Full cycle orchestrator exists (build → train → evaluate → export)
+    status: NOT_DONE
+    evidence: app/ai/ai_full_cycle.py runs end-to-end reliably
+
+  - id: P9-04
+    task: Model registry + versioning exists
+    status: NOT_DONE
+    evidence: models/ contains versioned model + meta json per version
+
+  - id: P9-05
+    task: Safe promotion logic exists
+    status: NOT_DONE
+    evidence: new model promoted only if metrics >= previous; otherwise rejected
+
+  - id: P9-06
+    task: Deployment contract exists (executor loads chosen model version)
+    status: NOT_DONE
+    evidence: setup_policy selects model version; executor loads that version deterministically
+
+  - id: P9-07
+    task: Training schedule exists (manual weekly at minimum)
+    status: NOT_DONE
+    evidence: scripts/ai_full_cycle_weekly.ps1 or docs instruction exists and is followed
+
+  - id: P9-08
+    task: Performance-driven adaptation loop exists
+    status: NOT_DONE
+    evidence: policy suggestions + drift feed into cycle decisions safely

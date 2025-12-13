@@ -1,0 +1,52 @@
+phase: Phase 1 — Infrastructure & Core Architecture
+
+checklist:
+  - id: P1-01
+    task: Remove .git and .venv from share artifacts + enforce .gitignore rules
+    status: NOT_DONE
+    evidence: Clean audit ZIP excludes .git/ and .venv/; repo has hard ignore rules
+
+  - id: P1-02
+    task: Consolidate WS switchboard to one canonical implementation
+    status: NOT_DONE
+    evidence: Only one ws_switchboard.py holds real logic; others removed or thin adapters
+
+  - id: P1-03
+    task: Consolidate ai_action_router.py to one canonical module
+    status: NOT_DONE
+    evidence: Single canonical file (prefer app/core/ai_action_router.py), duplicates removed
+
+  - id: P1-04
+    task: Add bus schema validator tool
+    status: NOT_DONE
+    evidence: app/tools/bus_validator.py validates positions/orderbook/trades buses vs bus_types
+
+  - id: P1-05
+    task: Infrastructure runbook exists
+    status: NOT_DONE
+    evidence: docs/infra.md includes exact start commands + state file meanings
+
+  - id: P1-06
+    task: Core bus modules exist and import cleanly
+    status: DONE
+    evidence: app/core/*_bus.py present and importable
+
+  - id: P1-07
+    task: Supervisor runs AI stack per ACCOUNT_LABEL
+    status: DONE
+    evidence: supervisor_ai_stack.py exists and starts workers per label
+
+  - id: P1-08
+    task: TP/SL Manager exists and is strategy-aware
+    status: DONE
+    evidence: app/bots/tp_sl_manager.py reads strategies/exit profiles
+
+  - id: P1-09
+    task: Shared core helpers centralized
+    status: DONE
+    evidence: app/core/flashback_common.py present and used broadly
+
+  - id: P1-10
+    task: Fossils/junk archived or removed from root and bots
+    status: NOT_DONE
+    evidence: dead/legacy scripts moved into app/lab/ or deleted; root stays clean

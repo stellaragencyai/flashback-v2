@@ -1,0 +1,32 @@
+phase: Phase 5 — Strategy Profiles + Exit Profiles
+
+checklist:
+  - id: P5-01
+    task: strategies.yaml defines risk_pct and exit_profile per strategy
+    status: DONE
+    evidence: config/strategies.yaml includes risk_pct + exit_profile mappings
+
+  - id: P5-02
+    task: Exit profiles file exists and is used
+    status: DONE
+    evidence: config/exit_profiles.yaml exists and tp_sl_manager loads profiles
+
+  - id: P5-03
+    task: TP/SL manager honors exit profiles (standard_10/standard_5/custom_5)
+    status: DONE
+    evidence: tp_sl_manager.py reads exit_profile and places correct ladder behavior
+
+  - id: P5-04
+    task: Deterministic profile tester exists
+    status: NOT_DONE
+    evidence: app/tools/tp_sl_profile_tester.py validates TP count, spacing, sizing sums for synthetic positions
+
+  - id: P5-05
+    task: Custom_5 spec defined (contract, not just a label)
+    status: NOT_DONE
+    evidence: docs/exit_profiles.md or config notes define how custom_5 differs from standard_5
+
+  - id: P5-06
+    task: exit_profile is logged into AI dataset
+    status: NOT_DONE
+    evidence: setup_memory includes exit_profile field so AI can compare performance across profiles

@@ -1,0 +1,42 @@
+phase: Phase 3 — AI State Engine
+
+checklist:
+  - id: P3-01
+    task: Feature snapshots captured at trade open
+    status: DONE
+    evidence: app/ai/feature_logger.py exists and writes feature snapshots in a consistent format
+
+  - id: P3-02
+    task: Feature store builder exists
+    status: DONE
+    evidence: app/tools/feature_store_builder.py builds state/feature_store.jsonl (or equivalent canonical output)
+
+  - id: P3-03
+    task: AI state inspection tool exists
+    status: DONE
+    evidence: app/tools/ai_state_inspector.py summarizes counts, symbols, strategies
+
+  - id: P3-04
+    task: AI state health enforcement exists (min samples, skew warnings)
+    status: NOT_DONE
+    evidence: app/tools/ai_state_health.py outputs RED/YELLOW/GREEN with thresholds
+
+  - id: P3-05
+    task: Dataset schema validation is enforced
+    status: NOT_DONE
+    evidence: health tool validates required keys/schema version and fails loudly
+
+  - id: P3-06
+    task: Daily maintenance command exists (build → health)
+    status: NOT_DONE
+    evidence: scripts/ai_phase3_daily.ps1 runs builder then health and prints summary
+
+  - id: P3-07
+    task: Clear empty-dataset behavior
+    status: NOT_DONE
+    evidence: builder/health prints “No trades yet; OK” instead of failing or silently doing nothing
+
+  - id: P3-08
+    task: AI state bus/store access layer exists
+    status: DONE
+    evidence: app/core/ai_state_bus.py and ai_store.py exist and are used

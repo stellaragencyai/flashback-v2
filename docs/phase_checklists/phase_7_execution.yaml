@@ -1,0 +1,42 @@
+phase: Phase 7 — AI Execution Engine (Live Execution)
+
+checklist:
+  - id: P7-01
+    task: Multi-account executor exists
+    status: DONE
+    evidence: app/bots/executor_v2.py exists and routes signals per strategy/sub
+
+  - id: P7-02
+    task: Guardrails exist and are active (risk/corr/session/portfolio)
+    status: DONE
+    evidence: risk_guardian, breakers, corr_gate_v2, portfolio/session guards present and used
+
+  - id: P7-03
+    task: Executor replay exists (paper harness)
+    status: DONE
+    evidence: app/tools/executor_replay.py replays signals safely
+
+  - id: P7-04
+    task: Execution recovery daemon exists
+    status: DONE
+    evidence: app/bots/execution_recovery_daemon.py generates reconciliation reports and alerts
+
+  - id: P7-05
+    task: Latency metrics are written (not just reported)
+    status: NOT_DONE
+    evidence: executor writes state/execution_latency.jsonl and report reads it
+
+  - id: P7-06
+    task: Recovery anomalies enforce safe lockout
+    status: NOT_DONE
+    evidence: recovery creates state/execution_suspect.lock and executor/supervisor respects it
+
+  - id: P7-07
+    task: Idempotency harness exists (no duplicate orders for same signal)
+    status: NOT_DONE
+    evidence: replay test proves the same signal cannot place twice
+
+  - id: P7-08
+    task: Crash recovery runbook exists
+    status: NOT_DONE
+    evidence: docs/recovery.md gives exact restart steps and safeguards

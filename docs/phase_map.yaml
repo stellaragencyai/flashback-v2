@@ -1,0 +1,45 @@
+phase_1_infrastructure:
+  - app/core/
+  - app/bots/supervisor*
+  - app/ws/
+  - app/bots/tp_sl_manager.py
+
+phase_2_multi_account:
+  - config/subaccounts.yaml
+  - config/strategies.yaml
+  - app/core/strategy_registry.py
+  - app/core/subs.py
+
+phase_3_ai_state:
+  - app/ai/feature_*
+  - app/tools/feature_store_builder.py
+  - app/tools/ai_state_inspector.py
+
+phase_4_ai_memory:
+  - app/ai/outcome_joiner.py
+  - app/ai/ai_journal_worker.py
+  - app/ai/setup_memory.py
+  - app/ai/ai_events_spine.py
+
+phase_5_strategies_exits:
+  - config/exit_profiles.yaml
+  - app/core/strategies.py
+  - app/bots/tp_sl_manager.py
+
+phase_6_policy:
+  - app/ai/ai_executor_gate.py
+  - app/ai/setup_memory_policy.py
+  - app/ai/drift_watch.py
+
+phase_7_execution:
+  - app/bots/executor_v2.py
+  - app/bots/execution_recovery_daemon.py
+
+phase_8_canary:
+  - app/strategies/canary.py
+
+phase_9_organism:
+  - app/ai/train_models.py
+
+phase_10_meta_ai:
+  - app/meta_ai/

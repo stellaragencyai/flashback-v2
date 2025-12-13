@@ -1,0 +1,42 @@
+phase: Phase 2 — Stable Multi-Account Engine
+
+checklist:
+  - id: P2-01
+    task: Multi-account health wrapper exists (one PASS/WARN/FAIL)
+    status: NOT_DONE
+    evidence: app/tools/multi_account_health.py runs sanity + validate + optional smoke and prints consolidated summary
+
+  - id: P2-02
+    task: Subaccounts + strategies registry validation is enforced
+    status: DONE
+    evidence: app/tools/subaccount_sanity.py and validate_subs.py exist and catch mismatches
+
+  - id: P2-03
+    task: Multi-account smoke replay exists for paper testing
+    status: DONE
+    evidence: app/tools/multi_account_smoke.py replays synthetic signals in safe mode
+
+  - id: P2-04
+    task: Heartbeat naming convention is standardized per ACCOUNT_LABEL
+    status: NOT_DONE
+    evidence: ws_switchboard_heartbeat_<label>.txt freshness checked for all enabled accounts
+
+  - id: P2-05
+    task: Strategies.yaml and subaccounts.yaml are the single sources of truth
+    status: DONE
+    evidence: runtime consumers load config/strategies.yaml and config/subaccounts.yaml consistently (no competing registry)
+
+  - id: P2-06
+    task: Multi-account runbook exists
+    status: NOT_DONE
+    evidence: docs/multi_account.md contains exact pre-live commands and checks
+
+  - id: P2-07
+    task: Config sanity tool exists and is used in routine
+    status: DONE
+    evidence: app/tools/config_sanity.py exists and flags invalid configs loudly
+
+  - id: P2-08
+    task: Per-sub automation modes are enforced consistently
+    status: NOT_DONE
+    evidence: executor + supervisor honor automation_mode for each sub, not just main

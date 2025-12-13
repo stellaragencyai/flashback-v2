@@ -1,0 +1,32 @@
+phase: Phase 8 — Multi-Agent Coordination + Canary Testing
+
+checklist:
+  - id: P8-01
+    task: Canary strategy exists (Sub7 lane)
+    status: DONE
+    evidence: app/strategies/canary.py exists and supports canary patterns
+
+  - id: P8-02
+    task: Canary monitoring tool exists
+    status: NOT_DONE
+    evidence: app/tools/canary_monitor.py writes state/canary_status.json and sends TG summaries
+
+  - id: P8-03
+    task: Canary rollback trigger exists
+    status: NOT_DONE
+    evidence: canary monitor creates lock file when DD/WR breaches and executor respects it
+
+  - id: P8-04
+    task: Drift watch is canary-specialized
+    status: NOT_DONE
+    evidence: drift stats computed for Sub7 only and alerts are canary-specific
+
+  - id: P8-05
+    task: Dataset tagging includes mode (PAPER/LIVE_CANARY/LIVE_FULL)
+    status: NOT_DONE
+    evidence: setup_memory rows include execution_mode field
+
+  - id: P8-06
+    task: Minimal A/B experiment logging exists
+    status: NOT_DONE
+    evidence: experiment id or cohort tag included for comparisons and promotions
