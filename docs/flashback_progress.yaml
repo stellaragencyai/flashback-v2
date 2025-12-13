@@ -1,0 +1,57 @@
+project: Flashback Trading AI
+last_updated: '2025-12-12'
+overall:
+  weighted_completion_pct: 39.42
+  note: Percentages are checklist-derived. DONE only counts when evidence is real
+    and committed.
+phases:
+  phase_1:
+    name: "Phase 1 \u2014 Infrastructure & Core Architecture"
+    completion_pct: 40.0
+    checklist_total: 10
+    checklist_done: 4
+  phase_2:
+    name: "Phase 2 \u2014 Stable Multi-Account Engine"
+    completion_pct: 50.0
+    checklist_total: 8
+    checklist_done: 4
+  phase_3:
+    name: "Phase 3 \u2014 AI State Engine"
+    completion_pct: 50.0
+    checklist_total: 8
+    checklist_done: 4
+  phase_4:
+    name: "Phase 4 \u2014 AI Memory & Journal System"
+    completion_pct: 62.5
+    checklist_total: 8
+    checklist_done: 5
+  phase_5:
+    name: "Phase 5 \u2014 Strategy Profiles + Exit Profiles"
+    completion_pct: 50.0
+    checklist_total: 6
+    checklist_done: 3
+  phase_6:
+    name: "Phase 6 \u2014 AI Policy Layer (Decision Intelligence)"
+    completion_pct: 50.0
+    checklist_total: 8
+    checklist_done: 4
+  phase_7:
+    name: "Phase 7 \u2014 AI Execution Engine (Live Execution)"
+    completion_pct: 50.0
+    checklist_total: 8
+    checklist_done: 4
+  phase_8:
+    name: "Phase 8 \u2014 Multi-Agent Coordination + Canary Testing"
+    completion_pct: 16.67
+    checklist_total: 6
+    checklist_done: 1
+  phase_9:
+    name: "Phase 9 \u2014 Fully Automated, Self-Learning Trading Organism"
+    completion_pct: 25.0
+    checklist_total: 8
+    checklist_done: 2
+  phase_10:
+    name: "Phase 10 \u2014 Multi-AI Non-Human Ecosystem"
+    completion_pct: 0.0
+    checklist_total: 6
+    checklist_done: 0

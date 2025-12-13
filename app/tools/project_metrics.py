@@ -5,21 +5,27 @@
 Flashback — Project Metrics (Repo-based truth)
 
 Reads:
-- docs/phase_checklists/*.yaml
+- docs/phase_checklists/phase_*.yaml
 
 Outputs:
 - per-phase completion (DONE / total)
 - overall completion (simple average)
 
+Optional:
+- --write  → updates docs/flashback_progress.yaml using checklist truth
+
 Usage:
   python -m app.tools.project_metrics
+  python -m app.tools.project_metrics --write
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import date
 from pathlib import Path
-from typing import Dict, List, Tuple
+from typing import List, Tuple
+import sys
 
 import yaml  # type: ignore
 
@@ -40,6 +46,7 @@ class PhaseRow:
 
 
 def repo_root() -> Path:
+    # app/tools/project_metrics.py -> app/tools -> app -> repo root
     return Path(__file__).resolve().parents[2]
 
 
@@ -68,6 +75,7 @@ def load_checklist(path: Path) -> Tuple[str, int, int]:
     for item in checklist:
         if not isinstance(item, dict):
             raise ValueError(f"Checklist item must be dict in {path}: {item}")
+
         _id = str(item.get("id", "")).strip()
         status = str(item.get("status", "")).strip().upper()
 
@@ -78,7 +86,9 @@ def load_checklist(path: Path) -> Tuple[str, int, int]:
         seen_ids.add(_id)
 
         if status not in VALID_STATUSES:
-            raise ValueError(f"Invalid status '{status}' in {path} (use DONE/NOT_DONE)")
+            raise ValueError(
+                f"Invalid status '{status}' in {path} (use DONE/NOT_DONE)"
+            )
 
         total += 1
         if status == "DONE":
@@ -87,11 +97,71 @@ def load_checklist(path: Path) -> Tuple[str, int, int]:
     return phase_title, total, done
 
 
+def _phase_number_from_filename(path: Path) -> int:
+    # phase_7_execution.yaml -> 7
+    try:
+        parts = path.stem.split("_")
+        return int(parts[1])
+    except Exception as e:
+        raise ValueError(f"Bad phase checklist filename (expected phase_<n>_*.yaml): {path.name}") from e
+
+
+def write_progress_yaml(root: Path, rows: List[PhaseRow], overall_pct: float) -> Path:
+    """
+    Writes/updates docs/flashback_progress.yaml based purely on checklist truth.
+    """
+    progress_path = root / "docs" / "flashback_progress.yaml"
+
+    progress = {}
+    if progress_path.exists():
+        progress = load_yaml(progress_path)
+
+    # Top-level metadata
+    progress["project"] = progress.get("project", "Flashback Trading AI")
+    progress["last_updated"] = str(date.today())
+
+    overall = progress.get("overall", {})
+    if not isinstance(overall, dict):
+        overall = {}
+
+    overall["weighted_completion_pct"] = overall_pct
+    overall.setdefault(
+        "note",
+        "Percentages are checklist-derived. DONE only counts when evidence is real and committed.",
+    )
+    progress["overall"] = overall
+
+    # Phases mapping (keep existing keys if present, otherwise create deterministic ones)
+    phases = progress.get("phases", {})
+    if not isinstance(phases, dict):
+        phases = {}
+
+    existing_keys = list(phases.keys())
+
+    for idx, r in enumerate(rows, start=1):
+        # Preserve existing key ordering if it exists; otherwise use deterministic key.
+        phase_key = existing_keys[idx - 1] if len(existing_keys) >= idx else f"phase_{idx}"
+
+        phases.setdefault(phase_key, {})
+        phases[phase_key]["name"] = r.phase_title
+        phases[phase_key]["completion_pct"] = r.pct
+        phases[phase_key]["checklist_total"] = r.total
+        phases[phase_key]["checklist_done"] = r.done
+
+    progress["phases"] = phases
+
+    progress_path.write_text(yaml.safe_dump(progress, sort_keys=False), encoding="utf-8")
+    return progress_path
+
+
 def main() -> int:
     root = repo_root()
     checklist_dir = root / "docs" / "phase_checklists"
 
-    files = sorted(checklist_dir.glob("phase_*.yaml"))
+    files = sorted(
+        checklist_dir.glob("phase_*.yaml"),
+        key=_phase_number_from_filename
+    )
     if not files:
         raise FileNotFoundError(f"No phase checklist files found in {checklist_dir}")
 
@@ -112,6 +182,11 @@ def main() -> int:
         print(f"    Done: {r.done}/{r.total}  →  {r.pct}%\n")
 
     print(f"🎯 Overall completion (simple average): {overall}%\n")
+
+    if "--write" in sys.argv:
+        path = write_progress_yaml(root, rows, overall)
+        print(f"📝 Updated progress file: {path}\n")
+
     return 0
 
 
