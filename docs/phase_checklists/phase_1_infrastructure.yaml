@@ -3,8 +3,8 @@ phase: Phase 1 — Infrastructure & Core Architecture
 checklist:
   - id: P1-01
     task: Remove .git and .venv from share artifacts + enforce .gitignore rules
-    status: NOT_DONE
-    evidence: Clean audit ZIP excludes .git/ and .venv/; repo has hard ignore rules
+    status: DONE
+    evidence: Clean audit ZIP script exists and excludes .git/ and .venv/; .gitignore hardened to ignore runtime artifacts and secrets
 
   - id: P1-02
     task: Consolidate WS switchboard to one canonical implementation
@@ -48,5 +48,5 @@ checklist:
 
   - id: P1-10
     task: Fossils/junk archived or removed from root and bots
-    status: NOT_DONE
-    evidence: dead/legacy scripts moved into app/lab/ or deleted; root stays clean
+    status: DONE
+    evidence: Legacy bots moved out of app/bots into app/lab/bots_legacy; runtime junk removed from repo tracking

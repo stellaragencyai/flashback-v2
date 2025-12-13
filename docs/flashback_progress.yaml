@@ -1,15 +1,15 @@
 project: Flashback Trading AI
 last_updated: '2025-12-12'
 overall:
-  weighted_completion_pct: 39.42
+  weighted_completion_pct: 41.42
   note: Percentages are checklist-derived. DONE only counts when evidence is real
     and committed.
 phases:
   phase_1:
     name: "Phase 1 \u2014 Infrastructure & Core Architecture"
-    completion_pct: 40.0
+    completion_pct: 60.0
     checklist_total: 10
-    checklist_done: 4
+    checklist_done: 6
   phase_2:
     name: "Phase 2 \u2014 Stable Multi-Account Engine"
     completion_pct: 50.0
