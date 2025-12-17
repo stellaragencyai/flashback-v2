@@ -1,52 +1,14 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Flashback — Setup Outcomes Builder (trade_id spine)
+Flashback — Setup Outcomes Builder (trade_id spine) v1.2
 
-Purpose
--------
-Bridge between raw AI events and training-ready setup memory:
-
-    INPUTS:
-      - state/ai_events/setups.jsonl   (SetupContext events)
-      - state/ai_events/outcomes.jsonl (OutcomeRecord events)
-
-    OUTPUT:
-      - state/setup_outcomes.jsonl
-
-Each output row represents ONE trade_id and is the merged view:
-
-  {
-    "trade_id": "...",
-    "symbol": "BTCUSDT",
-    "account_label": "main",
-    "strategy_name": "Sub1_Trend",
-    "side": "LONG" | "SHORT" | "UNKNOWN",
-
-    "opened_at_ms": ...,
-    "closed_at_ms": ...,
-    "risk_pct": float | null,
-    "mode": "PAPER" | "LIVE_CANARY" | "LIVE_FULL" | "UNKNOWN",
-
-    "features": {...},        # from SetupContext.features
-    "sub_uid": "...",         # if provided
-    "timeframe": "15m" | "...",
-
-    "journal": {
-      "result": "WIN" | "LOSS" | "BREAKEVEN" | "UNKNOWN",
-      "realized_rr": float | null,
-      "realized_pnl": float | null,
-      "rating_score": int | null,
-      "rating_reason": str | null,
-      "duration_ms": int | null,
-      "duration_human": str | null
-    }
-  }
-
-Notes
------
-- This script is *purely* a join / aggregation step.
-- setup_memory.py consumes state/setup_outcomes.jsonl and adds final labels.
+Fixes vs v1.0
+-------------
+- Consumes BOTH outcome_enriched (preferred) and outcome_record (fallback).
+- Accepts strategy field drift: `strategy` OR `strategy_name`.
+- Timeframe is read from setup.timeframe or setup.payload.extra.timeframe.
+- If enriched exists for a trade_id, it wins (single-row truth).
 """
 
 from __future__ import annotations
@@ -60,18 +22,13 @@ try:
     from app.core.config import settings  # type: ignore
     from app.core.logger import get_logger  # type: ignore
 except Exception:  # pragma: no cover
-    # Fallbacks for ad-hoc runs
     class _DummySettings:  # type: ignore
         ROOT = Path(__file__).resolve().parents[2]
-
     settings = _DummySettings()  # type: ignore
-
     import logging
-
     def get_logger(name: str):  # type: ignore
         logging.basicConfig(level=logging.INFO)
         return logging.getLogger(name)
-
 
 ROOT: Path = getattr(settings, "ROOT", Path(__file__).resolve().parents[2])
 STATE_DIR: Path = ROOT / "state"
@@ -88,7 +45,6 @@ log = get_logger("setup_outcomes_builder")
 
 
 # ----------------- helpers -----------------
-
 
 def _load_jsonl(path: Path) -> Iterable[Dict[str, Any]]:
     if not path.exists():
@@ -137,6 +93,16 @@ def _fmt_duration(ms: Optional[int]) -> Optional[str]:
     return f"{minutes}m"
 
 
+def _get_strategy(ev: Dict[str, Any]) -> str:
+    s = ev.get("strategy")
+    if isinstance(s, str) and s.strip():
+        return s.strip()
+    s2 = ev.get("strategy_name")
+    if isinstance(s2, str) and s2.strip():
+        return s2.strip()
+    return "unknown"
+
+
 def _infer_side_from_features(features: Dict[str, Any]) -> str:
     sig = features.get("signal") or {}
     if not isinstance(sig, dict):
@@ -149,8 +115,18 @@ def _infer_side_from_features(features: Dict[str, Any]) -> str:
     return "UNKNOWN"
 
 
-# ----------------- indexing -----------------
+def _timeframe_from_setup(setup_ev: Dict[str, Any]) -> Any:
+    if "timeframe" in setup_ev:
+        return setup_ev.get("timeframe")
+    payload = setup_ev.get("payload") or {}
+    if isinstance(payload, dict):
+        extra = payload.get("extra") or {}
+        if isinstance(extra, dict) and "timeframe" in extra:
+            return extra.get("timeframe")
+    return None
 
+
+# ----------------- indexing -----------------
 
 def _index_setups(rows: Iterable[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
     out: Dict[str, Dict[str, Any]] = {}
@@ -160,37 +136,50 @@ def _index_setups(rows: Iterable[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
         tid = str(ev.get("trade_id") or "").strip()
         if not tid:
             continue
-        # last event wins if duplicates
         out[tid] = ev
     return out
 
 
-def _group_outcomes(rows: Iterable[Dict[str, Any]]) -> Dict[str, List[Dict[str, Any]]]:
-    out: Dict[str, List[Dict[str, Any]]] = {}
+def _index_outcomes(rows: Iterable[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
+    """
+    One-trade_id truth:
+    - Prefer outcome_enriched if present
+    - Else last outcome_record
+    """
+    out: Dict[str, Dict[str, Any]] = {}
     for ev in rows:
-        if ev.get("event_type") != "outcome_record":
+        et = ev.get("event_type")
+        if et not in ("outcome_enriched", "outcome_record"):
             continue
         tid = str(ev.get("trade_id") or "").strip()
         if not tid:
             continue
-        out.setdefault(tid, []).append(ev)
+
+        prev = out.get(tid)
+        if prev is None:
+            out[tid] = ev
+            continue
+
+        # Enriched always wins
+        if ev.get("event_type") == "outcome_enriched":
+            out[tid] = ev
+            continue
+
+        # If we already have enriched, keep it
+        if prev.get("event_type") == "outcome_enriched":
+            continue
+
+        # Both are outcome_record: last wins
+        out[tid] = ev
     return out
 
 
 # ----------------- core transform -----------------
 
-
-def _build_outcome_row(
-    trade_id: str,
-    setup_ev: Dict[str, Any],
-    outcome_evs: List[Dict[str, Any]],
-) -> Optional[Dict[str, Any]]:
-    if not outcome_evs:
-        return None
-
-    symbol = str(setup_ev.get("symbol") or "").upper()
-    account_label = str(setup_ev.get("account_label") or "main")
-    strategy_name = str(setup_ev.get("strategy") or "unknown")
+def _build_row(trade_id: str, setup_ev: Dict[str, Any], out_ev: Dict[str, Any]) -> Dict[str, Any]:
+    symbol = str(setup_ev.get("symbol") or out_ev.get("symbol") or "").upper()
+    account_label = str(setup_ev.get("account_label") or out_ev.get("account_label") or "main")
+    strategy_name = _get_strategy(setup_ev) if _get_strategy(setup_ev) != "unknown" else _get_strategy(out_ev)
 
     payload = setup_ev.get("payload") or {}
     if not isinstance(payload, dict):
@@ -204,63 +193,77 @@ def _build_outcome_row(
     if not isinstance(extra, dict):
         extra = {}
 
-    # Times
+    # times
     ts_open_ms = _to_int(setup_ev.get("ts"))
-    ts_close_ms_candidates = [_to_int(ev.get("ts")) for ev in outcome_evs]
-    ts_close_ms_candidates = [x for x in ts_close_ms_candidates if x is not None]
+    ts_close_ms = _to_int(out_ev.get("ts"))
 
-    ts_close_ms: Optional[int] = max(ts_close_ms_candidates) if ts_close_ms_candidates else None
     duration_ms: Optional[int] = None
     if ts_open_ms is not None and ts_close_ms is not None and ts_close_ms >= ts_open_ms:
         duration_ms = ts_close_ms - ts_open_ms
 
-    # Risk / RR
+    # timeframe
+    timeframe = _timeframe_from_setup(setup_ev)
+
+    # risk fields
     risk_pct = _to_float(features.get("risk_pct"))
     risk_usd = _to_float(features.get("risk_usd"))
 
-    pnl_total = 0.0
-    for ev in outcome_evs:
-        op = ev.get("payload") or {}
-        try:
-            pnl_piece = float(op.get("pnl_usd") or 0.0)
-        except Exception:
-            pnl_piece = 0.0
-        pnl_total += pnl_piece
-
+    # stats
+    realized_pnl: Optional[float] = None
     realized_rr: Optional[float] = None
-    if risk_usd is not None and abs(risk_usd) > 1e-8:
-        realized_rr = pnl_total / risk_usd
+    result = "UNKNOWN"
 
-    # Result classification
-    if pnl_total > 0:
-        result = "WIN"
-    elif pnl_total < 0:
-        result = "LOSS"
-    elif abs(pnl_total) < 1e-8:
-        result = "BREAKEVEN"
+    if out_ev.get("event_type") == "outcome_enriched":
+        stats = out_ev.get("stats") or {}
+        if isinstance(stats, dict):
+            realized_pnl = _to_float(stats.get("pnl_usd"))
+            realized_rr = _to_float(stats.get("r_multiple"))
+            win = stats.get("win")
+            if win is True:
+                result = "WIN"
+            elif win is False:
+                result = "LOSS"
+            else:
+                # fallback on pnl sign
+                if realized_pnl is not None:
+                    if realized_pnl > 0:
+                        result = "WIN"
+                    elif realized_pnl < 0:
+                        result = "LOSS"
+                    else:
+                        result = "BREAKEVEN"
     else:
-        result = "UNKNOWN"
+        op = out_ev.get("payload") or {}
+        if not isinstance(op, dict):
+            op = {}
+        realized_pnl = _to_float(op.get("pnl_usd"))
+        # Compute RR if possible
+        if realized_pnl is not None and risk_usd is not None and abs(risk_usd) > 1e-8:
+            realized_rr = realized_pnl / risk_usd
+        if realized_pnl is not None:
+            if realized_pnl > 0:
+                result = "WIN"
+            elif realized_pnl < 0:
+                result = "LOSS"
+            else:
+                result = "BREAKEVEN"
 
     side = _infer_side_from_features(features)
 
-    # Mode / metadata
     mode = str(extra.get("mode") or "").upper() or "UNKNOWN"
-    timeframe = extra.get("timeframe")
     sub_uid = extra.get("sub_uid")
-
-    duration_human = _fmt_duration(duration_ms)
 
     journal = {
         "result": result,
         "realized_rr": realized_rr,
-        "realized_pnl": pnl_total,
+        "realized_pnl": realized_pnl,
         "rating_score": None,
         "rating_reason": None,
         "duration_ms": duration_ms,
-        "duration_human": duration_human,
+        "duration_human": _fmt_duration(duration_ms),
     }
 
-    row: Dict[str, Any] = {
+    return {
         "trade_id": trade_id,
         "symbol": symbol,
         "account_label": account_label,
@@ -276,8 +279,6 @@ def _build_outcome_row(
         "journal": journal,
     }
 
-    return row
-
 
 def build_setup_outcomes() -> None:
     log.info("[setup_outcomes] Loading setups from %s ...", SETUPS_PATH)
@@ -289,7 +290,7 @@ def build_setup_outcomes() -> None:
     log.info("[setup_outcomes] Loaded %d outcome events.", len(outcomes))
 
     setups_by_trade = _index_setups(setups)
-    outcomes_by_trade = _group_outcomes(outcomes)
+    outcomes_by_trade = _index_outcomes(outcomes)
 
     trade_ids = sorted(set(setups_by_trade.keys()) & set(outcomes_by_trade.keys()))
 
@@ -297,22 +298,14 @@ def build_setup_outcomes() -> None:
     missing_setups = sorted(set(outcomes_by_trade.keys()) - set(setups_by_trade.keys()))
 
     if missing_outcomes:
-        log.warning(
-            "[setup_outcomes] %d trade_ids have SetupContext but no OutcomeRecord (ignored).",
-            len(missing_outcomes),
-        )
+        log.warning("[setup_outcomes] %d trade_ids have SetupContext but no Outcome (ignored).", len(missing_outcomes))
     if missing_setups:
-        log.warning(
-            "[setup_outcomes] %d trade_ids have OutcomeRecord but no SetupContext (ignored).",
-            len(missing_setups),
-        )
+        log.warning("[setup_outcomes] %d trade_ids have Outcome but no SetupContext (ignored).", len(missing_setups))
 
     merged: List[Dict[str, Any]] = []
     for tid in trade_ids:
         try:
-            row = _build_outcome_row(tid, setups_by_trade[tid], outcomes_by_trade[tid])
-            if row:
-                merged.append(row)
+            merged.append(_build_row(tid, setups_by_trade[tid], outcomes_by_trade[tid]))
         except Exception as e:  # pragma: no cover
             log.exception("[setup_outcomes] Error building row for trade_id=%s: %r", tid, e)
 
@@ -321,11 +314,7 @@ def build_setup_outcomes() -> None:
         for row in merged:
             f.write(orjson.dumps(row) + b"\n")
 
-    log.info(
-        "[setup_outcomes] Wrote %d merged trades -> %s",
-        len(merged),
-        OUTPUT_PATH,
-    )
+    log.info("[setup_outcomes] Wrote %d merged trades -> %s", len(merged), OUTPUT_PATH)
     log.info("[setup_outcomes] Done.")
 
 

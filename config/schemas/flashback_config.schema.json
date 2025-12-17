@@ -1,0 +1,110 @@
+{
+  "$schema": "http://json-schema.org/draft/2020-12/schema",
+  "title": "Flashback Config Schema",
+  "type": "object",
+  "definitions": {
+    "riskProfile": {
+      "type": "object",
+      "properties": {
+        "risk_pct": { "type": "number", "minimum": 0 },
+        "max_concurrent_positions": { "type": "integer", "minimum": 0 },
+        "max_leverage": { "type": "number", "minimum": 1 },
+        "allow_cross": { "type": "boolean" },
+        "allow_isolated": { "type": "boolean" },
+        "manual_only": { "type": "boolean" }
+      },
+      "required": ["risk_pct", "max_concurrent_positions"]
+    },
+    "exitTier": {
+      "type": "object",
+      "properties": {
+        "rr": { "type": "number" },
+        "size_pct": { "type": "number", "minimum": 0, "maximum": 1 }
+      },
+      "required": ["rr", "size_pct"]
+    },
+    "exitProfile": {
+      "type": "object",
+      "properties": {
+        "tps": {
+          "type": "array",
+          "items": { "$ref": "#/definitions/exitTier" }
+        },
+        "sl": {
+          "type": "object",
+          "properties": { "rr": { "type": "number" } },
+          "required": ["rr"]
+        }
+      },
+      "required": ["tps", "sl"]
+    }
+  },
+  "properties": {
+    "strategies": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "sub_uid": { "type": ["integer", "null"] },
+          "account_label": { "type": "string" },
+          "strategy_name": { "type": "string" },
+          "role": { "type": "string" },
+          "enabled": { "type": "boolean" },
+          "symbols": {
+            "type": "array",
+            "items": { "type": "string" }
+          },
+          "timeframes": {
+            "type": "array",
+            "items": { "type": "string" }
+          },
+          "risk_pct": { "type": "number", "minimum": 0 },
+          "max_concurrent_positions": { "type": "integer", "minimum": 0 },
+          "ai_profile": { "type": "string" },
+          "automation_mode": { "type": "string" },
+          "exit_profile": { "type": "string" }
+        },
+        "required": [
+          "account_label",
+          "strategy_name",
+          "symbols",
+          "timeframes",
+          "risk_pct",
+          "max_concurrent_positions"
+        ]
+      }
+    },
+    "subaccounts": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "account_label": { "type": "string" },
+          "sub_uid": { "type": ["integer", "null"] },
+          "enabled": { "type": "boolean" },
+          "telegram_channel": { "type": "string" },
+          "risk_profile": { "type": "string" },
+          "enable_tp_sl": { "type": "boolean" },
+          "enable_journal": { "type": "boolean" },
+          "enable_ai_stack": { "type": "boolean" },
+          "ai_profile": { "type": "string" },
+          "automation_mode": { "type": "string" }
+        },
+        "required": ["account_label", "sub_uid"]
+      }
+    },
+    "risk_profiles": {
+      "type": "object",
+      "patternProperties": {
+        "^.*$": { "$ref": "#/definitions/riskProfile" }
+      }
+    },
+    "exit_profiles": {
+      "type": "object",
+      "patternProperties": {
+        "^.*$": { "$ref": "#/definitions/exitProfile" }
+      }
+    }
+  },
+  "required": ["strategies", "subaccounts", "risk_profiles", "exit_profiles"]
+}

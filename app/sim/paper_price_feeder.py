@@ -91,7 +91,10 @@ except Exception as e:  # pragma: no cover
     raise ImportError(f"Failed to import app.core.market_bus: {e}")
 
 # Paper broker
-from app.sim.paper_broker import PaperBroker
+try:
+    from app.sim.paper_broker import PaperBroker  # type: ignore
+except Exception as e:  # pragma: no cover
+    raise ImportError(f"Failed to import app.sim.paper_broker: {e}")
 
 
 def _env_bool(name: str, default: str = "false") -> bool:

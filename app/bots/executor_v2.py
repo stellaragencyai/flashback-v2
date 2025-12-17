@@ -1,35 +1,74 @@
-#!/usr/bin/env python3
+﻿#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
 Flashback — Auto Executor v2 (Strategy-aware, multi-sub, AI-gated, policy-aware)
 
-Purpose
--------
-- Consume signals from an append-only JSONL file (signals/observed.jsonl).
-- For EACH strategy defined in config/strategies.yaml:
-    • Check symbol + timeframe match via strategy_gate.
-    • Check enabled + automation mode.
-    • Run AI gating (classifier + min-score policy).
-    • Run correlation gate.
-    • Size entries (bayesian + risk_capped, policy-adjusted risk).
-    • Log feature snapshot for setup memory (feature_logger v3, trade_id-based).
-    • Place live or paper entries depending on automation_mode.
+Patch (2025-12-13c)
+-------------------
+Adds AI decision emission to state/ai_decisions.jsonl so:
+- ai_decision_enforcer has a real store to enforce from
+- decision_outcome_linker can join decisions ↔ outcomes consistently
+- TP/SL Manager can gate TP ladders by trade_id
 
-Automation modes
-----------------
-- OFF         : ignore strategy.
-- LEARN_DRY   : run AI + logging, NO live orders (paper / learning only).
-- LIVE_CANARY : live orders with small risk (as per strategies.yaml + policy).
-- LIVE_FULL   : normal live trading (once proven).
+Key behavior:
+- PAPER: decision is emitted once with trade_id=client_trade_id
+- LIVE: decision is emitted twice:
+    1) pre-order (trade_id=client_trade_id)
+    2) post-order (trade_id=orderId)  <-- joinable canonical trade_id
 
-Exits:
-- TP/SL handled by a separate bot (tp_sl_manager) for LIVE positions.
-- For PAPER positions, TP/SL are handled by PaperBroker.update_price(...).
+Patch (2025-12-13d)
+-------------------
+Adds decision enforcement + deterministic test hooks:
+- EXEC_ENFORCE_DECISIONS=true (default): enforce_decision(trade_id) must ALLOW or trade is blocked.
+- EXEC_FORCE_TRADE_ID=... (optional): override client_trade_id for deterministic tests (ex: BLOCK_TEST_1).
+- If enforcer returns size_multiplier (ALLOW with scaling), sizing uses it deterministically.
 
-Notes
------
-- Stateless across runs except for the cursor file.
-- Strategy definitions live in config/strategies.yaml.
+Patch (2025-12-13e)
+-------------------
+HARD GATE moved BEFORE sizing:
+- Decision enforcement happens immediately after client_trade_id creation
+- size_multiplier is applied into eff_risk_pct BEFORE bayesian_size/risk_capped_qty/portfolio_guard
+
+Patch (2025-12-13f) ✅ FIX
+-------------------------
+Executor now emits the *pilot legacy decision row* BEFORE enforcement.
+ai_decision_enforcer only consumes:
+  - manual override rows, or
+  - pilot legacy rows (schema_version==1 and "decision" in payload)
+
+So we:
+  1) call pilot_decide(setup_event)
+  2) append that dict to state/ai_decisions.jsonl
+  3) then enforce_decision(trade_id)
+
+Patch (2025-12-13g) ✅ FIX
+-------------------------
+Executor audit rows now reflect the *true enforced decision*:
+- decision_code == enforced_code (ex: COLD_START) instead of always ALLOW_TRADE
+- reason == enforced_reason
+- extra includes enforced_code/enforced_reason/enforced_size_multiplier
+
+Patch (2025-12-13h) ✅ FIX (Deterministic trade_id selection)
+-------------------------------------------------------------
+trade_id selection is now deterministic and priority-based:
+  1) Prefer sig['trade_id'] (or sig['client_trade_id']) if present
+  2) Else EXEC_FORCE_TRADE_ID
+  3) Else generated default
+
+Patch (2025-12-13i) ✅ FIX (Hardened decision-store writes)
+-----------------------------------------------------------
+Route all decision-store writes through app.core.ai_decision_logger.append_decision()
+(lock + tail-dedupe), with safe fallback to raw append if logger signature differs.
+
+Patch (2025-12-14a) ✅ FIX (Trade-ID namespacing + source_trade_id)
+-------------------------------------------------------------------
+If a signal provides a trade_id, that is treated as *source_trade_id*.
+We then compute an *effective* per-account client_trade_id so subaccounts do not collide.
+
+- source_trade_id: the original ID from the signal / forced / generated
+- client_trade_id: the effective, namespaced ID used for decisions/enforcement/broker
+- We write source_trade_id into every decision/audit row.
+- We log: trade_id_map source=... -> effective=...
 """
 
 from __future__ import annotations
@@ -38,6 +77,7 @@ import os
 import json
 import asyncio
 import time
+import hashlib
 from decimal import Decimal
 from pathlib import Path
 from typing import Dict, Optional, List, Any, Iterable, Tuple
@@ -46,41 +86,32 @@ from app.core.config import settings
 
 # ---------- Robust logger import ---------- #
 try:
-    # Preferred: dedicated logger module
     from app.core.logger import get_logger, bind_context  # type: ignore
 except Exception:
     try:
-        # Fallback: older / alternate logging module
         from app.core.log import get_logger as _get_logger  # type: ignore
-
         import logging
 
         def bind_context(logger: "logging.Logger", **ctx):
-            """
-            Minimal bind_context fallback:
-            just returns the same logger, ignoring context.
-            """
             return logger
 
         get_logger = _get_logger  # type: ignore
     except Exception:
-        # Last resort: plain stdlib logging
         import logging
 
         def get_logger(name: str) -> "logging.Logger":  # type: ignore
             logger_ = logging.getLogger(name)
             if not logger_.handlers:
                 handler = logging.StreamHandler()
-                fmt = logging.Formatter(
-                    "%(asctime)s [%(levelname)s] [%(name)s] %(message)s"
-                )
+                fmt = logging.Formatter("%(asctime)s [%(levelname)s] [%(name)s] %(message)s")
                 handler.setFormatter(fmt)
-            logger_.addHandler(handler)
+                logger_.addHandler(handler)
             logger_.setLevel(logging.INFO)
             return logger_
 
         def bind_context(logger: "logging.Logger", **ctx):  # type: ignore
             return logger
+
 
 from app.core.bybit_client import Bybit
 from app.core.notifier_bot import tg_send
@@ -97,40 +128,36 @@ from app.core.flashback_common import get_equity_usdt, record_heartbeat, GLOBAL_
 from app.core.session_guard import should_block_trading
 from app.ai.setup_memory_policy import get_risk_multiplier, get_min_ai_score
 
-# NEW: orders bus for AI/journal spine
 from app.core.orders_bus import record_order_event
-
-# NEW: trade_id-based feature snapshot logger
 from app.ai.feature_logger import log_features_at_open
-
-# NEW: AI events (setup/outcome logs → state/ai_events)
 from app.ai.ai_events_spine import build_setup_context, publish_ai_event
 
-# NEW: Policy decision logger (audit)
+# ✅ Decision enforcer (manual blocks + pilot decisions)
+from app.ai.ai_decision_enforcer import enforce_decision
+
+# ✅ Pilot (legacy decision schema v1) producer
+try:
+    from app.bots.ai_pilot import pilot_decide  # type: ignore
+except Exception:
+    pilot_decide = None  # type: ignore
+
 try:
     from app.ai.policy_log import record_policy_decision  # type: ignore
 except Exception:  # pragma: no cover
     def record_policy_decision(*args, **kwargs):
         return None
 
-# NEW: Position snapshot for feature context
 from app.core.position_bus import get_positions_snapshot as bus_get_positions_snapshot
-
-# NEW: Paper Broker for LEARN_DRY / EXEC_DRY_RUN
 from app.sim.paper_broker import PaperBroker  # type: ignore
 
 log = get_logger("executor_v2")
 
-# Global dry-run override (env EXEC_DRY_RUN=true/false)
-EXEC_DRY_RUN: bool = os.getenv("EXEC_DRY_RUN", "true").strip().lower() in (
-    "1",
-    "true",
-    "yes",
-    "y",
-    "on",
-)
+EXEC_DRY_RUN: bool = os.getenv("EXEC_DRY_RUN", "true").strip().lower() in ("1", "true", "yes", "y", "on")
 
-# Paths
+# ✅ Decision enforcement toggles
+EXEC_ENFORCE_DECISIONS: bool = os.getenv("EXEC_ENFORCE_DECISIONS", "true").strip().lower() in ("1", "true", "yes", "y", "on")
+EXEC_FORCE_TRADE_ID: str = os.getenv("EXEC_FORCE_TRADE_ID", "").strip()
+
 ROOT: Path = settings.ROOT
 SIGNAL_FILE: Path = ROOT / "signals" / "observed.jsonl"
 CURSOR_FILE: Path = ROOT / "state" / "observed.cursor"
@@ -138,7 +165,6 @@ CURSOR_FILE: Path = ROOT / "state" / "observed.cursor"
 SIGNAL_FILE.parent.mkdir(parents=True, exist_ok=True)
 CURSOR_FILE.parent.mkdir(parents=True, exist_ok=True)
 
-# Latency logging
 LATENCY_LOG_PATH: Path = ROOT / "state" / "latency_exec.jsonl"
 LATENCY_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
 
@@ -147,8 +173,19 @@ try:
 except Exception:
     LATENCY_WARN_MS = 1500
 
-# Lock created by execution_recovery_daemon when accounting <-> reality diverge
 SUSPECT_LOCK_PATH: Path = ROOT / "state" / "execution_suspect.lock"
+
+# ✅ Decisions store (for enforcer + joiner)
+DECISIONS_PATH: Path = ROOT / "state" / "ai_decisions.jsonl"
+DECISIONS_PATH.parent.mkdir(parents=True, exist_ok=True)
+
+# ---------------------------------------------------------------------------
+# ✅ Hardened decision logger import (lock + tail-dedupe)
+# ---------------------------------------------------------------------------
+try:
+    from app.core.ai_decision_logger import append_decision as _append_decision_hardened  # type: ignore
+except Exception:
+    _append_decision_hardened = None  # type: ignore
 
 
 # ---------------------------------------------------------------------------
@@ -160,45 +197,20 @@ _PAPER_BROKER_CACHE: Dict[str, PaperBroker] = {}
 
 
 def get_trade_client(sub_uid: Optional[str]) -> Bybit:
-    """
-    Return a Bybit trade client for the given sub_uid.
-
-    - sub_uid is a string UID (e.g. "524649709") for unified_sub accounts.
-    - If sub_uid is None/empty, we use the main unified account client.
-    """
     key = str(sub_uid) if sub_uid else "main"
-
     client = _TRADE_CLIENTS.get(key)
     if client is not None:
         return client
-
-    if sub_uid:
-        client = Bybit("trade", sub_uid=sub_uid)
-    else:
-        client = Bybit("trade")
-
+    client = Bybit("trade", sub_uid=sub_uid) if sub_uid else Bybit("trade")
     _TRADE_CLIENTS[key] = client
     return client
 
 
-def get_paper_broker(
-    account_label: str,
-    starting_equity: float,
-) -> PaperBroker:
-    """
-    Return a PaperBroker for the given account_label, creating it if needed.
-
-    starting_equity is only used on first creation; after that the on-disk
-    ledger decides.
-    """
+def get_paper_broker(account_label: str, starting_equity: float) -> PaperBroker:
     broker = _PAPER_BROKER_CACHE.get(account_label)
     if broker is not None:
         return broker
-
-    broker = PaperBroker.load_or_create(
-        account_label=account_label,
-        starting_equity=starting_equity,
-    )
+    broker = PaperBroker.load_or_create(account_label=account_label, starting_equity=starting_equity)
     _PAPER_BROKER_CACHE[account_label] = broker
     return broker
 
@@ -223,21 +235,7 @@ def save_cursor(pos: int) -> None:
 
 # ---------- LATENCY HELPERS ---------- #
 
-def record_latency(
-    event: str,
-    symbol: str,
-    strat: str,
-    mode: str,
-    duration_ms: int,
-    extra: Optional[Dict[str, Any]] = None,
-) -> None:
-    """
-    Append a latency record to state/latency_exec.jsonl.
-
-    event: short label, e.g. "entry_order" or "decision_pipeline"
-    duration_ms: measured latency in milliseconds
-    extra: any additional context (sub_uid, account_label, qty, etc.)
-    """
+def record_latency(event: str, symbol: str, strat: str, mode: str, duration_ms: int, extra: Optional[Dict[str, Any]] = None) -> None:
     row: Dict[str, Any] = {
         "ts_ms": int(time.time() * 1000),
         "event": event,
@@ -248,7 +246,6 @@ def record_latency(
     }
     if extra:
         row["extra"] = extra
-
     try:
         with LATENCY_LOG_PATH.open("ab") as f:
             f.write(json.dumps(row).encode("utf-8") + b"\n")
@@ -256,73 +253,189 @@ def record_latency(
         log.warning("failed to write latency log: %r", e)
 
 
+# ---------------------------------------------------------------------------
+# Raw JSONL append helper (fallback only)
+# ---------------------------------------------------------------------------
+
+def _append_jsonl(path: Path, payload: Dict[str, Any]) -> None:
+    try:
+        with path.open("ab") as f:
+            f.write(json.dumps(payload, ensure_ascii=False).encode("utf-8") + b"\n")
+    except Exception as e:
+        log.warning("failed to append jsonl to %s: %r", path, e)
+
+
+# ---------------------------------------------------------------------------
+# ✅ Decision-store append wrapper (prefer hardened logger)
+# ---------------------------------------------------------------------------
+
+def _append_decision(payload: Dict[str, Any]) -> None:
+    """
+    Append a decision row to the canonical decisions store.
+
+    Prefer app.core.ai_decision_logger.append_decision() (lock + tail-dedupe).
+    Fall back to raw append if the hardened logger is unavailable or signature differs.
+    """
+    if _append_decision_hardened is not None:
+        # Try common signatures without breaking runtime.
+        try:
+            _append_decision_hardened(payload)  # type: ignore[arg-type]
+            return
+        except TypeError:
+            try:
+                _append_decision_hardened(payload, path=DECISIONS_PATH)  # type: ignore[arg-type]
+                return
+            except Exception as e:
+                log.warning("append_decision(payload, path=...) failed; falling back: %r", e)
+        except Exception as e:
+            log.warning("append_decision(payload) failed; falling back: %r", e)
+
+    _append_jsonl(DECISIONS_PATH, payload)
+
+
+# ---------------------------------------------------------------------------
+# ✅ Trade-ID namespacing helpers (2025-12-14a)
+# ---------------------------------------------------------------------------
+
+def _safe_str(x: Any) -> str:
+    try:
+        return str(x) if x is not None else ""
+    except Exception:
+        return ""
+
+
+def _make_effective_trade_id(source_trade_id: str, account_label: str, sub_uid: str, strategy_id: str) -> str:
+    """
+    Make a per-account effective trade id to prevent collisions when a signal supplies trade_id.
+
+    Constraints:
+    - Must be deterministic
+    - Must be short enough for orderLinkId in LIVE (conservatively keep <= 36)
+    """
+    src = _safe_str(source_trade_id).strip() or "NO_SRC"
+    acct = _safe_str(account_label).strip() or (_safe_str(sub_uid).strip() or "main")
+    # Start with readable namespacing
+    candidate = f"{acct}:{src}"
+
+    if len(candidate) <= 36:
+        return candidate
+
+    # Too long: hash the source deterministically but keep account readable
+    h = hashlib.sha1(src.encode("utf-8", errors="ignore")).hexdigest()[:16]
+    candidate2 = f"{acct}:{h}"
+    if len(candidate2) <= 36:
+        return candidate2
+
+    # Still too long: hash account too (last resort)
+    h2 = hashlib.sha1(acct.encode("utf-8", errors="ignore")).hexdigest()[:8]
+    return f"{h2}:{h}"
+
+
+# ---------------------------------------------------------------------------
+# ✅ Pilot decision emission (THIS is what enforcer consumes)
+# ---------------------------------------------------------------------------
+
+def emit_pilot_input_decision(setup_event: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """
+    Produces + appends a pilot legacy decision row:
+      - schema_version == 1
+      - has "decision"
+      - includes trade_id
+    """
+    if pilot_decide is None:
+        return None
+    try:
+        d = pilot_decide(setup_event)
+        if isinstance(d, dict) and d.get("schema_version") == 1 and "decision" in d and d.get("trade_id"):
+            _append_decision(d)
+            return d
+    except Exception as e:
+        log.warning("pilot_decide failed (non-fatal): %r", e)
+    return None
+
+
+# ---------------------------------------------------------------------------
+# ✅ Decision emitter (executor audit rows for joining/telemetry)
+# ---------------------------------------------------------------------------
+
+def emit_ai_decision(
+    *,
+    trade_id: str,
+    client_trade_id: str,
+    source_trade_id: Optional[str],
+    symbol: str,
+    account_label: str,
+    sub_uid: str,
+    strategy_id: str,
+    strategy_name: str,
+    timeframe: str,
+    side: str,
+    mode: str,
+    allow: bool,
+    decision_code: str,
+    reason: str,
+    model_used: Optional[str] = None,
+    regime: Optional[str] = None,
+    confidence_source: Optional[str] = None,
+    learning_tags: Optional[list[str]] = None,  
+    ai_score: Optional[float],
+    tier_used: Optional[str] = None,
+    gates_reason: Optional[str] = None,
+    memory_id: Optional[str] = None,
+    memory_score: Optional[float] = None,
+    size_multiplier: Optional[float] = None,
+    extra: Optional[Dict[str, Any]] = None,
+) -> None:
+    row: Dict[str, Any] = {
+        "ts_ms": int(time.time() * 1000),
+        "event_type": "ai_decision",
+        "trade_id": str(trade_id),
+        "client_trade_id": str(client_trade_id),
+        "source_trade_id": (str(source_trade_id) if source_trade_id else None),
+        "symbol": str(symbol),
+        "account_label": str(account_label),
+        "sub_uid": (str(sub_uid) if sub_uid else None),
+        "strategy_id": str(strategy_id),
+        "strategy_name": str(strategy_name),
+        "timeframe": str(timeframe),
+         "model_used": model_used,
+        "regime": regime,
+        "confidence_source": confidence_source,
+        "learning_tags": learning_tags or [],
+        "side": str(side),
+        "mode": str(mode),
+        "allow": bool(allow),
+        "decision_code": str(decision_code),
+        "reason": str(reason),
+        "ai_score": (float(ai_score) if ai_score is not None else None),
+        "tier_used": tier_used,
+        "gates_reason": gates_reason,
+        "memory_id": memory_id,
+        "memory_score": (float(memory_score) if memory_score is not None else None),
+        "size_multiplier": (float(size_multiplier) if size_multiplier is not None else None),
+    }
+    if extra:
+        row["extra"] = extra
+    _append_decision(row)
+
+
 # ---------- AI GATE WRAPPER ---------- #
 
 def run_ai_gate(signal: Dict[str, Any], strat_id: str, bound_log) -> Dict[str, Any]:
-    """
-    Unified wrapper around trade_classifier + policy threshold.
+    decision: Dict[str, Any] = {"allow": True, "score": None, "reason": "default_allow_fallback", "features": {}}
 
-    Returns a dict with at least:
-      {
-        "allow": bool,
-        "score": float | None,
-        "reason": str,
-        "features": dict
-      }
-
-    Every decision is also logged to state/ai_policy_decisions.jsonl.
-    """
-    # Default decision in case classifier explodes
-    decision: Dict[str, Any] = {
-        "allow": True,
-        "score": None,
-        "reason": "default_allow_fallback",
-        "features": {},
-    }
-
-    # 1) Classifier itself
     try:
         clf = classify_trade(signal, strat_id)
     except Exception as e:
-        bound_log.warning(
-            "AI classifier crashed or misbehaved for [%s]: %r — bypassing gate (allow=True).",
-            strat_id,
-            e,
-        )
-        decision = {
-            "allow": True,
-            "score": None,
-            "reason": f"classifier_error: {e}",
-            "features": {},
-        }
-        record_policy_decision(
-            strategy_id=strat_id,
-            allow=decision["allow"],
-            score=decision["score"],
-            reason=decision["reason"],
-            signal=signal,
-        )
+        bound_log.warning("AI classifier crashed for [%s]: %r — bypassing gate (allow=True).", strat_id, e)
+        decision = {"allow": True, "score": None, "reason": f"classifier_error: {e}", "features": {}}
+        record_policy_decision(strategy_id=strat_id, allow=decision["allow"], score=decision["score"], reason=decision["reason"], signal=signal)
         return decision
 
     if not isinstance(clf, dict):
-        bound_log.warning(
-            "AI classifier returned non-dict for [%s]: %r — treating as allow=True.",
-            strat_id,
-            clf,
-        )
-        decision = {
-            "allow": True,
-            "score": None,
-            "reason": "classifier_non_dict",
-            "features": {},
-        }
-        record_policy_decision(
-            strategy_id=strat_id,
-            allow=decision["allow"],
-            score=decision["score"],
-            reason=decision["reason"],
-            signal=signal,
-        )
+        bound_log.warning("AI classifier returned non-dict for [%s]: %r — treating as allow=True.", strat_id, clf)
+        decision = {"allow": True, "score": None, "reason": "classifier_non_dict", "features": {}}
+        record_policy_decision(strategy_id=strat_id, allow=decision["allow"], score=decision["score"], reason=decision["reason"], signal=signal)
         return decision
 
     allow = bool(clf.get("allow", True))
@@ -330,108 +443,52 @@ def run_ai_gate(signal: Dict[str, Any], strat_id: str, bound_log) -> Dict[str, A
     reason = clf.get("reason") or clf.get("why") or "ok"
     features = clf.get("features") or {}
 
-    # 2) Policy-based min score per strategy
     min_score = get_min_ai_score(strat_id)
-    score_f: Optional[float]
     try:
         score_f = float(score) if score is not None else None
     except Exception:
         score_f = None
 
     if min_score > 0 and score_f is not None and score_f < min_score:
-        bound_log.info(
-            "AI score %.3f < min threshold %.3f for [%s]; rejecting trade.",
-            score_f,
-            min_score,
-            strat_id,
-        )
-        decision = {
-            "allow": False,
-            "score": score_f,
-            "reason": f"score_below_min ({score_f:.3f} < {min_score:.3f})",
-            "features": features,
-        }
-        record_policy_decision(
-            strategy_id=strat_id,
-            allow=decision["allow"],
-            score=decision["score"],
-            reason=decision["reason"],
-            signal=signal,
-        )
+        bound_log.info("AI score %.3f < min threshold %.3f for [%s]; rejecting trade.", score_f, min_score, strat_id)
+        decision = {"allow": False, "score": score_f, "reason": f"score_below_min ({score_f:.3f} < {min_score:.3f})", "features": features}
+        record_policy_decision(strategy_id=strat_id, allow=decision["allow"], score=decision["score"], reason=decision["reason"], signal=signal)
         return decision
 
     if not allow:
         bound_log.info("AI gate rejected [%s]: %s", strat_id, reason)
 
-    decision = {
-        "allow": allow,
-        "score": score_f,
-        "reason": reason,
-        "features": features,
-    }
-
-    record_policy_decision(
-        strategy_id=strat_id,
-        allow=decision["allow"],
-        score=decision["score"],
-        reason=decision["reason"],
-        signal=signal,
-    )
+    decision = {"allow": allow, "score": score_f, "reason": reason, "features": features}
+    record_policy_decision(strategy_id=strat_id, allow=decision["allow"], score=decision["score"], reason=decision["reason"], signal=signal)
     return decision
 
 
 # ---------- SIGNAL PROCESSOR ---------- #
 
-def _normalize_strategies_for_signal(
-    strategies: Any,
-) -> Iterable[Tuple[str, Dict[str, Any]]]:
-    """
-    Normalize whatever get_strategies_for_signal(...) returns into
-    an iterable of (strat_name, strat_cfg) pairs.
-    """
+def _normalize_strategies_for_signal(strategies: Any) -> Iterable[Tuple[str, Dict[str, Any]]]:
     if not strategies:
         return []
-
-    # Case 1: dict[name] -> cfg
     if isinstance(strategies, dict):
         return strategies.items()
-
-    # Case 2: list-like
     if isinstance(strategies, (list, tuple)):
         if not strategies:
             return []
-
         first = strategies[0]
-
-        # 2a: list of (name, cfg) tuples
         if isinstance(first, (list, tuple)) and len(first) == 2:
             return strategies
-
-        # 2b: list of dicts → extract name from each
         if isinstance(first, dict):
             normalized: List[Tuple[str, Dict[str, Any]]] = []
             for cfg in strategies:
                 if not isinstance(cfg, dict):
                     continue
-                name = (
-                    cfg.get("name")
-                    or cfg.get("id")
-                    or cfg.get("label")
-                    or cfg.get("strategy_name")
-                    or "unnamed_strategy"
-                )
+                name = cfg.get("name") or cfg.get("id") or cfg.get("label") or cfg.get("strategy_name") or "unnamed_strategy"
                 normalized.append((str(name), cfg))
             return normalized
-
         return []
-
     return []
 
 
 async def process_signal_line(line: str) -> None:
-    """
-    Process one raw signal line from signals/observed.jsonl.
-    """
     try:
         sig = json.loads(line)
     except Exception:
@@ -445,7 +502,6 @@ async def process_signal_line(line: str) -> None:
 
     strategies = get_strategies_for_signal(symbol, tf)
     strat_items = _normalize_strategies_for_signal(strategies)
-
     if not strat_items:
         return
 
@@ -466,10 +522,6 @@ def _automation_mode_from_cfg(cfg: Dict[str, Any]) -> str:
 
 
 def _normalize_paper_side(signal_side: str) -> str:
-    """
-    Normalize signal side into PaperBroker side ("long"/"short").
-    Accepts: "buy"/"sell"/"long"/"short" (case-insensitive).
-    """
     s = str(signal_side or "").strip().lower()
     if s in ("buy", "long"):
         return "long"
@@ -478,12 +530,8 @@ def _normalize_paper_side(signal_side: str) -> str:
     raise ValueError(f"Unsupported side value for paper entry: {signal_side!r}")
 
 
-async def handle_strategy_signal(
-    strat_name: str,
-    strat_cfg: Dict[str, Any],
-    sig: Dict[str, Any],
-) -> None:
-    strat_id = strategy_label(strat_cfg)  # e.g. "Sub1_Trend (sub 524630315)"
+async def handle_strategy_signal(strat_name: str, strat_cfg: Dict[str, Any], sig: Dict[str, Any]) -> None:
+    strat_id = strategy_label(strat_cfg)
     bound = bind_context(log, strat=strat_id)
 
     enabled = bool(strat_cfg.get("enabled", False))
@@ -497,7 +545,6 @@ async def handle_strategy_signal(
     tf = sig.get("timeframe") or sig.get("tf")
     side = sig.get("side")
 
-    # Price can come from top-level or from debug block
     price = sig.get("price") or sig.get("last") or sig.get("close")
     debug = sig.get("debug") or {}
     if price is None and isinstance(debug, dict):
@@ -517,7 +564,6 @@ async def handle_strategy_signal(
         bound.warning("invalid price in signal: %r", sig)
         return
 
-    # Normalize mode for feature logging
     if EXEC_DRY_RUN:
         trade_mode = "PAPER"
     else:
@@ -530,39 +576,18 @@ async def handle_strategy_signal(
         else:
             trade_mode = mode_raw
 
-    # Sub UID for logging + guards
-    sub_uid = str(
-        strat_cfg.get("sub_uid")
-        or strat_cfg.get("subAccountId")
-        or strat_cfg.get("accountId")
-        or strat_cfg.get("subId")
-        or ""
-    )
+    sub_uid = str(strat_cfg.get("sub_uid") or strat_cfg.get("subAccountId") or strat_cfg.get("accountId") or strat_cfg.get("subId") or "")
+    account_label = str(strat_cfg.get("account_label") or strat_cfg.get("label") or strat_cfg.get("account_label_slug") or "main")
 
-    # Account label for orders_bus / state joins (e.g. "main", "flashback10")
-    account_label = str(
-        strat_cfg.get("account_label")
-        or strat_cfg.get("label")
-        or strat_cfg.get("account_label_slug")
-        or "main"
-    )
-
-    # Whether execution_recovery_daemon has raised a hard lock
     lock_active = SUSPECT_LOCK_PATH.exists()
-
-    # Global breaker flag snapshot
     try:
         breaker_on = bool(GLOBAL_BREAKER.get("on", False))
     except Exception:
         breaker_on = False
 
-    # Training vs live profile
     is_training_mode = EXEC_DRY_RUN or mode_raw == "LEARN_DRY"
-
-    # Timestamp for latency measurement (signal → decision → order)
     started_ms = int(time.time() * 1000)
 
-    # ---------- Session Guard (loss streak / daily limits) ---------- #
     try:
         if should_block_trading():
             bound.info("Session Guard blocking new trades (limits reached).")
@@ -570,12 +595,177 @@ async def handle_strategy_signal(
     except Exception as e:
         bound.warning("Session Guard error; bypassing: %r", e)
 
-    # ---------- AI Classifier + Policy Gate ---------- #
+    # -----------------------------------------------------------------------
+    # ✅ trade_id selection (deterministic priority) → source_trade_id
+    # -----------------------------------------------------------------------
+    ts_open_ms = int(time.time() * 1000)
+    strat_safe = strat_id.replace(" ", "_").replace("(", "").replace(")", "")
+    default_source_trade_id = f"{strat_safe}-{ts_open_ms}"
+
+    sig_trade_id_raw = ""
+    try:
+        sig_trade_id_raw = str(sig.get("trade_id") or sig.get("client_trade_id") or "").strip()
+    except Exception:
+        sig_trade_id_raw = ""
+
+    used_sig_trade_id = bool(sig_trade_id_raw)
+    used_force_trade_id = False
+
+    if used_sig_trade_id:
+        source_trade_id = sig_trade_id_raw
+        trade_id_source = "signal"
+    elif EXEC_FORCE_TRADE_ID:
+        source_trade_id = EXEC_FORCE_TRADE_ID
+        used_force_trade_id = True
+        trade_id_source = "exec_force"
+    else:
+        source_trade_id = default_source_trade_id
+        trade_id_source = "generated"
+
+    # ✅ Effective per-account client_trade_id (prevents collisions)
+    client_trade_id = _make_effective_trade_id(source_trade_id, account_label=account_label, sub_uid=sub_uid, strategy_id=strat_id)
+    trade_id = client_trade_id  # PAPER uses this; LIVE later switches to orderId after entry
+
+    bound.info(
+        "trade_id_map source=%s -> effective=%s account=%s sub_uid=%s strat=%s",
+        source_trade_id, client_trade_id, account_label, (sub_uid or None), strat_id
+    )
+
+    # -----------------------------------------------------------------------
+    # ✅ FIX: produce pilot legacy decision row BEFORE enforcement
+    # -----------------------------------------------------------------------
+    pilot_setup_event = {
+        "trade_id": client_trade_id,
+        "source_trade_id": source_trade_id,
+        "symbol": symbol,
+        "timeframe": str(tf),
+        "setup_type": str(sig.get("setup_type") or "unknown"),
+        "account_label": account_label,
+        "policy": {"policy_hash": str(strat_cfg.get("policy_hash") or (strat_cfg.get("policy", {}) or {}).get("policy_hash") or "")},
+        "payload": {
+            "features": {
+                "memory_fingerprint": (
+                    (sig.get("payload", {}).get("features", {}).get("memory_fingerprint") if isinstance(sig.get("payload"), dict) else None)
+                    or (sig.get("debug", {}).get("memory_fingerprint") if isinstance(sig.get("debug"), dict) else None)
+                    or (sig.get("memory_fingerprint"))
+                    or ""
+                ),
+            }
+        },
+    }
+
+    ph_sig = None
+    try:
+        ph_sig = (sig.get("policy", {}).get("policy_hash") if isinstance(sig.get("policy"), dict) else None)
+    except Exception:
+        ph_sig = None
+    if ph_sig:
+        pilot_setup_event["policy"]["policy_hash"] = str(ph_sig)
+
+    pilot_row = emit_pilot_input_decision(pilot_setup_event)
+
+    # -----------------------------------------------------------------------
+    # ✅ HARD GATE: ENFORCE DECISION BEFORE SIZING/EXECUTION (effective id)
+    # -----------------------------------------------------------------------
+    size_multiplier_applied = 1.0
+    enforced_reason = "not_enforced"
+    enforced_code = None
+
+    if EXEC_ENFORCE_DECISIONS:
+        try:
+            enforced = enforce_decision(client_trade_id)
+        except Exception as e:
+            enforced = {"allow": True, "size_multiplier": 1.0, "decision_code": None, "reason": f"enforcer_error:{e}"}
+
+        allow = bool(enforced.get("allow", True))
+        enforced_code = enforced.get("decision_code")
+        enforced_reason = str(enforced.get("reason") or "ok")
+
+        sm_raw = enforced.get("size_multiplier", 1.0)
+        try:
+            sm = float(sm_raw) if sm_raw is not None else 1.0
+        except Exception:
+            sm = 1.0
+
+        if not allow:
+            emit_ai_decision(
+                trade_id=client_trade_id,
+                client_trade_id=client_trade_id,
+                source_trade_id=source_trade_id,
+                symbol=symbol,
+                account_label=account_label,
+                sub_uid=sub_uid,
+                strategy_id=strat_id,
+                strategy_name=strat_cfg.get("name", strat_name),
+                timeframe=str(tf),
+                side=str(side),
+                mode=trade_mode,
+                allow=False,
+                decision_code=str(enforced_code or "BLOCK_TRADE"),
+                reason=enforced_reason,
+                ai_score=None,
+                size_multiplier=0.0,
+                extra={
+                    "stage": "decision_enforced_pre_sizing",
+                    "trade_id_source": trade_id_source,
+                    "sig_trade_id_present": bool(used_sig_trade_id),
+                    "forced_trade_id": bool(used_force_trade_id),
+                    "pilot_emitted": bool(pilot_row),
+                    "enforced_code": str(enforced_code or ""),
+                    "enforced_reason": str(enforced_reason or ""),
+                    "enforced_size_multiplier": 0.0,
+                },
+            )
+            bound.info("⛔ Decision enforcer BLOCKED (pre-sizing) trade_id=%s reason=%s", client_trade_id, enforced_reason)
+            try:
+                tg_send(f"⛔ Trade BLOCKED by decision enforcer (pre-sizing): trade_id={client_trade_id} source_trade_id={source_trade_id} symbol={symbol} strat={strat_id} reason={enforced_reason}")
+            except Exception:
+                pass
+            return
+
+        if sm > 0:
+            size_multiplier_applied = sm
+
+    effective_code = str(enforced_code) if enforced_code else "ALLOW_TRADE"
+    effective_reason = str(enforced_reason) if (enforced_reason and enforced_reason != "not_enforced") else "passed"
+
+    # -----------------------------------------------------------------------
+    # AI gate (classifier/min score)
+    # -----------------------------------------------------------------------
     ai = run_ai_gate(sig, strat_id, bound)
     if not ai["allow"]:
+        emit_ai_decision(
+            trade_id=client_trade_id,
+            client_trade_id=client_trade_id,
+            source_trade_id=source_trade_id,
+            symbol=symbol,
+            account_label=account_label,
+            sub_uid=sub_uid,
+            strategy_id=strat_id,
+            strategy_name=strat_cfg.get("name", strat_name),
+            timeframe=str(tf),
+            side=str(side),
+            mode=trade_mode,
+            allow=False,
+            decision_code="REJECT_TRADE",
+            reason=str(ai.get("reason") or "ai_reject"),
+            ai_score=ai.get("score"),
+            extra={
+                "stage": "ai_gate",
+                "trade_id_source": trade_id_source,
+                "sig_trade_id_present": bool(used_sig_trade_id),
+                "forced_trade_id": bool(used_force_trade_id),
+                "pilot_emitted": bool(pilot_row),
+                "enforced_code": effective_code,
+                "enforced_reason": effective_reason,
+                "enforced_size_multiplier": float(size_multiplier_applied),
+            },
+        )
         return
 
-    # ---------- Correlation gate (unpack (allowed, reason)) ---------- #
+    # -----------------------------------------------------------------------
+    # Correlation gate
+    # -----------------------------------------------------------------------
     try:
         allowed_corr, corr_reason = corr_allow(symbol)
     except Exception as e:
@@ -583,10 +773,38 @@ async def handle_strategy_signal(
         allowed_corr, corr_reason = True, "corr_gate_v2 exception, bypassed"
 
     if not allowed_corr:
-        bound.info("Correlation gate rejected for %s: %s", symbol, corr_reason)
+        emit_ai_decision(
+            trade_id=client_trade_id,
+            client_trade_id=client_trade_id,
+            source_trade_id=source_trade_id,
+            symbol=symbol,
+            account_label=account_label,
+            sub_uid=sub_uid,
+            strategy_id=strat_id,
+            strategy_name=strat_cfg.get("name", strat_name),
+            timeframe=str(tf),
+            side=str(side),
+            mode=trade_mode,
+            allow=False,
+            decision_code="REJECT_TRADE",
+            reason=f"corr_gate:{corr_reason}",
+            ai_score=ai.get("score"),
+            extra={
+                "stage": "corr_gate",
+                "trade_id_source": trade_id_source,
+                "sig_trade_id_present": bool(used_sig_trade_id),
+                "forced_trade_id": bool(used_force_trade_id),
+                "pilot_emitted": bool(pilot_row),
+                "enforced_code": effective_code,
+                "enforced_reason": effective_reason,
+                "enforced_size_multiplier": float(size_multiplier_applied),
+            },
+        )
         return
 
-    # ---------- Sizing + Risk Policy ---------- #
+    # -----------------------------------------------------------------------
+    # Risk/Sizing inputs (✅ size_multiplier applied BEFORE sizing deterministically)
+    # -----------------------------------------------------------------------
     try:
         base_risk_pct = Decimal(str(strategy_risk_pct(strat_cfg)))
     except Exception:
@@ -594,6 +812,11 @@ async def handle_strategy_signal(
 
     risk_mult = Decimal(str(get_risk_multiplier(strat_id)))
     eff_risk_pct = base_risk_pct * risk_mult
+
+    try:
+        eff_risk_pct = eff_risk_pct * Decimal(str(size_multiplier_applied))
+    except Exception:
+        pass
 
     if eff_risk_pct <= 0:
         bound.info("effective risk_pct <= 0 for %s; skipping.", strat_id)
@@ -605,8 +828,7 @@ async def handle_strategy_signal(
         bound.warning("get_equity_usdt failed: %r; assuming equity=0.", e)
         equity_val = Decimal("0")
 
-    # Stop distance used for risk sizing (keep conservative)
-    stop_pct_for_size = 0.005  # 0.5% dummy for sizing
+    stop_pct_for_size = 0.005
     stop_distance = Decimal(str(price_f * stop_pct_for_size))
 
     qty_suggested, risk_usd = bayesian_size(
@@ -617,12 +839,7 @@ async def handle_strategy_signal(
     )
 
     if qty_suggested <= 0 or risk_usd <= 0:
-        bound.info(
-            "bayesian_size returned non-positive sizing for %s; equity=%s risk_pct=%s",
-            strat_id,
-            equity_val,
-            eff_risk_pct,
-        )
+        bound.info("bayesian_size returned non-positive sizing for %s; equity=%s risk_pct=%s", strat_id, equity_val, eff_risk_pct)
         return
 
     qty_capped, risk_capped = risk_capped_qty(
@@ -634,17 +851,9 @@ async def handle_strategy_signal(
     )
 
     if qty_capped <= 0 or risk_capped <= 0:
-        bound.info(
-            "qty <= 0 after risk_capped_qty; skipping entry. "
-            "qty_suggested=%s risk_usd=%s equity=%s risk_pct=%s",
-            qty_suggested,
-            risk_usd,
-            equity_val,
-            eff_risk_pct,
-        )
+        bound.info("qty <= 0 after risk_capped_qty; skipping entry.")
         return
 
-    # ---------- Portfolio Guard (global / per-trade caps) ---------- #
     try:
         guard_ok, guard_reason = can_open_trade(
             sub_uid=sub_uid or None,
@@ -664,136 +873,226 @@ async def handle_strategy_signal(
         guard_ok, guard_reason = True, "guard_exception_bypass"
 
     if not guard_ok:
+        emit_ai_decision(
+            trade_id=client_trade_id,
+            client_trade_id=client_trade_id,
+            source_trade_id=source_trade_id,
+            symbol=symbol,
+            account_label=account_label,
+            sub_uid=sub_uid,
+            strategy_id=strat_id,
+            strategy_name=strat_cfg.get("name", strat_name),
+            timeframe=str(tf),
+            side=str(side),
+            mode=trade_mode,
+            allow=False,
+            decision_code="REJECT_TRADE",
+            reason=f"portfolio_guard:{guard_reason}",
+            ai_score=ai.get("score"),
+            extra={
+                "stage": "portfolio_guard",
+                "trade_id_source": trade_id_source,
+                "sig_trade_id_present": bool(used_sig_trade_id),
+                "forced_trade_id": bool(used_force_trade_id),
+                "pilot_emitted": bool(pilot_row),
+                "enforced_code": effective_code,
+                "enforced_reason": effective_reason,
+                "enforced_size_multiplier": float(size_multiplier_applied),
+            },
+        )
         bound.info("Portfolio guard blocked trade for %s: %s", symbol, guard_reason)
         return
 
-    # ---------- Decision-pipeline latency ---------- #
     decision_done_ms = int(time.time() * 1000)
-    try:
-        record_latency(
-            event="decision_pipeline",
-            symbol=symbol,
-            strat=strat_id,
-            mode=trade_mode,
-            duration_ms=decision_done_ms - started_ms,
-            extra={
-                "sub_uid": sub_uid or None,
-                "account_label": account_label,
-                "equity_usd": float(equity_val),
-                "eff_risk_pct": float(eff_risk_pct),
-                "lock_active": lock_active,
-                "breaker_on": breaker_on,
-            },
-        )
-    except Exception as e:
-        bound.warning("latency logging (decision_pipeline) failed: %r", e)
+    record_latency(
+        event="decision_pipeline",
+        symbol=symbol,
+        strat=strat_id,
+        mode=trade_mode,
+        duration_ms=decision_done_ms - started_ms,
+        extra={
+            "sub_uid": sub_uid or None,
+            "account_label": account_label,
+            "equity_usd": float(equity_val),
+            "eff_risk_pct": float(eff_risk_pct),
+            "lock_active": lock_active,
+            "breaker_on": breaker_on,
+            "decision_enforced": bool(EXEC_ENFORCE_DECISIONS),
+            "decision_size_multiplier": float(size_multiplier_applied),
+            "decision_reason": effective_reason,
+            "decision_code": effective_code,
+            "pilot_emitted": bool(pilot_row),
+            "trade_id_source": trade_id_source,
+            "source_trade_id": source_trade_id,
+        },
+    )
 
-    # ---------- Unified trade_id (orderLinkId) + feature snapshot + setup event ---------- #
-    ts_open_ms = int(time.time() * 1000)
-    strat_safe = strat_id.replace(" ", "_").replace("(", "").replace(")", "")
-    trade_id = f"{strat_safe}-{ts_open_ms}"
+    setup_type_val: str = str(sig.get("setup_type") or "unknown")
+    base_features: Dict[str, Any] = {
+        "schema_version": "setup_features_v1",
+        "signal": sig,
+        "symbol": symbol,
+        "timeframe": str(tf),
+        "side": side,
+        "account_label": account_label,
+        "sub_uid": sub_uid or None,
+        "strategy_name": strat_cfg.get("name", strat_name),
+        "automation_mode": mode_raw,
+        "trade_mode": trade_mode,
+        "equity_usd": float(equity_val),
+        "risk_usd": float(risk_capped),
+        "risk_pct": float(eff_risk_pct),
+        "stop_pct_for_size": float(stop_pct_for_size),
+        "train_mode": "DRY_RUN_V1" if is_training_mode else "LIVE_OR_CANARY",
+        "setup_type": setup_type_val,
+        "trade_id": trade_id,
+        "client_trade_id": client_trade_id,
+        "source_trade_id": source_trade_id,
+        "ts_open_ms": ts_open_ms,
+        "qty": float(qty_capped),
+        "size": float(qty_capped),
+        "execution_lock_active": lock_active,
+        "execution_global_breaker_on": breaker_on,
+        "decision_size_multiplier": float(size_multiplier_applied),
+        "decision_enforced": bool(EXEC_ENFORCE_DECISIONS),
+        "decision_reason": effective_reason,
+        "decision_code": effective_code,
+        "trade_id_source": trade_id_source,
+        "forced_trade_id": bool(used_force_trade_id),
+        "sig_trade_id_present": bool(used_sig_trade_id),
+    }
+
+    features_payload: Dict[str, Any] = dict(base_features)
+    setup_logged: bool = False
 
     try:
         ai_score = ai.get("score")
         ai_reason = ai.get("reason", "")
         ai_features = ai.get("features") or {}
+        features_payload.update(ai_features)
+        features_payload["ai_score"] = float(ai_score) if ai_score is not None else None
+        features_payload["ai_reason"] = str(ai_reason)
+    except Exception as e:
+        bound.warning("feature enrichment failed (non-fatal): %r", e)
 
-        # Pull a compact snapshot of current positions for context
-        positions_view: Optional[Dict[str, Any]] = None
-        try:
-            pos_rows = bus_get_positions_snapshot(
-                label=account_label,
-                category="linear",
-                max_age_seconds=10,
-                allow_rest_fallback=True,
-            )
-            if isinstance(pos_rows, list):
-                canon: List[Dict[str, Any]] = []
-                for p in pos_rows:
-                    if not isinstance(p, dict):
-                        continue
-                    try:
-                        canon.append(
-                            {
-                                "symbol": p.get("symbol"),
-                                "side": p.get("side"),
-                                "size": p.get("size"),
-                                "avgPrice": p.get("avgPrice")
-                                or p.get("entryPrice")
-                                or p.get("avg_price"),
-                                "unrealisedPnl": p.get("unrealisedPnl")
-                                or p.get("unrealised_pnl"),
-                                "markPrice": p.get("markPrice") or p.get("mark_price"),
-                                "stopLoss": p.get("stopLoss")
-                                or p.get("stopLossPrice")
-                                or p.get("slPrice"),
-                                "takeProfit": p.get("takeProfit") or p.get("tpPrice"),
-                                "sub_uid": p.get("sub_uid")
-                                or p.get("subAccountId")
-                                or p.get("accountId")
-                                or p.get("subId"),
-                                "account_label": p.get("account_label")
-                                or p.get("label")
-                                or None,
-                            }
-                        )
-                    except Exception:
-                        continue
-                positions_view = {
-                    "ts_ms": int(time.time() * 1000),
-                    "positions": canon,
-                }
-        except Exception:
-            positions_view = None
+    live_mode_requested = mode_raw in ("LIVE_CANARY", "LIVE_FULL")
+    live_allowed = live_mode_requested and not lock_active and not EXEC_DRY_RUN and not breaker_on
 
-        # Regime tag (hook) if the signal provides one
-        regime_tag = sig.get("regime") or sig.get("market_regime")
-
-        setup_type_val = str(sig.get("setup_type") or "unknown")
-
-        features_payload: Dict[str, Any] = {
-            **ai_features,
-            "schema_version": "setup_features_v1",
-            "signal": sig,
-            "symbol": symbol,
-            "timeframe": str(tf),
-            "side": side,
-            "account_label": account_label,
-            "sub_uid": sub_uid or None,
-            "strategy_name": strat_cfg.get("name", strat_name),
-            "automation_mode": mode_raw,
-            "trade_mode": trade_mode,
-            "equity_usd": float(equity_val),
+    # ✅ Truthy PRE audit row
+    emit_ai_decision(
+        trade_id=client_trade_id,
+        client_trade_id=client_trade_id,
+        source_trade_id=source_trade_id,
+        symbol=symbol,
+        account_label=account_label,
+        sub_uid=sub_uid,
+        strategy_id=strat_id,
+        strategy_name=strat_cfg.get("name", strat_name),
+        timeframe=str(tf),
+        side=str(side),
+        mode=trade_mode,
+        allow=True,
+        decision_code=effective_code,
+        reason=effective_reason,
+        ai_score=features_payload.get("ai_score"),
+        size_multiplier=float(size_multiplier_applied) if size_multiplier_applied != 1.0 else None,
+        extra={
+            "stage": "pre_entry",
             "risk_usd": float(risk_capped),
             "risk_pct": float(eff_risk_pct),
-            "ai_score": float(ai_score) if ai_score is not None else None,
-            "ai_reason": str(ai_reason),
-            "execution_lock_active": lock_active,
-            "execution_global_breaker_on": breaker_on,
-            "positions_snapshot": positions_view,
-            "size": float(qty_capped),
             "qty": float(qty_capped),
-            "stop_pct_for_size": float(stop_pct_for_size),
-            "train_mode": "DRY_RUN_V1" if is_training_mode else "LIVE_OR_CANARY",
-            "setup_type": setup_type_val,
-        }
+            "decision_enforced": bool(EXEC_ENFORCE_DECISIONS),
+            "trade_id_source": trade_id_source,
+            "source_trade_id": source_trade_id,
+            "sig_trade_id_present": bool(used_sig_trade_id),
+            "forced_trade_id": bool(used_force_trade_id),
+            "pilot_emitted": bool(pilot_row),
+            "enforced_code": effective_code,
+            "enforced_reason": effective_reason,
+            "enforced_size_multiplier": float(size_multiplier_applied),
+        },
+    )
 
-        if regime_tag is not None:
-            features_payload["regime_tag"] = regime_tag
-
-        # Feature logger (local setup memory / feature store)
-        log_features_at_open(
-            trade_id=trade_id,
-            ts_open_ms=ts_open_ms,
+    # --- LIVE path (unchanged below except hardened pilot row copy) ---
+    if live_allowed:
+        order_id = await execute_entry(
             symbol=symbol,
-            sub_uid=sub_uid,
-            strategy_name=strat_cfg.get("name", strat_name),
-            setup_type=setup_type_val,
+            signal_side=str(side),
+            qty=float(qty_capped),
+            price=price_f,
+            strat=strat_id,
             mode=trade_mode,
-            features=features_payload,
+            sub_uid=sub_uid,
+            account_label=account_label,
+            trade_id=client_trade_id,
+            bound_log=bound,
+            started_ms=started_ms,
+        )
+        if not order_id:
+            bound.warning("LIVE entry failed; not emitting setup_context (no order_id).")
+            return
+
+        trade_id = str(order_id)
+
+        # Also emit pilot decision keyed by orderId for downstream joiners if desired
+        try:
+            if isinstance(pilot_row, dict):
+                pilot_row2 = dict(pilot_row)
+                pilot_row2["trade_id"] = trade_id
+                pilot_row2["client_trade_id"] = client_trade_id
+                pilot_row2["source_trade_id"] = source_trade_id
+                _append_decision(pilot_row2)
+        except Exception:
+            pass
+
+        emit_ai_decision(
+            trade_id=trade_id,
+            client_trade_id=client_trade_id,
+            source_trade_id=source_trade_id,
+            symbol=symbol,
+            account_label=account_label,
+            sub_uid=sub_uid,
+            strategy_id=strat_id,
+            strategy_name=strat_cfg.get("name", strat_name),
+            timeframe=str(tf),
+            side=str(side),
+            mode=trade_mode,
+            allow=True,
+            decision_code=effective_code,
+            reason=effective_reason,
+            ai_score=features_payload.get("ai_score"),
+            size_multiplier=float(size_multiplier_applied) if size_multiplier_applied != 1.0 else None,
+            extra={
+                "stage": "post_entry",
+                "order_id": trade_id,
+                "join_key": "orderId",
+                "decision_enforced": bool(EXEC_ENFORCE_DECISIONS),
+                "pilot_emitted": bool(pilot_row),
+                "enforced_code": effective_code,
+                "enforced_reason": effective_reason,
+                "enforced_size_multiplier": float(size_multiplier_applied),
+            },
         )
 
-        # AI events: setup_context → state/ai_events/setups.jsonl
+        features_payload["trade_id"] = trade_id
+        features_payload["order_id"] = trade_id
+        features_payload["client_trade_id"] = client_trade_id
+        features_payload["source_trade_id"] = source_trade_id
+
+        try:
+            log_features_at_open(
+                trade_id=trade_id,
+                ts_open_ms=ts_open_ms,
+                symbol=symbol,
+                sub_uid=sub_uid,
+                strategy_name=strat_cfg.get("name", strat_name),
+                setup_type=setup_type_val,
+                mode=trade_mode,
+                features=features_payload,
+            )
+        except Exception as e:
+            bound.warning("log_features_at_open failed (non-fatal): %r", e)
+
         try:
             setup_event = build_setup_context(
                 trade_id=trade_id,
@@ -807,145 +1106,128 @@ async def handle_strategy_signal(
                 extra={
                     "mode": trade_mode,
                     "sub_uid": sub_uid or None,
+                    "client_trade_id": client_trade_id,
+                    "source_trade_id": source_trade_id,
+                    "order_id": trade_id,
+                    "join_key": "orderId",
                 },
             )
             publish_ai_event(setup_event)
+            setup_logged = True
+            bound.info("✅ LIVE setup_context emitted trade_id(orderId)=%s client_trade_id=%s source_trade_id=%s symbol=%s", trade_id, client_trade_id, source_trade_id, symbol)
         except Exception as e:
-            bound.warning("AI setup_context logging failed: %r", e)
+            bound.warning("AI LIVE setup_context logging failed: %r", e)
 
-    except Exception as e:
-        bound.warning("feature logging / setup event failed: %r", e)
+        return
 
-    # ---------- Execute or paper log (lock-aware + EXEC_DRY_RUN + breaker) ---------- #
-    live_mode_requested = mode_raw in ("LIVE_CANARY", "LIVE_FULL")
-    live_allowed = (
-        live_mode_requested
-        and not lock_active
-        and not EXEC_DRY_RUN
-        and not breaker_on
-    )
-
-    if live_mode_requested and lock_active:
-        bound.warning(
-            "execution_suspect.lock present; forcing PAPER-only for [%s] %s",
-            strat_id,
-            symbol,
-        )
-    elif live_mode_requested and EXEC_DRY_RUN:
-        bound.info(
-            "EXEC_DRY_RUN=true; forcing PAPER-only for [%s] %s (would be %s).",
-            strat_id,
-            symbol,
-            mode_raw,
-        )
-    elif live_mode_requested and breaker_on:
-        bound.info(
-            "GLOBAL_BREAKER.on=true; forcing PAPER-only for [%s] %s (mode=%s).",
-            strat_id,
-            symbol,
-            mode_raw,
-        )
-
-    if live_allowed:
-        await execute_entry(
-            symbol=symbol,
-            signal_side=str(side),
-            qty=float(qty_capped),
-            price=price_f,
-            strat=strat_id,
-            mode=trade_mode,
-            sub_uid=sub_uid,
-            account_label=account_label,
-            trade_id=trade_id,
-            bound_log=bound,
-            started_ms=started_ms,
-        )
+    # --- PAPER path (unchanged below) ---
+    if is_training_mode:
+        paper_stop_pct = 0.0015
+        paper_tp_mult = 1.5
     else:
-        # PAPER execution path: use PaperBroker to simulate entry and later TP/SL.
+        paper_stop_pct = 0.005
+        paper_tp_mult = 2.0
 
-        # Training-mode stop/TP profile:
-        # - In DRY modes we compress stops/TP to get more completed trades / hour.
-        # - Live / non-dry keeps the wider profile.
-        if is_training_mode:
-            paper_stop_pct = 0.0015  # ~0.15%
-            paper_tp_mult = 1.5      # 1.5R
-        else:
-            paper_stop_pct = 0.005   # 0.5%
-            paper_tp_mult = 2.0      # 2R
+    try:
+        paper_side = _normalize_paper_side(str(side))
+    except ValueError as e:
+        bound.warning("cannot normalize paper side %r for %s: %r", side, symbol, e)
+        return
 
-        try:
-            paper_side = _normalize_paper_side(str(side))
-        except ValueError as e:
-            bound.warning("cannot normalize paper side %r for %s: %r", side, symbol, e)
-            return
+    stop_distance_f = float(price_f * paper_stop_pct)
+    if stop_distance_f <= 0:
+        bound.warning("stop_distance <= 0 for %s; skipping PAPER entry.", symbol)
+        return
 
-        stop_distance_f = float(price_f * paper_stop_pct)
-        if stop_distance_f <= 0:
-            bound.warning("stop_distance <= 0 for %s; skipping PAPER entry.", symbol)
-            return
+    if paper_side == "long":
+        stop_price = max(0.0001, price_f - stop_distance_f)
+        take_profit_price = price_f + (paper_tp_mult * stop_distance_f)
+    else:
+        stop_price = price_f + stop_distance_f
+        take_profit_price = max(0.0001, price_f - (paper_tp_mult * stop_distance_f))
 
-        if paper_side == "long":
-            stop_price = max(0.0001, price_f - stop_distance_f)
-            take_profit_price = price_f + (paper_tp_mult * stop_distance_f)
-        else:  # short
-            stop_price = price_f + stop_distance_f
-            take_profit_price = max(0.0001, price_f - (paper_tp_mult * stop_distance_f))
+    features_for_paper = {
+        **(features_payload or base_features),
+        "paper_stop_pct": float(paper_stop_pct),
+        "paper_tp_mult": float(paper_tp_mult),
+        "stop_price": float(stop_price),
+        "take_profit_price": float(take_profit_price),
+        "trade_id": trade_id,
+        "client_trade_id": client_trade_id,
+        "source_trade_id": source_trade_id,
+        "ts_open_ms": ts_open_ms,
+    }
 
-        # Extend features with exit info for the paper engine
-        features_for_paper = {
-            **features_payload,
-            "paper_stop_pct": float(paper_stop_pct),
-            "paper_tp_mult": float(paper_tp_mult),
-            "stop_price": float(stop_price),
-            "take_profit_price": float(take_profit_price),
-        }
+    try:
+        log_features_at_open(
+            trade_id=trade_id,
+            ts_open_ms=ts_open_ms,
+            symbol=symbol,
+            sub_uid=sub_uid,
+            strategy_name=strat_cfg.get("name", strat_name),
+            setup_type=setup_type_val,
+            mode=trade_mode,
+            features=features_payload,
+        )
+    except Exception as e:
+        bound.warning("log_features_at_open failed (non-fatal): %r", e)
 
-        try:
-            broker = get_paper_broker(
-                account_label=account_label,
-                starting_equity=float(equity_val) if equity_val > 0 else 1000.0,
-            )
-            broker.open_position(
-                symbol=symbol,
-                side=paper_side,  # "long"/"short"
-                entry_price=price_f,
-                stop_price=stop_price,
-                take_profit_price=take_profit_price,
-                setup_type=setup_type_val,
-                timeframe=str(tf),
-                features=features_for_paper,
-                extra={
-                    "mode": trade_mode,
-                    "sub_uid": sub_uid or None,
-                    "strategy_name": strat_cfg.get("name", strat_name),
-                },
-                trade_id=trade_id,
-                log_setup=False,  # executor already logged setup_context
-            )
+    try:
+        setup_event = build_setup_context(
+            trade_id=trade_id,
+            symbol=symbol,
+            account_label=account_label,
+            strategy=strat_cfg.get("name", strat_name),
+            features=features_payload,
+            setup_type=setup_type_val,
+            timeframe=str(tf),
+            ai_profile=strat_cfg.get("ai_profile") or None,
+            extra={
+                "mode": trade_mode,
+                "sub_uid": sub_uid or None,
+                "client_trade_id": client_trade_id,
+                "source_trade_id": source_trade_id,
+                "join_key": "client_trade_id",
+            },
+        )
+        publish_ai_event(setup_event)
+        setup_logged = True
+        bound.info("✅ PAPER setup_context emitted trade_id=%s source_trade_id=%s symbol=%s", trade_id, source_trade_id, symbol)
+    except Exception as e:
+        bound.warning("AI PAPER setup_context logging failed: %r", e)
 
-            bound.info(
-                "PAPER entry [%s]: %s %s qty=%s @ ~%s (risk_pct=%s stop=%s tp=%s trade_id=%s)",
-                strat_id,
-                symbol,
-                paper_side,
-                qty_capped,
-                price_f,
-                eff_risk_pct,
-                stop_price,
-                take_profit_price,
-                trade_id,
-            )
-        except Exception as e:
-            bound.warning("PaperBroker entry failed for %s %s: %r", strat_id, symbol, e)
+    try:
+        broker = get_paper_broker(account_label=account_label, starting_equity=float(equity_val) if equity_val > 0 else 1000.0)
+        broker.open_position(
+            symbol=symbol,
+            side=paper_side,
+            entry_price=price_f,
+            stop_price=stop_price,
+            take_profit_price=take_profit_price,
+            setup_type=setup_type_val,
+            timeframe=str(tf),
+            features=features_for_paper,
+            extra={
+                "mode": trade_mode,
+                "sub_uid": sub_uid or None,
+                "strategy_name": strat_cfg.get("name", strat_name),
+                "setup_logged_by_executor": setup_logged,
+                "client_trade_id": client_trade_id,
+                "source_trade_id": source_trade_id,
+            },
+            trade_id=trade_id,
+            log_setup=(not setup_logged),
+        )
 
+        bound.info(
+            "PAPER entry [%s]: %s %s qty=%s @ ~%s (risk_pct=%s stop=%s tp=%s trade_id=%s source_trade_id=%s setup_logged=%s)",
+            strat_id, symbol, paper_side, qty_capped, price_f, eff_risk_pct, stop_price, take_profit_price, trade_id, source_trade_id, setup_logged
+        )
+    except Exception as e:
+        bound.warning("PaperBroker entry failed for %s %s: %r", strat_id, symbol, e)
 
-# ---------- EXECUTOR ---------- #
 
 def _normalize_order_side(signal_side: str) -> str:
-    """
-    Normalize signal side into Bybit API side ("Buy"/"Sell").
-    Accepts: "buy"/"sell"/"long"/"short" (case-insensitive).
-    """
     s = str(signal_side or "").strip().lower()
     if s in ("buy", "long"):
         return "Buy"
@@ -966,24 +1248,18 @@ async def execute_entry(
     trade_id: str,
     bound_log,
     started_ms: Optional[int] = None,
-) -> None:
-    """
-    Execute a live entry order and record latency metrics.
-
-    started_ms: timestamp in ms from the moment the strategy pipeline
-                started handling this signal. If None, we measure from
-                just before placing the order.
-    """
+) -> Optional[str]:
     client = get_trade_client(sub_uid or None)
     try:
         order_side = _normalize_order_side(signal_side)
     except ValueError as e:
         bound_log.error("cannot normalize side %r for %s: %r", signal_side, symbol, e)
-        return
+        return None
 
     order_link_id = trade_id
     success = False
     start_ms = started_ms or int(time.time() * 1000)
+    order_id_out: Optional[str] = None
 
     try:
         resp = client.place_order(
@@ -994,35 +1270,21 @@ async def execute_entry(
             orderType="Market",
             orderLinkId=order_link_id,
         )
-        bound_log.info(
-            "LIVE entry executed [%s %s]: %s %s qty=%s trade_id=%s resp=%r",
-            mode,
-            strat,
-            symbol,
-            order_side,
-            qty,
-            trade_id,
-            resp,
-        )
+        bound_log.info("LIVE entry executed [%s %s]: %s %s qty=%s client_trade_id=%s resp=%r", mode, strat, symbol, order_side, qty, trade_id, resp)
         success = True
 
-        # --- Orders bus logging (NEW event) --- #
         try:
             result = resp.get("result") if isinstance(resp, dict) else None
             r = result or {}
 
-            order_id = (
-                r.get("orderId")
-                or r.get("order_id")
-                or r.get("orderID")
-                or order_link_id
-            )
-            status = (
-                r.get("orderStatus")
-                or r.get("order_status")
-                or "New"
-            )
-            order_type = r.get("orderType") or r.get("order_type") or "Market"
+            order_id = (r.get("orderId") or r.get("order_id") or r.get("orderID"))
+            if order_id:
+                order_id_out = str(order_id)
+            else:
+                order_id_out = str(order_link_id)
+
+            status = (r.get("orderStatus") or r.get("order_status") or "New")
+            order_type = (r.get("orderType") or r.get("order_type") or "Market")
 
             price_str = str(r.get("price") or price)
             qty_str = str(r.get("qty") or qty)
@@ -1033,7 +1295,7 @@ async def execute_entry(
             record_order_event(
                 account_label=account_label,
                 symbol=symbol,
-                order_id=str(order_id),
+                order_id=str(order_id_out),
                 side=order_side,
                 order_type=str(order_type),
                 status=str(status),
@@ -1046,33 +1308,20 @@ async def execute_entry(
                 position_side=None,
                 reduce_only=r.get("reduceOnly"),
                 client_order_id=order_link_id,
-                raw={
-                    "api_response": r,
-                    "sub_uid": sub_uid,
-                    "mode": mode,
-                    "strategy": strat,
-                },
+                raw={"api_response": r, "sub_uid": sub_uid, "mode": mode, "strategy": strat},
             )
         except Exception as e:
             bound_log.warning("orders_bus logging failed for %s %s: %r", symbol, order_link_id, e)
 
         try:
-            tg_send(
-                f"🚀 Entry placed [{mode}/{strat}] {symbol} {order_side} qty={qty} "
-                f"trade_id={trade_id}"
-            )
+            tg_send(f"🚀 Entry placed [{mode}/{strat}] {symbol} {order_side} qty={qty} client_trade_id={trade_id} order_id={order_id_out}")
         except Exception as e:
             bound_log.warning("telegram send failed: %r", e)
+
     except Exception as e:
-        bound_log.error(
-            "order failed for %s %s qty=%s (strat=%s trade_id=%s): %r",
-            symbol,
-            order_side,
-            qty,
-            strat,
-            trade_id,
-            e,
-        )
+        bound_log.error("order failed for %s %s qty=%s (strat=%s client_trade_id=%s): %r", symbol, order_side, qty, strat, trade_id, e)
+        order_id_out = None
+
     finally:
         end_ms = int(time.time() * 1000)
         duration = end_ms - start_ms
@@ -1083,34 +1332,19 @@ async def execute_entry(
                 strat=strat,
                 mode=mode,
                 duration_ms=duration,
-                extra={
-                    "sub_uid": sub_uid or None,
-                    "account_label": account_label,
-                    "qty": qty,
-                    "price": price,
-                    "success": success,
-                },
+                extra={"sub_uid": sub_uid or None, "account_label": account_label, "qty": qty, "price": price, "success": success, "order_id": order_id_out, "client_trade_id": order_link_id},
             )
             if duration > LATENCY_WARN_MS:
-                bound_log.warning(
-                    "High executor latency for %s (%s): %d ms (threshold=%d ms)",
-                    symbol,
-                    strat,
-                    duration,
-                    LATENCY_WARN_MS,
-                )
+                bound_log.warning("High executor latency for %s (%s): %d ms (threshold=%d ms)", symbol, strat, duration, LATENCY_WARN_MS)
                 try:
-                    tg_send(
-                        f"⚠️ High executor latency [{mode}/{strat}] {symbol} "
-                        f"{duration} ms (threshold={LATENCY_WARN_MS} ms)"
-                    )
+                    tg_send(f"⚠️ High executor latency [{mode}/{strat}] {symbol} {duration} ms (threshold={LATENCY_WARN_MS} ms)")
                 except Exception:
                     pass
         except Exception as e:
             bound_log.warning("latency logging failed for %s %s: %r", symbol, trade_id, e)
 
+    return order_id_out
 
-# ---------- MAIN LOOP ---------- #
 
 async def executor_loop() -> None:
     pos = load_cursor()
@@ -1126,11 +1360,7 @@ async def executor_loop() -> None:
 
             file_size = SIGNAL_FILE.stat().st_size
             if pos > file_size:
-                log.info(
-                    "Signal file truncated (size=%s, cursor=%s). Resetting cursor to 0.",
-                    file_size,
-                    pos,
-                )
+                log.info("Signal file truncated (size=%s, cursor=%s). Resetting cursor to 0.", file_size, pos)
                 pos = 0
                 save_cursor(pos)
 
@@ -1138,21 +1368,14 @@ async def executor_loop() -> None:
                 f.seek(pos)
                 for raw in f:
                     pos = f.tell()
-
                     try:
                         line = raw.decode("utf-8").strip()
                     except Exception as e:
-                        log.warning(
-                            "executor_v2: failed to decode line at pos=%s: %r",
-                            pos,
-                            e,
-                        )
+                        log.warning("executor_v2: failed to decode line at pos=%s: %r", pos, e)
                         continue
-
                     if not line:
                         continue
-
-                    await asyncio.sleep(0)  # yield between signals
+                    await asyncio.sleep(0)
                     await process_signal_line(line)
                     save_cursor(pos)
 
@@ -1162,8 +1385,6 @@ async def executor_loop() -> None:
             log.exception("executor loop error: %r; backing off 1s", e)
             await asyncio.sleep(1.0)
 
-
-# ---------- ENTRYPOINT ---------- #
 
 def main() -> None:
     try:

@@ -28,6 +28,7 @@ from __future__ import annotations
 import time
 import uuid
 from pathlib import Path
+import json
 from typing import Optional, List, Dict, Any
 
 import orjson
@@ -37,6 +38,37 @@ from app.core.ai_schema import (
     OrderLog,
     TradeSummaryLog,
 )
+
+# ============================
+# Phase 5: Training Idempotency
+# ============================
+
+_TRAINED_TRADES_PATH = Path("data/trained_trades.json")
+
+
+def _load_trained_trades() -> set[str]:
+    try:
+        if _TRAINED_TRADES_PATH.exists():
+            with _TRAINED_TRADES_PATH.open("r", encoding="utf-8") as f:
+                return set(json.load(f))
+    except Exception:
+        pass
+    return set()
+
+
+def _mark_trained_once(trade_id: str) -> bool:
+    trained = _load_trained_trades()
+    if trade_id in trained:
+        return False
+
+    trained.add(trade_id)
+    _TRAINED_TRADES_PATH.parent.mkdir(parents=True, exist_ok=True)
+    with _TRAINED_TRADES_PATH.open("w", encoding="utf-8") as f:
+        json.dump(sorted(trained), f, indent=2)
+
+    return True
+
+
 
 # ---------- ai_store (real or stub) ----------
 

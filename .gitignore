@@ -59,3 +59,16 @@ app/state/
 _audit/
 
 
+
+# Local artifacts
+flashback_clean.zip
+signal_engine.patch
+executor_v2.py
+
+
+# Runtime outputs
+logs/
+signals/*.jsonl
+*.log
+*.jsonl
+

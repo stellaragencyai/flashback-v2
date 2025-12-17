@@ -448,12 +448,13 @@ def _build_outcome_from_exec_row(row: Dict[str, Any]) -> Optional[Dict[str, Any]
     )
     ts_exec_ms = _normalize_ts_ms(ts_exec_raw)
 
-    exec_type = (
+    exec_type_raw = (
         row.get("execType")
         or row.get("exec_type")
         or row.get("type")
         or "execution"
     )
+    exec_type = f"EXEC_FILL::{exec_type_raw}"
 
     hint = _setup_hint_for_trade_id(trade_id) or {}
     setup_type = hint.get("setup_type")
@@ -472,20 +473,37 @@ def _build_outcome_from_exec_row(row: Dict[str, Any]) -> Optional[Dict[str, Any]
             win=None,
             exit_reason=str(exec_type),
             extra={
-                "schema_version": "outcome_from_exec_v1_3",
-                "pnl_kind": "fill_cashflow",
-                "side": side,
-                "exec_price": float(exec_price),
-                "exec_qty": float(exec_qty),
-                "exec_value": float(exec_value),
-                "exec_fee": float(exec_fee),
-                "cashflow_usd": float(cashflow),
-                "ts_exec_ms": ts_exec_ms,
-                "setup_type_hint": setup_type,
-                "timeframe_hint": timeframe,
-                "ai_profile_hint": ai_profile,
-                "raw": row,
-            },
+    # Schema
+    "schema_version": "outcome_from_exec_v1_4",
+
+    # 🔐 Phase-4 lifecycle contract
+    "lifecycle_stage": "EXECUTION_FILL",
+    "lifecycle_role": "EXECUTION_EVENT",
+    "is_final": False,
+    "final_authority_expected": "trade_close_emitter",
+
+    # Confidence & semantics
+    "outcome_confidence": "LOW",
+    "pnl_kind": "fill_cashflow",
+
+    # Execution details
+    "side": side,
+    "exec_price": float(exec_price),
+    "exec_qty": float(exec_qty),
+    "exec_value": float(exec_value),
+    "exec_fee": float(exec_fee),
+    "cashflow_usd": float(cashflow),
+    "ts_exec_ms": ts_exec_ms,
+
+    # AI hints (non-binding)
+    "setup_type_hint": setup_type,
+    "timeframe_hint": timeframe,
+    "ai_profile_hint": ai_profile,
+
+    # Debug / audit
+    "raw": row,
+},
+
         )
     except Exception as e:
         log.warning("failed to build outcome_record for %s: %r", symbol, e)

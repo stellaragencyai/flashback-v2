@@ -1,26 +1,30 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Flashback — WS Switchboard v4.8 (multi-account safe: public/private toggles + windows-safe writes + positions freshness)
+Flashback — WS Switchboard v5.2
 
-Key fixes:
-1) Windows file-lock collisions (WinError 5 / Errno 13):
-   - Uses unique temp filenames and retries os.replace().
+What changed vs v5.1:
+1) Self-rotating WS logs (proactive):
+   - Automatically rotates:
+       state/public_trades.jsonl
+       state/ws_executions.jsonl
+   - Prevents multi-hundred-MB bloat if health_check isn't run.
+   - Policy via env:
+       WS_LOG_ROTATE_ENABLED=true/false (default true)
+       WS_LOG_ROTATE_WARN_MB=50
+       WS_LOG_ROTATE_CAP_MB=150
+       WS_LOG_ROTATE_KEEP=3
+       WS_LOG_ROTATE_EVERY_SEC=30
 
-2) positions_bus stale when there are NO position events:
-   - Adds a "touch" loop that updates positions_bus.updated_ms periodically, even if empty.
-   - This makes health checks meaningful: WS alive != positions exist.
-
-New env toggles:
-- WS_ENABLE_PRIVATE=true/false  (default true)
-- WS_ENABLE_PUBLIC=true/false   (default true)
-
-Recommended:
-- MAIN: WS_ENABLE_PRIVATE=true,  WS_ENABLE_PUBLIC=true
-- SUBS: WS_ENABLE_PRIVATE=true,  WS_ENABLE_PUBLIC=false
-
-New env:
-- WS_POSITIONS_BUS_TOUCH_SEC=5  (default 5)  # keep positions_bus fresh
+Retains:
+- Log symmetry + cleanliness:
+    [PRIVATE] WS CONNECTED
+    [PUBLIC] WS CONNECTED
+- Strategy-driven public symbols
+- Delta-safe positions merge
+- Always-valid buses even when empty
+- Windows-safe atomic writes
+- positions_bus touch loop to avoid false stale alarms
 """
 
 from __future__ import annotations
@@ -31,13 +35,16 @@ import threading
 import time
 import hmac
 import hashlib
+import logging
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 import websocket  # type: ignore
-websocket.enableTrace(False)
 
 from app.core.logger import get_logger
+from app.core.flashback_common import send_tg, get_equity_usdt
+
+websocket.enableTrace(False)
 
 try:
     from app.core.config import settings
@@ -53,6 +60,58 @@ except Exception:
     pass
 
 LOG = get_logger("ws_switchboard")
+
+# Track whether each WS branch is connected
+_ws_private_ready = False
+_ws_public_ready = False
+_already_notified = False
+
+
+def _maybe_send_online_notification(account_label: str) -> None:
+    """
+    Once both private & public WS streams are connected,
+    send a Telegram notification via the subaccount bot (if configured),
+    and optionally also via the global/master bot.
+    This only runs once per process start.
+    """
+    global _ws_private_ready, _ws_public_ready, _already_notified
+
+    # Only send once
+    if _already_notified:
+        return
+
+    # Only when both streams are ready
+    if not (_ws_private_ready and _ws_public_ready):
+        return
+
+    # Attempt to fetch balance for the ACCOUNT_LABEL
+    try:
+        balance = get_equity_usdt()
+    except Exception:
+        balance = "unknown"
+
+    # Send via the subaccount’s bot (if configured)
+    send_tg(
+        f"🚀 WS ONLINE — {account_label}\n💰 Balance: {balance} USDT",
+        label=account_label
+    )
+
+    # Optional: also send a global/master notifier
+    send_tg(
+        f"📡 {account_label} is ONLINE — balance ≈ {balance} USDT",
+        label=account_label,
+        main=True
+    )
+
+    _already_notified = True
+
+# ---------------------------------------------------------------------------
+# Suppress third-party websocket spam logger ("Websocket connected")
+# ---------------------------------------------------------------------------
+try:
+    logging.getLogger("websocket").setLevel(logging.WARNING)
+except Exception:
+    pass
 
 STATE_DIR: Path = ROOT / "state"
 STATE_DIR.mkdir(parents=True, exist_ok=True)
@@ -100,6 +159,11 @@ def _safe_float(x: Any) -> float:
         return 0.0
 
 
+def _env_bool(name: str, default: str = "false") -> bool:
+    raw = os.getenv(name, default)
+    return str(raw).strip().lower() in ("1", "true", "yes", "y", "on")
+
+
 def normalize_position(raw: dict, account_label: str) -> dict:
     symbol = str(raw.get("symbol", "")).upper()
     side = str(raw.get("side", "")).title()
@@ -136,31 +200,19 @@ def normalize_position(raw: dict, account_label: str) -> dict:
 # -------------------------
 
 def _atomic_write_json(path: Path, payload: Dict[str, Any]) -> None:
-    """
-    Windows-safe best-effort atomic JSON write.
-
-    Fixes:
-      - Unique temp name (pid + time_ns) avoids collisions across processes
-      - Retries os.replace (Windows can transiently deny)
-      - Falls back to direct write if replace keeps failing
-    """
     path.parent.mkdir(parents=True, exist_ok=True)
     data = json.dumps(payload, separators=(",", ":"), ensure_ascii=False)
-
     tmp = path.with_name(f"{path.name}.tmp.{os.getpid()}.{time.time_ns()}")
 
-    # Write temp
     try:
         tmp.write_text(data, encoding="utf-8")
     except Exception as e:
-        # fallback direct
         try:
             path.write_text(data, encoding="utf-8")
         except Exception as e2:
             LOG.error("Error writing JSON to %s: %s / %s", path, e, e2)
         return
 
-    # Replace with retry
     last_err: Optional[Exception] = None
     for _ in range(5):
         try:
@@ -170,7 +222,6 @@ def _atomic_write_json(path: Path, payload: Dict[str, Any]) -> None:
             last_err = e
             time.sleep(0.05)
 
-    # Replace failed: fallback direct write
     try:
         path.write_text(data, encoding="utf-8")
     except Exception as e2:
@@ -212,27 +263,32 @@ def _ensure_bus_files_exist() -> None:
         LOG.error("Failed ensuring bus files exist: %s", e)
 
 
-def _touch_positions_bus_forever(interval_sec: int, stop_event: threading.Event) -> None:
-    """
-    Keep positions_bus.json 'fresh' even when there are no position events.
-    Prevents false stale alarms when WS is alive but positions are empty.
-    """
+def _ensure_label_block(existing: Dict[str, Any], account_label: str) -> Dict[str, Any]:
+    if not isinstance(existing, dict):
+        existing = {}
+    existing.setdefault("version", 2)
+    labels = existing.get("labels")
+    if not isinstance(labels, dict):
+        labels = {}
+    if account_label not in labels or not isinstance(labels.get(account_label), dict):
+        labels[account_label] = {"category": "linear", "positions": []}
+    else:
+        labels[account_label].setdefault("category", "linear")
+        if not isinstance(labels[account_label].get("positions"), list):
+            labels[account_label]["positions"] = []
+    existing["labels"] = labels
+    return existing
+
+
+def _touch_positions_bus_forever(interval_sec: int, account_label: str, stop_event: threading.Event) -> None:
     LOG.info("Starting positions_bus touch loop (interval=%ss)", interval_sec)
 
     while not stop_event.is_set():
         try:
             existing = _load_json(POSITIONS_BUS_PATH)
-            if not isinstance(existing, dict):
-                existing = {}
-
-            existing.setdefault("version", 2)
-            labels = existing.get("labels")
-            if not isinstance(labels, dict):
-                existing["labels"] = {}
-
+            existing = _ensure_label_block(existing, account_label)
             existing["updated_ms"] = _now_ms()
             _atomic_write_json(POSITIONS_BUS_PATH, existing)
-
         except Exception as e:
             LOG.error("positions_bus touch error: %s", e)
 
@@ -240,6 +296,205 @@ def _touch_positions_bus_forever(interval_sec: int, stop_event: threading.Event)
             if stop_event.is_set():
                 break
             time.sleep(1)
+
+
+# -------------------------
+# Log rotation (self-healing)
+# -------------------------
+
+def _file_size_mb(path: Path) -> float:
+    try:
+        if not path.exists():
+            return 0.0
+        return float(path.stat().st_size) / (1024.0 * 1024.0)
+    except Exception:
+        return 0.0
+
+
+def _rotate_file(path: Path, keep: int) -> bool:
+    """
+    Rotate:
+      foo.jsonl -> foo.jsonl.1
+      foo.jsonl.1 -> foo.jsonl.2 ... up to keep
+    Then create empty foo.jsonl.
+    Returns True if rotated, False if not.
+    """
+    try:
+        if not path.exists():
+            return False
+
+        keep = int(keep)
+        if keep < 1:
+            keep = 1
+
+        # delete oldest
+        oldest = path.with_name(f"{path.name}.{keep}")
+        try:
+            if oldest.exists():
+                oldest.unlink()
+        except Exception:
+            pass
+
+        # shift down
+        for i in range(keep - 1, 0, -1):
+            src = path.with_name(f"{path.name}.{i}")
+            dst = path.with_name(f"{path.name}.{i+1}")
+            if src.exists():
+                try:
+                    os.replace(str(src), str(dst))
+                except Exception:
+                    pass
+
+        # move current to .1
+        dst1 = path.with_name(f"{path.name}.1")
+        try:
+            os.replace(str(path), str(dst1))
+        except Exception:
+            # last resort: copy-then-truncate
+            try:
+                data = path.read_bytes()
+                dst1.write_bytes(data)
+                path.write_text("", encoding="utf-8")
+                return True
+            except Exception:
+                return False
+
+        # create new empty file
+        try:
+            path.write_text("", encoding="utf-8")
+        except Exception:
+            pass
+
+        return True
+    except Exception:
+        return False
+
+
+def _log_rotate_loop(stop_event: threading.Event) -> None:
+    """
+    Periodically checks and rotates logs to prevent runaway file sizes.
+    """
+    enabled = _env_bool("WS_LOG_ROTATE_ENABLED", "true")
+    if not enabled:
+        LOG.info("WS log rotation disabled (WS_LOG_ROTATE_ENABLED=false).")
+        return
+
+    warn_mb = float(os.getenv("WS_LOG_ROTATE_WARN_MB", "50") or "50")
+    cap_mb = float(os.getenv("WS_LOG_ROTATE_CAP_MB", "150") or "150")
+    keep = int(os.getenv("WS_LOG_ROTATE_KEEP", "3") or "3")
+    every = int(os.getenv("WS_LOG_ROTATE_EVERY_SEC", "30") or "30")
+    if every < 5:
+        every = 5
+
+    LOG.info(
+        "WS log rotation enabled (warn>%.2fMB cap>%.2fMB keep=%d every=%ss)",
+        warn_mb, cap_mb, keep, every
+    )
+
+    while not stop_event.is_set():
+        try:
+            for p in (PUBLIC_TRADES_PATH, EXECUTIONS_PATH):
+                sz = _file_size_mb(p)
+                if sz >= warn_mb:
+                    LOG.warning("WS log size warning: %s size=%.2f MB", p.name, sz)
+                if sz >= cap_mb:
+                    rotated = _rotate_file(p, keep=keep)
+                    if rotated:
+                        LOG.warning("WS log rotated: %s (%.2f MB) -> %s.1", p.name, sz, p.name)
+                    else:
+                        LOG.error("WS log rotation FAILED for %s (%.2f MB)", p.name, sz)
+        except Exception as e:
+            LOG.error("WS log rotation loop error: %s", e)
+
+        for _ in range(every):
+            if stop_event.is_set():
+                break
+            time.sleep(1)
+
+
+# -------------------------
+# Strategy-driven public symbols
+# -------------------------
+
+def _load_public_symbols_from_strategies(account_label: str) -> List[str]:
+    if not _env_bool("WS_PUBLIC_FROM_STRATEGIES", "true"):
+        return []
+
+    strat_path = ROOT / "config" / "strategies.yaml"
+    if not strat_path.exists():
+        return []
+
+    try:
+        import yaml  # type: ignore
+    except Exception:
+        LOG.warning("PyYAML not installed; cannot read strategies.yaml for public symbols. Falling back.")
+        return []
+
+    try:
+        cfg = yaml.safe_load(strat_path.read_text(encoding="utf-8")) or {}
+    except Exception as e:
+        LOG.warning("Failed to parse strategies.yaml for public symbols: %s", e)
+        return []
+
+    subs = cfg.get("subaccounts") or []
+    if not isinstance(subs, list):
+        return []
+
+    only_this = _env_bool("WS_PUBLIC_ONLY_THIS_LABEL", "false")
+    include_main = _env_bool("WS_PUBLIC_INCLUDE_MAIN", "true")
+
+    wanted_labels = {account_label}
+    if include_main:
+        wanted_labels.add("main")
+
+    symbols: List[str] = []
+    for s in subs:
+        if not isinstance(s, dict):
+            continue
+        if not bool(s.get("enabled", True)):
+            continue
+
+        label = str(s.get("account_label") or "").strip()
+        if only_this and label not in wanted_labels:
+            continue
+
+        sym_list = s.get("symbols") or []
+        if not isinstance(sym_list, list):
+            continue
+
+        for sym in sym_list:
+            sym_u = str(sym).strip().upper()
+            if sym_u:
+                symbols.append(sym_u)
+
+    # de-dupe while preserving order
+    seen = set()
+    out: List[str] = []
+    for sym in symbols:
+        if sym not in seen:
+            seen.add(sym)
+            out.append(sym)
+
+    sort_mode = os.getenv("WS_PUBLIC_SYMBOLS_SORT", "none").strip().lower()
+    if sort_mode == "alpha":
+        out = sorted(out)
+
+    return out
+
+
+def _resolve_public_symbols(account_label: str) -> List[str]:
+    symbols_env = os.getenv("WS_PUBLIC_SYMBOLS", "")
+    if symbols_env.strip():
+        syms = [s.strip().upper() for s in symbols_env.split(",") if s.strip()]
+    else:
+        syms = _load_public_symbols_from_strategies(account_label) or DEFAULT_PUBLIC_SYMBOLS
+
+    max_n = int(os.getenv("WS_PUBLIC_MAX_SYMBOLS", "50") or "50")
+    if max_n <= 0:
+        max_n = 50
+    if len(syms) > max_n:
+        syms = syms[:max_n]
+    return syms
 
 
 # -------------------------
@@ -275,14 +530,12 @@ def _load_api_creds(account_label: str) -> Tuple[Optional[str], Optional[str], s
 def _build_ws_auth_payload(api_key: str, api_secret: str) -> Dict[str, Any]:
     expires_ms = _now_ms() + 60_000
     expires_str = str(expires_ms)
-
     signed_string = f"GET/realtime{expires_str}"
     signature = hmac.new(
         api_secret.encode("utf-8"),
         signed_string.encode("utf-8"),
         hashlib.sha256,
     ).hexdigest()
-
     return {"op": "auth", "args": [api_key, expires_str, signature]}
 
 
@@ -318,27 +571,40 @@ def _handle_private_message(msg: Dict[str, Any], account_label: str) -> None:
         raw_data = msg.get("data") or []
         if isinstance(raw_data, dict):
             raw_data = [raw_data]
+        if not isinstance(raw_data, list):
+            raw_data = []
 
-        norm_positions: List[dict] = []
+        existing = _load_json(POSITIONS_BUS_PATH)
+        existing = _ensure_label_block(existing, account_label)
+
+        labels = existing["labels"]
+        current_positions = labels[account_label].get("positions") or []
+        if not isinstance(current_positions, list):
+            current_positions = []
+
+        pos_map: Dict[str, dict] = {}
+        for p in current_positions:
+            if isinstance(p, dict):
+                sym = str(p.get("symbol", "")).upper()
+                if sym:
+                    pos_map[sym] = p
+
         for p in raw_data:
             if not isinstance(p, dict):
                 continue
             try:
                 norm = normalize_position(p, account_label=account_label)
-                if not norm["symbol"]:
+                sym = norm.get("symbol", "")
+                if not sym:
                     continue
-                if norm["size"] <= 0:
+                if _safe_float(norm.get("size", 0)) <= 0:
+                    pos_map.pop(sym, None)
                     continue
-                norm_positions.append(norm)
+                pos_map[sym] = norm
             except Exception as e:
                 LOG.error("[PRIVATE] Error normalizing position row %s: %s", p, e)
 
-        existing = _load_json(POSITIONS_BUS_PATH)
-        labels = existing.get("labels")
-        if not isinstance(labels, dict):
-            labels = {}
-
-        labels[account_label] = {"category": "linear", "positions": norm_positions}
+        labels[account_label] = {"category": "linear", "positions": list(pos_map.values())}
         existing["labels"] = labels
         existing["version"] = 2
         existing["updated_ms"] = now_ms
@@ -373,15 +639,22 @@ def _run_private_ws(
     stop_event: threading.Event,
 ) -> None:
     backoff = WS_RECONNECT_MIN_SEC
-
     def on_open(ws: websocket.WebSocketApp) -> None:  # type: ignore
         nonlocal backoff
         backoff = WS_RECONNECT_MIN_SEC
+        LOG.info("[PRIVATE] WS CONNECTED")
         LOG.info("[PRIVATE] WS opened, sending auth + subscribe...")
 
         auth_payload = _build_ws_auth_payload(api_key, api_secret)
         ws.send(json.dumps(auth_payload))
         ws.send(json.dumps({"op": "subscribe", "args": ["position", "execution"]}))
+
+        # ===== ADD THESE LINES =====
+        global _ws_private_ready
+        _ws_private_ready = True
+        _maybe_send_online_notification(account_label)
+        # ============================
+
 
     def on_message(ws: websocket.WebSocketApp, message: str) -> None:  # type: ignore
         try:
@@ -523,7 +796,13 @@ def _handle_public_message(msg: Dict[str, Any]) -> None:
         return
 
 
-def _run_public_ws(url: str, symbols: List[str], stop_event: threading.Event) -> None:
+def _run_public_ws(
+    url: str,
+    symbols: List[str],
+    stop_event: threading.Event,
+    account_label: str,
+) -> None:
+
     symbols_clean = [str(s).strip().upper() for s in symbols if str(s).strip()]
     topics: List[str] = []
     for s in symbols_clean:
@@ -536,8 +815,16 @@ def _run_public_ws(url: str, symbols: List[str], stop_event: threading.Event) ->
     def on_open(ws: websocket.WebSocketApp) -> None:  # type: ignore
         nonlocal backoff
         backoff = WS_RECONNECT_MIN_SEC
+        
+        LOG.info("[PUBLIC] WS CONNECTED")
         LOG.info("[PUBLIC] WS opened, subscribing (%d topics)...", len(topics))
         ws.send(json.dumps(sub_payload))
+
+    # Mark public WS ready and maybe notify
+        global _ws_public_ready
+        _ws_public_ready = True
+        _maybe_send_online_notification(account_label)
+
 
     def on_message(ws: websocket.WebSocketApp, message: str) -> None:  # type: ignore
         try:
@@ -610,18 +897,14 @@ def main() -> None:
     private_url = os.getenv("BYBIT_WS_PRIVATE_URL", "wss://stream.bybit.com/v5/private")
     public_url = os.getenv("BYBIT_WS_PUBLIC_URL", "wss://stream.bybit.com/v5/public/linear")
 
-    symbols_env = os.getenv("WS_PUBLIC_SYMBOLS", "")
-    if symbols_env.strip():
-        public_symbols = [s.strip().upper() for s in symbols_env.split(",") if s.strip()]
-    else:
-        public_symbols = DEFAULT_PUBLIC_SYMBOLS
+    public_symbols = _resolve_public_symbols(account_label)
 
     heartbeat_file = STATE_DIR / f"ws_switchboard_heartbeat_{account_label}.txt"
     heartbeat_interval = int(os.getenv("WS_HEARTBEAT_SECONDS", "20"))
 
     touch_interval = int(os.getenv("WS_POSITIONS_BUS_TOUCH_SEC", "5"))
 
-    LOG.info("Starting WS Switchboard v4.8")
+    LOG.info("Starting WS Switchboard v5.2")
     LOG.info("ACCOUNT_LABEL        : %s", account_label)
     LOG.info("WS_ENABLE_PRIVATE    : %s", enable_private)
     LOG.info("WS_ENABLE_PUBLIC     : %s", enable_public)
@@ -640,6 +923,7 @@ def main() -> None:
 
     stop_event = threading.Event()
 
+    # Heartbeat writer
     hb_thread = threading.Thread(
         target=_heartbeat_loop,
         name="ws_heartbeat",
@@ -648,14 +932,23 @@ def main() -> None:
     )
     hb_thread.start()
 
-    # Keep positions_bus fresh even when no positions are open
+    # Bus-touch loop to prevent false stale alarms
     touch_thread = threading.Thread(
         target=_touch_positions_bus_forever,
         name="bus_touch_positions",
-        args=(touch_interval, stop_event),
+        args=(touch_interval, account_label, stop_event),
         daemon=True,
     )
     touch_thread.start()
+
+    # NEW: log rotation loop (proactive)
+    rotate_thread = threading.Thread(
+        target=_log_rotate_loop,
+        name="ws_log_rotate",
+        args=(stop_event,),
+        daemon=True,
+    )
+    rotate_thread.start()
 
     priv_thread = None
     if enable_private:
@@ -682,7 +975,7 @@ def main() -> None:
         pub_thread = threading.Thread(
             target=_run_public_ws,
             name="ws_public",
-            args=(public_url, public_symbols, stop_event),
+            args=(public_url, public_symbols, stop_event, account_label),
             daemon=True,
         )
         pub_thread.start()

@@ -1,0 +1,520 @@
+# -------------------------------------------------------------------
+# master_strategies.yaml (Unified Strategy + Subaccount Config)
+# Version: 1
+#
+# Unified config combining:
+#   • config/strategies.yaml
+#   • config/subaccounts.yaml
+#   • config/risk_profiles.yaml
+#   • config/exit_profiles.yaml
+#   • subaccounts.json (via ENV references)
+#
+# ⚠ Sensitive tokens/keys must be provided via environment variables.
+# -------------------------------------------------------------------
+
+version: 1
+notes: |
+  Unified master strategies config for Flashback:
+   - AI gating, executor, telemetry, alerts
+   - Environment variables for credentials & Telegram
+
+subaccounts:
+  flashback01:
+    sub_uid: 524630315
+    telegram:
+      bot_token_env: "TG_FB01_TOKEN"
+      chat_id_env: "TG_FB01_CHAT_ID"
+    api_env:
+      key: "BYBIT_FB01_API_KEY"
+      secret: "BYBIT_FB01_API_SECRET"
+  flashback02:
+    sub_uid: 524633243
+    telegram:
+      bot_token_env: "TG_FB02_TOKEN"
+      chat_id_env: "TG_FB02_CHAT_ID"
+    api_env:
+      key: "BYBIT_FB02_API_KEY"
+      secret: "BYBIT_FB02_API_SECRET"
+  flashback03:
+    sub_uid: 524634622
+    telegram:
+      bot_token_env: "TG_FB03_TOKEN"
+      chat_id_env: "TG_FB03_CHAT_ID"
+    api_env:
+      key: "BYBIT_FB03_API_KEY"
+      secret: "BYBIT_FB03_API_SECRET"
+  flashback04:
+    sub_uid: 524636309
+    telegram:
+      bot_token_env: "TG_FB04_TOKEN"
+      chat_id_env: "TG_FB04_CHAT_ID"
+    api_env:
+      key: "BYBIT_FB04_API_KEY"
+      secret: "BYBIT_FB04_API_SECRET"
+  flashback05:
+    sub_uid: 524637467
+    telegram:
+      bot_token_env: "TG_FB05_TOKEN"
+      chat_id_env: "TG_FB05_CHAT_ID"
+    api_env:
+      key: "BYBIT_FB05_API_KEY"
+      secret: "BYBIT_FB05_API_SECRET"
+  flashback06:
+    sub_uid: 524638768
+    telegram:
+      bot_token_env: "TG_FB06_TOKEN"
+      chat_id_env: "TG_FB06_CHAT_ID"
+    api_env:
+      key: "BYBIT_FB06_API_KEY"
+      secret: "BYBIT_FB06_API_SECRET"
+  flashback07:
+    sub_uid: 524649709
+    telegram:
+      bot_token_env: "TG_FB07_TOKEN"
+      chat_id_env: "TG_FB07_CHAT_ID"
+    api_env:
+      key: "BYBIT_FB07_API_KEY"
+      secret: "BYBIT_FB07_API_SECRET"
+  flashback08:
+    sub_uid: 524650929
+    telegram:
+      bot_token_env: "TG_FB08_TOKEN"
+      chat_id_env: "TG_FB08_CHAT_ID"
+    api_env:
+      key: "BYBIT_FB08_API_KEY"
+      secret: "BYBIT_FB08_API_SECRET"
+  flashback09:
+    sub_uid: 524693375
+    telegram:
+      bot_token_env: "TG_FB09_TOKEN"
+      chat_id_env: "TG_FB09_CHAT_ID"
+    api_env:
+      key: "BYBIT_FB09_API_KEY"
+      secret: "BYBIT_FB09_API_SECRET"
+  flashback10:
+    sub_uid: 524700541
+    telegram:
+      bot_token_env: "TG_FB10_TOKEN"
+      chat_id_env: "TG_FB10_CHAT_ID"
+    api_env:
+      key: "BYBIT_FB10_API_KEY"
+      secret: "BYBIT_FB10_API_SECRET"
+
+strategies:
+  - id: "Sub1_Trend"
+    account_label: "flashback01"
+    enabled: true
+    symbols:
+      - BTCUSDT
+      - ETHUSDT
+      - SOLUSDT
+      - XRPUSDT
+      - ADAUSDT
+      - LINKUSDT
+      - INJUSDT
+      - OPUSDT
+      - AVAXUSDT
+      - DOGEUSDT
+    timeframes:
+      - "15"
+      - "60"
+    setup_types:
+      - trend_pullback
+      - trend_breakout_retest
+      - ema_trend_follow
+    automation_mode: "LEARN_DRY"
+    ai_profile: "trend_v1"
+    risk_profile: "midterm_core"
+    exit_profile: "standard_5"
+    promotion_rules:
+      enabled: true
+      min_trades: 150
+      min_winrate: 0.52
+      min_avg_r: 0.30
+      min_expectancy_r: 0.15
+      max_drawdown_pct: 18.0
+    regime:
+      min_adx: 0.0
+      max_atr_pct: 999.0
+      min_vol_z: -999.0
+      max_vol_z: 999.0
+    tags:
+      - "trend"
+      - "midterm"
+
+  - id: "Sub2_Breakout"
+    account_label: "flashback02"
+    enabled: true
+    symbols:
+      - BTCUSDT
+      - ETHUSDT
+      - SOLUSDT
+      - XRPUSDT
+      - ADAUSDT
+      - LINKUSDT
+      - INJUSDT
+      - OPUSDT
+      - AVAXUSDT
+      - DOGEUSDT
+      - MATICUSDT
+      - NEARUSDT
+      - ARBUSDT
+      - HBARUSDT
+      - FARTCOINUSDT
+      - PUMPFUNUSDT
+    timeframes:
+      - "5"
+      - "15"
+    setup_types:
+      - breakout_high
+      - breakout_range
+      - squeeze_release
+    automation_mode: "LEARN_DRY"
+    ai_profile: "breakout_v1"
+    risk_profile: "intraday_fast"
+    exit_profile: "standard_5"
+    promotion_rules:
+      enabled: true
+      min_trades: 200
+      min_winrate: 0.50
+      min_avg_r: 0.35
+      min_expectancy_r: 0.20
+      max_drawdown_pct: 20.0
+    regime:
+      min_adx: 0.0
+      max_atr_pct: 999.0
+      min_vol_z: -999.0
+      max_vol_z: 999.0
+    tags:
+      - "breakout"
+      - "intraday"
+
+  - id: "Sub3_ScalpMajors"
+    account_label: "flashback03"
+    enabled: true
+    symbols:
+      - BTCUSDT
+      - ETHUSDT
+      - SOLUSDT
+      - XRPUSDT
+      - ADAUSDT
+      - LINKUSDT
+    timeframes:
+      - "1"
+      - "3"
+      - "5"
+    setup_types:
+      - scalp_liquidity_sweep
+      - scalp_trend_continuation
+      - scalp_reversal_snapback
+    automation_mode: "LEARN_DRY"
+    ai_profile: "scalp_v1"
+    risk_profile: "intraday_fast"
+    exit_profile: "standard_5"
+    promotion_rules:
+      enabled: true
+      min_trades: 250
+      min_winrate: 0.50
+      min_avg_r: 0.20
+      min_expectancy_r: 0.10
+      max_drawdown_pct: 22.0
+    regime:
+      min_adx: 0.0
+      max_atr_pct: 999.0
+      min_vol_z: -999.0
+      max_vol_z: 999.0
+    tags:
+      - "scalp"
+      - "intraday"
+      - "high_freq"
+
+  - id: "Sub4_SwingRevert"
+    account_label: "flashback04"
+    enabled: true
+    symbols:
+      - BTCUSDT
+      - ETHUSDT
+      - XRPUSDT
+      - ADAUSDT
+      - LINKUSDT
+      - AVAXUSDT
+      - MATICUSDT
+    timeframes:
+      - "15"
+      - "60"
+      - "240"
+    setup_types:
+      - swing_reversion_extreme
+      - swing_reversion_channel
+    automation_mode: "LEARN_DRY"
+    ai_profile: "reversion_v1"
+    risk_profile: "midterm_core"
+    exit_profile: "standard_5"
+    promotion_rules:
+      enabled: true
+      min_trades: 120
+      min_winrate: 0.52
+      min_avg_r: 0.35
+      min_expectancy_r: 0.20
+      max_drawdown_pct: 18.0
+    regime:
+      min_adx: 0.0
+      max_atr_pct: 999.0
+      min_vol_z: -999.0
+      max_vol_z: 999.0
+    tags:
+      - "mean_reversion"
+      - "midterm"
+
+   - id: "Sub5_HFT_MM"
+    account_label: "flashback05"
+    enabled: true
+    symbols:
+      - BTCUSDT
+      - ETHUSDT
+    timeframes:
+      - "1"
+    setup_types:
+      - mm_spread_capture
+      - mm_reversion_micro
+    automation_mode: "LEARN_DRY"
+    ai_profile: "hft_mm_v1"
+    risk_profile: "hft_mm"
+    exit_profile: "standard_5"
+    promotion_rules:
+      enabled: true
+      min_trades: 400
+      min_winrate: 0.49
+      min_avg_r: 0.12
+      min_expectancy_r: 0.05
+      max_drawdown_pct: 15.0
+    regime:
+      min_adx: 0.0
+      max_atr_pct: 999.0
+      min_vol_z: -999.0
+      max_vol_z: 999.0
+    tags:
+      - "hft"
+      - "market_maker"
+      - "micro"
+
+  - id: "Sub6_Speculative"
+    account_label: "flashback06"
+    enabled: true
+    symbols:
+      - FARTCOINUSDT
+      - PUMPFUNUSDT
+      - HBARUSDT
+    timeframes:
+      - "1"
+      - "5"
+    setup_types:
+      - pump_chase_momo
+      - dump_fade_reversion
+    automation_mode: "LEARN_DRY"
+    ai_profile: "spec_v1"
+    risk_profile: "spec_intraday"
+    exit_profile: "standard_5"
+    promotion_rules:
+      enabled: true
+      min_trades: 200
+      min_winrate: 0.48
+      min_avg_r: 0.35
+      min_expectancy_r: 0.18
+      max_drawdown_pct: 25.0
+    regime:
+      min_adx: 0.0
+      max_atr_pct: 999.0
+      min_vol_z: -999.0
+      max_vol_z: 999.0
+    tags:
+      - "speculative"
+      - "microcap"
+      - "intraday"
+
+  - id: "Sub7_Canary"
+    account_label: "flashback07"
+    enabled: true
+    symbols:
+      - BTCUSDT
+      - ETHUSDT
+      - SOLUSDT
+      - LINKUSDT
+      - INJUSDT
+      - AVAXUSDT
+      - OPUSDT
+    timeframes:
+      - "5"
+      - "15"
+    setup_types:
+      - trend_pullback
+      - breakout_high
+      - swing_trend_continuation
+    automation_mode: "LEARN_DRY"
+    ai_profile: "canary_v1"
+    risk_profile: "canary_low_risk"
+    exit_profile: "standard_5"
+    promotion_rules:
+      enabled: true
+      min_trades: 150
+      min_winrate: 0.52
+      min_avg_r: 0.30
+      min_expectancy_r: 0.18
+      max_drawdown_pct: 18.0
+    regime:
+      min_adx: 0.0
+      max_atr_pct: 999.0
+      min_vol_z: -999.0
+      max_vol_z: 999.0
+    tags:
+      - "canary"
+      - "experimental"
+
+  - id: "Sub8_SwingMulti"
+    account_label: "flashback08"
+    enabled: true
+    symbols:
+      - BTCUSDT
+      - ETHUSDT
+      - SOLUSDT
+      - XRPUSDT
+      - ADAUSDT
+      - LINKUSDT
+      - INJUSDT
+      - OPUSDT
+      - AVAXUSDT
+      - MATICUSDT
+      - NEARUSDT
+      - ARBUSDT
+      - HBARUSDT
+    timeframes:
+      - "30"
+      - "240"
+    setup_types:
+      - swing_trend_follow
+      - swing_reversion_extreme
+    automation_mode: "LEARN_DRY"
+    ai_profile: "swing_v1"
+    risk_profile: "swing_position"
+    exit_profile: "standard_5"
+    promotion_rules:
+      enabled: true
+      min_trades: 150
+      min_winrate: 0.50
+      min_avg_r: 0.30
+      min_expectancy_r: 0.15
+      max_drawdown_pct: 20.0
+    regime:
+      min_adx: 0.0
+      max_atr_pct: 999.0
+      min_vol_z: -999.0
+      max_vol_z: 999.0
+    tags:
+      - "swing"
+      - "multi_asset"
+      - "longterm"
+
+  - id: "Sub9_Range"
+    account_label: "flashback09"
+    enabled: true
+    symbols:
+      - BTCUSDT
+      - ETHUSDT
+      - XRPUSDT
+      - ADAUSDT
+      - LINKUSDT
+      - DOGEUSDT
+    timeframes:
+      - "5"
+      - "15"
+    setup_types:
+      - intraday_range_fade
+      - failed_breakout_fade
+    automation_mode: "LEARN_DRY"
+    ai_profile: "range_v1"
+    risk_profile: "intraday_fast"
+    exit_profile: "standard_5"
+    promotion_rules:
+      enabled: true
+      min_trades: 180
+      min_winrate: 0.50
+      min_avg_r: 0.25
+      min_expectancy_r: 0.12
+      max_drawdown_pct: 20.0
+    regime:
+      min_adx: 0.0
+      max_atr_pct: 999.0
+      min_vol_z: -999.0
+      max_vol_z: 999.0
+    tags:
+      - "range_fade"
+      - "intraday"
+
+  - id: "Sub10_ManualOnly"
+    account_label: "flashback10"
+    enabled: false
+    symbols:
+      - BTCUSDT
+      - ETHUSDT
+      - SOLUSDT
+      - XRPUSDT
+      - ADAUSDT
+      - LINKUSDT
+      - INJUSDT
+      - OPUSUT
+      - AVAXUSDT
+      - DOGEUSDT
+      - MATICUSDT
+      - NEARUSDT
+      - ARBUSDT
+      - HBARUSDT
+      - FARTCOINUSDT
+      - PUMPFUNUSDT
+    timeframes:
+      - "5"
+      - "15"
+    setup_types: []
+    automation_mode: "OFF"
+    ai_profile: "manual_only"
+    risk_profile: "manual_only"
+    exit_profile: "standard_5"
+    promotion_rules:
+      enabled: false
+    regime:
+      min_adx: 0.0
+      max_atr_pct: 999.0
+      min_vol_z: -999.0
+      max_vol_z: 999.0
+    tags:
+      - "manual"
+      - "disabled"
+
+  - id: "main_manual"
+    account_label: "main"
+    enabled: true
+    symbols:
+      - BTCUSDT
+      - ETHUSDT
+      - SOLUSDT
+      - XRPUSDT
+      - ADAUSDT
+      - LINKUSDT
+      - AVAXUSDT
+    timeframes:
+      - "5"
+      - "15"
+    setup_types: []
+    automation_mode: "OFF"
+    ai_profile: "manual_v1"
+    risk_profile: "main_manual_exits_only"
+    exit_profile: "standard_10"
+    promotion_rules:
+      enabled: false
+    regime:
+      min_adx: 0.0
+      max_atr_pct: 999.0
+      min_vol_z: -999.0
+      max_vol_z: 999.0
+    tags:
+      - "manual"
+      - "main"

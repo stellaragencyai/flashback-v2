@@ -176,6 +176,45 @@ def _normalize_mode(raw: Any) -> str:
         return m
     return "UNKNOWN"
 
+# ────────────────────────────────────────────────────────────────────
+# Regime Tagging Helper (for regime-aware models)
+# ────────────────────────────────────────────────────────────────────
+
+def compute_regime_tag(row: dict[str, Any]) -> str:
+    """
+    Assign a simple regime label based on regime indicators:
+      - trend: strong trend (adx >= 20)
+      - high_vol: high volatility (atr_pct >= 1.0)
+      - range: range / low trend (adx < 20 and atr_pct < 1.0)
+      - other: fallback
+    You can tune thresholds to your liking.
+    """
+    try:
+        adx = float(row.get("adx") or 0.0)
+    except Exception:
+        adx = 0.0
+
+    try:
+        atr_pct = float(row.get("atr_pct") or 0.0)
+    except Exception:
+        atr_pct = 0.0
+
+    try:
+        vol_z = float(row.get("vol_zscore") or 0.0)
+    except Exception:
+        vol_z = 0.0
+
+    # Strong trending
+    if adx >= 20:
+        return "trend"
+    # High volatility (but not trending)
+    if atr_pct >= 1.0 or abs(vol_z) >= 1.5:
+        return "high_vol"
+    # Likely range or subdued move
+    if adx < 20 and atr_pct < 1.0:
+        return "range"
+    # Fallback catch-all
+    return "other"
 
 # ---------------------------------------------------------------------------
 # Normalization from different sources
@@ -228,9 +267,16 @@ def _normalize_from_features_trades(row: Dict[str, Any]) -> Dict[str, Any]:
     base["atr_pct"] = _to_float(features.get("atr_pct") or features.get("atr_perc"))
     base["vol_zscore"] = _to_float(features.get("vol_zscore") or features.get("volume_zscore"))
     base["adx"] = _to_float(features.get("adx"))
+    
+    
+    
 
     # Flatten the rest under f.
     flat = dict(base)
+    
+    # ▶ Now add the regime tag
+    flat["regime"] = compute_regime_tag(flat)
+    
     for k, v in features.items():
         key = str(k)
         if key in ("rr_est", "rr_expected", "atr_pct", "atr_perc", "vol_zscore", "volume_zscore", "adx"):
@@ -294,13 +340,17 @@ def _normalize_from_trades_log(row: Dict[str, Any]) -> Dict[str, Any]:
 
     # Anything that looks like a "feature" can be flattened with a prefix
     flat = dict(base)
+    
+    # Regime tag based on numeric indicators
+    flat["regime"] = compute_regime_tag(flat)
+
+    # Anything that looks like a "feature" can be flattened with a prefix
     for k, v in row.items():
         key = str(k)
         if key in flat:
             continue
         if key.startswith("f.") or key.startswith("feature_"):
             flat[f"f.{key}"] = v
-
     return flat
 
 

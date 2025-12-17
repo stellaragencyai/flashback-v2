@@ -1,51 +1,35 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Flashback — AI Events Spine (disk-logging version, v2.2 upgraded)
+Flashback — AI Events Spine (disk-logging version, v2.7.0 Phase4-decision-enforced)
 
-Purpose
--------
-Single place to construct and publish AI-related events.
+v2.6.1 Fix (kept):
+- memory_fingerprint must NOT include setup_fingerprint or memory_fingerprint
+  (otherwise it inherits trade_id uniqueness indirectly via setup_fingerprint).
 
-Events are:
-    - Written directly to disk as JSONL:
-        state/ai_events/setups.jsonl
-        state/ai_events/outcomes.jsonl
-    - Optionally pushed into ai_events_bus for in-process consumers.
+v2.6.2 Upgrade (kept):
+- Emit TWO memory records per enriched outcome:
+    Tier A (symbol-scoped):  symbol_scope = <SYMBOL>  e.g. "BTCUSDT"
+    Tier B (global):         symbol_scope = "ANY"
+  This enables tiered retrieval to actually work (Tier A becomes real).
 
-This removes the need for a separate ai_journal_worker process just to
-drain an in-memory deque across processes (which is impossible).
+v2.7.0 Upgrade (NEW):
+- Enforce Phase 4 contract:
+    "setup_context exists" => "ai_decisions.jsonl contains decision for trade_id"
+  If missing:
+    - try pilot_decide(setup_event) (preferred)
+    - else write fallback decision (BLOCKED_BY_GATES, reason=decision_missing)
 
-This module ALSO exposes a `main()` loop so supervisor_ai_stack can run it
-as an "ai_journal" worker that just emits heartbeats while disk logging
-is done inline by publish_ai_event().
-
-UPGRADE (Option-1 style)
-------------------------
-- Maintain a crash-safe pending registry of setups:
-
-      state/ai_events/pending_setups.json
-
-- When an outcome arrives:
-      • Write raw outcome to outcomes_raw.jsonl
-      • Try to find matching setup by trade_id
-      • If found, merge into an enriched outcome:
-            stats.pnl_usd, stats.r_multiple, stats.win
-        and append to outcomes.jsonl
-      • Remove that trade_id from pending registry
-
-v2.2 Upgrade Summary
---------------------
-- Introduced typed SetupRecord / OutcomeRecord schemas in app.core.bus_types.
-- build_setup_context() now supports optional setup_type, timeframe, ai_profile
-  as top-level fields for better AI learning.
-- publish_ai_event() remains backwards compatible with older callers that
-  only pass event_type + payload.
+Keeps:
+- setup_fingerprint (trade_id-bound) for Phase 3 audit/join safety
+- memory_fingerprint (trade_id-free) for Phase 4 mergeable pattern memory
 """
 
 from __future__ import annotations
 
+import hashlib
 import json
+import os
 import time
 from pathlib import Path
 from typing import Any, Dict, Optional
@@ -54,6 +38,7 @@ import orjson
 
 from app.core.bus_types import (  # type: ignore
     ai_events_bus,
+    memory_bus,
     SetupRecord,
     OutcomeRecord,
 )
@@ -72,9 +57,7 @@ except Exception:  # pragma: no cover
         logger_ = logging.getLogger(name)
         if not logger_.handlers:
             handler = logging.StreamHandler(sys.stdout)
-            fmt = logging.Formatter(
-                "%(asctime)s [%(levelname)s] [%(name)s] %(message)s"
-            )
+            fmt = logging.Formatter("%(asctime)s [%(levelname)s] [%(name)s] %(message)s")
             handler.setFormatter(fmt)
             logger_.addHandler(handler)
         logger_.setLevel(logging.INFO)
@@ -87,11 +70,11 @@ try:
 except Exception:  # pragma: no cover
     def record_heartbeat(name: str) -> None:  # type: ignore[override]
         return None
+
 try:
     from app.core.config import settings  # type: ignore
     ROOT: Path = settings.ROOT  # type: ignore
 except Exception:
-    # Fallback: derive project root from this file location
     ROOT = Path(__file__).resolve().parents[2]
 
 
@@ -113,79 +96,458 @@ SETUPS_PATH: Path = AI_EVENTS_DIR / "setups.jsonl"
 OUTCOMES_PATH: Path = AI_EVENTS_DIR / "outcomes.jsonl"           # legacy / enriched
 OUTCOMES_RAW_PATH: Path = AI_EVENTS_DIR / "outcomes_raw.jsonl"   # raw execution outcomes
 
-# Pending setups registry (crash-safe)
 PENDING_REGISTRY_PATH: Path = AI_EVENTS_DIR / "pending_setups.json"
+
+CONFIG_DIR: Path = ROOT / "config"
+STRATEGIES_PATH: Path = CONFIG_DIR / "strategies.yaml"
+EXIT_PROFILES_PATH: Path = CONFIG_DIR / "exit_profiles.yaml"
+RISK_PROFILES_PATH: Path = CONFIG_DIR / "risk_profiles.yaml"
+
+# ---------------------------------------------------------------------------
+# Phase 4: Memory store (bounded + reversible)
+# ---------------------------------------------------------------------------
+
+AI_MEMORY_DIR: Path = STATE_DIR / "ai_memory"
+AI_MEMORY_DIR.mkdir(parents=True, exist_ok=True)
+
+MEMORY_SNAPSHOT_PATH: Path = AI_MEMORY_DIR / "memory_snapshot.json"
+MEMORY_RECORDS_PATH: Path = AI_MEMORY_DIR / "memory_records.jsonl"
+
+MEMORY_SCHEMA_VERSION = 1
+
+MEM_MAX_RECORDS = 50_000
+MEM_MAX_AGE_DAYS = 180
+MEM_MAX_NOTES_LEN = 512
+
+PEND_MAX_COUNT = 5_000
+PEND_MAX_AGE_DAYS = 14
+
+# ---------------------------------------------------------------------------
+# Phase 4: Decisions (enforced)
+# ---------------------------------------------------------------------------
+
+AI_DECISIONS_PATH: Path = (STATE_DIR / "ai_decisions.jsonl")
+AI_EVENTS_ENFORCE_DECISION: bool = str(os.getenv("AI_EVENTS_ENFORCE_DECISION", "true")).strip().lower() in (
+    "1", "true", "yes", "y", "on"
+)
+AI_DECISION_TAIL_BYTES: int = int(os.getenv("AI_DECISION_TAIL_BYTES", "1048576") or "1048576")  # default 1MB
 
 
 def _append_jsonl(path: Path, payload: Dict[str, Any]) -> None:
-    """
-    Append a single JSON object as one line to the given file.
-    """
     try:
         with path.open("ab") as f:
             f.write(orjson.dumps(payload))
             f.write(b"\n")
     except Exception as e:
-        # Best-effort logging; do NOT crash callers.
         try:
             log.warning("[ai_events] Failed to append event to %s: %r", path, e)
         except Exception:
-            # Worst case: totally silent
             pass
 
 
+def _atomic_write_text(path: Path, text: str) -> None:
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(text, encoding="utf-8")
+    tmp.replace(path)
+
+
 # ---------------------------------------------------------------------------
-# Pending registry helpers (crash-safe setups cache)
+# Timeframe normalization + fingerprinting
+# ---------------------------------------------------------------------------
+
+def _normalize_timeframe(tf: Any) -> Optional[str]:
+    if tf is None:
+        return None
+    try:
+        s = str(tf).strip().lower()
+    except Exception:
+        return None
+    if not s:
+        return None
+
+    if s.endswith(("m", "h", "d", "w")):
+        return s
+
+    try:
+        n = int(float(s))
+        if n > 0:
+            return f"{n}m"
+    except Exception:
+        return None
+
+    return None
+
+
+def _stable_json(obj: Any) -> str:
+    try:
+        return json.dumps(obj, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+    except Exception:
+        try:
+            return str(obj)
+        except Exception:
+            return ""
+
+
+def _filter_features_for_fingerprint(features: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Conservative filter for stable fingerprint inputs.
+    Critical: exclude setup_fingerprint + memory_fingerprint to avoid recursion/poisoning.
+    """
+    if not isinstance(features, dict):
+        return {}
+    f = dict(features)
+
+    # volatile or large blobs
+    for k in (
+        "ts", "timestamp", "updated_ms",
+        "price", "last", "mark", "index",
+        "best_bid", "best_ask",
+        "orderbook", "trades",
+    ):
+        f.pop(k, None)
+
+    # CRITICAL: avoid recursive fingerprint poisoning
+    f.pop("setup_fingerprint", None)
+    f.pop("memory_fingerprint", None)
+
+    return f
+
+
+def _compute_setup_fingerprint(
+    *,
+    trade_id: str,
+    symbol: str,
+    account_label: str,
+    strategy: str,
+    setup_type: Optional[str],
+    timeframe: Optional[str],
+    features: Dict[str, Any],
+) -> str:
+    core = {
+        "trade_id": str(trade_id),
+        "symbol": str(symbol).upper(),
+        "account_label": str(account_label),
+        "strategy": str(strategy),
+        "setup_type": str(setup_type) if setup_type is not None else None,
+        "timeframe": timeframe,
+        "features": _filter_features_for_fingerprint(features),
+    }
+    h = hashlib.sha256()
+    h.update(_stable_json(core).encode("utf-8", errors="ignore"))
+    return h.hexdigest()
+
+
+def _compute_memory_fingerprint(
+    *,
+    symbol: str,
+    account_label: str,
+    strategy: str,
+    setup_type: Optional[str],
+    timeframe: Optional[str],
+    features: Dict[str, Any],
+) -> str:
+    core = {
+        "symbol": str(symbol).upper(),
+        "account_label": str(account_label),
+        "strategy": str(strategy),
+        "setup_type": str(setup_type) if setup_type is not None else None,
+        "timeframe": timeframe,
+        "features": _filter_features_for_fingerprint(features),
+    }
+    h = hashlib.sha256()
+    h.update(_stable_json(core).encode("utf-8", errors="ignore"))
+    return h.hexdigest()
+
+
+def _ensure_setup_fingerprint(event: Dict[str, Any]) -> None:
+    if not isinstance(event, dict):
+        return
+    if event.get("event_type") != "setup_context":
+        return
+
+    payload = event.get("payload") if isinstance(event.get("payload"), dict) else {}
+    features = payload.get("features") if isinstance(payload.get("features"), dict) else {}
+    if not isinstance(features, dict):
+        features = {}
+
+    tf = _normalize_timeframe(event.get("timeframe"))
+    if tf is None:
+        extra = payload.get("extra") if isinstance(payload.get("extra"), dict) else {}
+        tf = _normalize_timeframe(extra.get("timeframe"))
+
+    if tf is not None:
+        event["timeframe"] = tf
+        extra = payload.get("extra") if isinstance(payload.get("extra"), dict) else {}
+        extra["timeframe"] = tf
+        payload["extra"] = extra
+        event["payload"] = payload
+
+    tid = str(event.get("trade_id") or "").strip()
+    sym = str(event.get("symbol") or "").strip()
+    acct = str(event.get("account_label") or "main").strip()
+    strat = str(event.get("strategy") or event.get("strategy_name") or "unknown").strip()
+    stype = event.get("setup_type")
+    tf_final = tf
+
+    if not features.get("setup_fingerprint"):
+        fp = _compute_setup_fingerprint(
+            trade_id=tid,
+            symbol=sym,
+            account_label=acct,
+            strategy=strat,
+            setup_type=str(stype) if stype is not None else None,
+            timeframe=tf_final,
+            features=features,
+        )
+        features["setup_fingerprint"] = fp
+
+    if not features.get("memory_fingerprint"):
+        mfp = _compute_memory_fingerprint(
+            symbol=sym,
+            account_label=acct,
+            strategy=strat,
+            setup_type=str(stype) if stype is not None else None,
+            timeframe=tf_final,
+            features=features,
+        )
+        features["memory_fingerprint"] = mfp
+
+    payload["features"] = features
+    event["payload"] = payload
+
+
+# ---------------------------------------------------------------------------
+# Policy stamping (versions + hash)
+# ---------------------------------------------------------------------------
+
+_POLICY_CACHE: Dict[str, Any] = {"policy": None, "loaded_ms": 0}
+_POLICY_CACHE_TTL_MS = 10_000
+
+
+def _safe_read_bytes(path: Path) -> bytes:
+    try:
+        return path.read_bytes()
+    except Exception:
+        return b""
+
+
+def _extract_yaml_version(yaml_bytes: bytes) -> Optional[int]:
+    try:
+        txt = yaml_bytes.decode("utf-8", errors="ignore")
+        for line in txt.splitlines():
+            s = line.strip()
+            if s.startswith("version:"):
+                rest = s.split("version:", 1)[1].strip()
+                rest = rest.strip('"').strip("'")
+                try:
+                    return int(rest)
+                except Exception:
+                    return None
+        return None
+    except Exception:
+        return None
+
+
+def _compute_policy() -> Dict[str, Any]:
+    strategies_b = _safe_read_bytes(STRATEGIES_PATH)
+    exits_b = _safe_read_bytes(EXIT_PROFILES_PATH)
+    risks_b = _safe_read_bytes(RISK_PROFILES_PATH)
+
+    strategies_version = _extract_yaml_version(strategies_b)
+    exit_profiles_version = _extract_yaml_version(exits_b)
+    risk_profiles_version = _extract_yaml_version(risks_b)
+
+    h = hashlib.sha256()
+    h.update(b"strategies.yaml\n")
+    h.update(strategies_b)
+    h.update(b"\nexit_profiles.yaml\n")
+    h.update(exits_b)
+    h.update(b"\nrisk_profiles.yaml\n")
+    h.update(risks_b)
+
+    policy_hash = h.hexdigest()
+
+    return {
+        "strategies_version": strategies_version,
+        "exit_profiles_version": exit_profiles_version,
+        "risk_profiles_version": risk_profiles_version,
+        "policy_hash": policy_hash,
+        "paths": {
+            "strategies": str(STRATEGIES_PATH),
+            "exit_profiles": str(EXIT_PROFILES_PATH),
+            "risk_profiles": str(RISK_PROFILES_PATH),
+        },
+    }
+
+
+def _get_policy_cached() -> Dict[str, Any]:
+    now = _now_ms()
+    cached = _POLICY_CACHE.get("policy")
+    loaded_ms = int(_POLICY_CACHE.get("loaded_ms") or 0)
+    if cached and (now - loaded_ms) < _POLICY_CACHE_TTL_MS:
+        return cached  # type: ignore[return-value]
+    policy = _compute_policy()
+    _POLICY_CACHE["policy"] = policy
+    _POLICY_CACHE["loaded_ms"] = now
+    return policy
+
+
+def _stamp_policy(event: Dict[str, Any]) -> None:
+    try:
+        if not isinstance(event, dict):
+            return
+        if "policy" in event:
+            return
+        event["policy"] = _get_policy_cached()
+    except Exception:
+        pass
+
+
+# ---------------------------------------------------------------------------
+# Phase 4: Decision enforcement helpers
+# ---------------------------------------------------------------------------
+
+def _decisions_file_has_trade_id(trade_id: str) -> bool:
+    """
+    Fast-ish check: tail-scan ai_decisions.jsonl for '"trade_id":"<tid>"'.
+    This avoids loading huge files. Default tail = 1MB.
+    """
+    try:
+        tid = str(trade_id).strip()
+        if not tid:
+            return False
+        if not AI_DECISIONS_PATH.exists():
+            return False
+
+        needle = f"\"trade_id\":\"{tid}\"".encode("utf-8", errors="ignore")
+        size = AI_DECISIONS_PATH.stat().st_size
+        read_n = min(max(0, AI_DECISION_TAIL_BYTES), size)
+
+        with AI_DECISIONS_PATH.open("rb") as f:
+            if read_n < size:
+                f.seek(size - read_n)
+            chunk = f.read(read_n)
+        return needle in chunk
+    except Exception:
+        return False
+
+
+def _write_fallback_decision(setup_event: Dict[str, Any], reason: str) -> None:
+    """
+    Absolute last resort: append a minimal decision so Phase 4 contract is never violated.
+    """
+    try:
+        from app.core.ai_decision_logger import append_decision  # type: ignore
+    except Exception:
+        return
+
+    try:
+        tid = str(setup_event.get("trade_id") or "").strip()
+        sym = str(setup_event.get("symbol") or "").strip().upper()
+        acct = str(setup_event.get("account_label") or "main").strip()
+        tf = _normalize_timeframe(setup_event.get("timeframe")) or "unknown"
+        pol = setup_event.get("policy") if isinstance(setup_event.get("policy"), dict) else {}
+        policy_hash = str(pol.get("policy_hash") or "").strip() or None
+
+        payload: Dict[str, Any] = {
+            "schema_version": 1,
+            "ts": _now_ms(),
+            "decision": "BLOCKED_BY_GATES",
+            "tier_used": "NONE",
+            "memory": None,
+            "gates": {"reason": reason},
+            "proposed_action": None,
+            "trade_id": tid,
+            "symbol": sym,
+            "account_label": acct,
+            "timeframe": tf,
+        }
+        if policy_hash:
+            payload["policy_hash"] = policy_hash
+
+        append_decision(payload)
+    except Exception:
+        return
+
+
+def _ensure_decision_for_setup(setup_event: Dict[str, Any]) -> None:
+    """
+    Phase 4 contract enforcement:
+      setup_context -> decision exists in ai_decisions.jsonl
+    """
+    if not AI_EVENTS_ENFORCE_DECISION:
+        return
+    if not isinstance(setup_event, dict):
+        return
+
+    tid = str(setup_event.get("trade_id") or "").strip()
+    if not tid:
+        return
+
+    # If already logged, don't double-log.
+    if _decisions_file_has_trade_id(tid):
+        return
+
+    # Preferred path: call pilot_decide, which logs a proper contract decision.
+    try:
+        from app.bots.ai_pilot import pilot_decide  # local import avoids hard cycles
+        pilot_decide(setup_event)
+    except Exception as e:
+        log.warning("[phase4] pilot_decide failed for trade_id=%s: %r (writing fallback)", tid, e)
+        _write_fallback_decision(setup_event, reason="decision_missing")
+
+
+# ---------------------------------------------------------------------------
+# Pending registry + eviction
 # ---------------------------------------------------------------------------
 
 def _load_pending() -> Dict[str, Any]:
-    """
-    Load the pending setups registry from disk.
-
-    Shape:
-        {
-          "<trade_id>": {<setup_event_dict>},
-          ...
-        }
-    """
     if not PENDING_REGISTRY_PATH.exists():
         return {}
     try:
         txt = PENDING_REGISTRY_PATH.read_text(encoding="utf-8")
         data = json.loads(txt or "{}")
-        if isinstance(data, dict):
-            return data
-        return {}
+        return data if isinstance(data, dict) else {}
     except Exception:
         return {}
 
 
-def _save_pending(reg: Dict[str, Any]) -> None:
-    """
-    Persist the pending registry. Overwrites atomically from our perspective.
-    """
+def _prune_pending(reg: Dict[str, Any]) -> Dict[str, Any]:
     try:
-        PENDING_REGISTRY_PATH.write_text(
-            json.dumps(reg, indent=2, sort_keys=True),
-            encoding="utf-8",
+        now = _now_ms()
+        max_age_ms = int(PEND_MAX_AGE_DAYS * 24 * 60 * 60 * 1000)
+
+        items = []
+        for k, v in reg.items():
+            ts = None
+            if isinstance(v, dict):
+                ts = v.get("ts")
+            try:
+                ts_i = int(ts) if ts is not None else 0
+            except Exception:
+                ts_i = 0
+            items.append((k, ts_i, v))
+
+        items = [it for it in items if (now - it[1]) <= max_age_ms or it[1] == 0]
+        items.sort(key=lambda x: x[1], reverse=True)
+        items = items[:PEND_MAX_COUNT]
+        return {k: v for (k, _ts, v) in items}
+    except Exception:
+        return reg
+
+
+def _save_pending(reg: Dict[str, Any]) -> None:
+    try:
+        reg2 = _prune_pending(reg)
+        _atomic_write_text(
+            PENDING_REGISTRY_PATH,
+            json.dumps(reg2, indent=2, sort_keys=True),
         )
     except Exception as e:
         log.warning("[ai_events] Failed to save pending registry: %r", e)
 
 
-def _merge_setup_and_outcome(
-    setup_event: Dict[str, Any],
-    outcome_event: Dict[str, Any],
-) -> Dict[str, Any]:
-    """
-    Merge a setup_context event + outcome_record into one enriched outcome.
-
-    - Computes:
-        stats.pnl_usd
-        stats.r_multiple (if risk_usd available)
-        stats.win (if r_multiple computed)
-    - Embeds full setup and outcome payloads for AI training.
-    """
+def _merge_setup_and_outcome(setup_event: Dict[str, Any], outcome_event: Dict[str, Any]) -> Dict[str, Any]:
     try:
         setup_payload = setup_event.get("payload", {}) or {}
         outcome_payload = outcome_event.get("payload", {}) or {}
@@ -193,7 +555,6 @@ def _merge_setup_and_outcome(
         features = setup_payload.get("features", {}) or {}
         pnl_usd = outcome_payload.get("pnl_usd", 0.0)
 
-        # risk_usd should have been attached by executor_v2 feature logger
         risk_usd = features.get("risk_usd")
         r_multiple = None
         if risk_usd is not None:
@@ -206,30 +567,273 @@ def _merge_setup_and_outcome(
         if r_multiple is not None:
             win = r_multiple > 0
 
+        final_status = "CLOSED"
+
         enriched: Dict[str, Any] = {
             "event_type": "outcome_enriched",
             "ts": _now_ms(),
             "trade_id": setup_event.get("trade_id") or outcome_event.get("trade_id"),
             "symbol": setup_event.get("symbol") or outcome_event.get("symbol"),
-            "account_label": setup_event.get("account_label")
-            or outcome_event.get("account_label"),
+            "account_label": setup_event.get("account_label") or outcome_event.get("account_label"),
             "strategy": setup_event.get("strategy") or outcome_event.get("strategy"),
             "setup_type": setup_event.get("setup_type"),
-            "timeframe": setup_event.get("timeframe"),
+            "timeframe": setup_event.get("timeframe") or outcome_event.get("timeframe"),
             "ai_profile": setup_event.get("ai_profile"),
+            "policy": setup_event.get("policy") or outcome_event.get("policy"),
             "setup": setup_event,
             "outcome": outcome_event,
+            "extra": {
+                "is_terminal": True,
+                "final_status": final_status,
+                "setup_fingerprint": (features.get("setup_fingerprint") if isinstance(features, dict) else None),
+                "memory_fingerprint": (features.get("memory_fingerprint") if isinstance(features, dict) else None),
+            },
             "stats": {
                 "pnl_usd": float(pnl_usd),
                 "r_multiple": float(r_multiple) if r_multiple is not None else None,
                 "win": win,
+                "is_terminal": True,
             },
         }
         return enriched
     except Exception as e:
         log.warning("[ai_events] Failed to merge setup/outcome: %r", e)
-        # Fallback: just return the raw outcome so at least something is logged.
         return outcome_event
+
+
+# ---------------------------------------------------------------------------
+# Phase 4: Memory store
+# ---------------------------------------------------------------------------
+
+def _load_memory_snapshot() -> Dict[str, Any]:
+    if not MEMORY_SNAPSHOT_PATH.exists():
+        return {}
+    try:
+        txt = MEMORY_SNAPSHOT_PATH.read_text(encoding="utf-8")
+        data = json.loads(txt or "{}")
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def _prune_memory_snapshot(snapshot: Dict[str, Any]) -> Dict[str, Any]:
+    try:
+        now = _now_ms()
+        max_age_ms = int(MEM_MAX_AGE_DAYS * 24 * 60 * 60 * 1000)
+
+        items = []
+        for mid, rec in snapshot.items():
+            updated = 0
+            if isinstance(rec, dict):
+                lifecycle = rec.get("lifecycle") if isinstance(rec.get("lifecycle"), dict) else {}
+                try:
+                    updated = int(lifecycle.get("updated_ts") or rec.get("ts") or 0)
+                except Exception:
+                    updated = 0
+            items.append((mid, updated, rec))
+
+        items = [it for it in items if (now - it[1]) <= max_age_ms or it[1] == 0]
+        items.sort(key=lambda x: x[1], reverse=True)
+        items = items[:MEM_MAX_RECORDS]
+        return {mid: rec for (mid, _u, rec) in items}
+    except Exception:
+        return snapshot
+
+
+def _save_memory_snapshot(snapshot: Dict[str, Any]) -> None:
+    try:
+        snap2 = _prune_memory_snapshot(snapshot)
+        _atomic_write_text(
+            MEMORY_SNAPSHOT_PATH,
+            json.dumps(snap2, indent=2, sort_keys=True),
+        )
+    except Exception as e:
+        log.warning("[ai_memory] Failed to save snapshot: %r", e)
+
+
+def _compute_memory_id(memory_fingerprint: str, policy_hash: str, account_scope: str, symbol_scope: str, timeframe: str) -> str:
+    h = hashlib.sha256()
+    h.update(_stable_json({
+        "memory_fingerprint": memory_fingerprint,
+        "policy_hash": policy_hash,
+        "account_scope": account_scope,
+        "symbol_scope": symbol_scope,
+        "timeframe": timeframe,
+    }).encode("utf-8", errors="ignore"))
+    return h.hexdigest()
+
+
+def _upsert_memory_record(
+    *,
+    snapshot: Dict[str, Any],
+    memory_fingerprint: str,
+    setup_fingerprint: str,
+    policy_hash: str,
+    timeframe: str,
+    account_scope: str,
+    symbol_scope: str,
+    pnl: float,
+    r_val: Optional[float],
+    win_val: Optional[bool],
+) -> Dict[str, Any]:
+    now = _now_ms()
+    memory_id = _compute_memory_id(memory_fingerprint, policy_hash, account_scope, symbol_scope, timeframe)
+
+    rec = snapshot.get(memory_id) if isinstance(snapshot.get(memory_id), dict) else None
+    if rec is None:
+        rec = {
+            "event_type": "memory_record",
+            "ts": now,
+            "schema_version": MEMORY_SCHEMA_VERSION,
+            "memory_id": memory_id,
+            "memory_fingerprint": memory_fingerprint,
+            # keep setup_fingerprint as an audit hint only (NOT identity)
+            "setup_fingerprint": setup_fingerprint,
+            "policy_hash": policy_hash,
+            "timeframe": timeframe,
+            "symbol_scope": symbol_scope,
+            "account_scope": account_scope,
+            "stats": {
+                "n": 0,
+                "wins": 0,
+                "losses": 0,
+                "pnl_usd_sum": 0.0,
+                "r_sum": 0.0,
+                "r_mean": None,
+                "last_seen_ts": now,
+            },
+            "lifecycle": {
+                "created_ts": now,
+                "updated_ts": now,
+                "read_only": True,
+                "mutability": "merge_stats_only",
+            },
+            "tags": [],
+            "notes": "",
+        }
+
+    stats = rec.get("stats") if isinstance(rec.get("stats"), dict) else {}
+    n = int(stats.get("n") or 0) + 1
+    wins = int(stats.get("wins") or 0)
+    losses = int(stats.get("losses") or 0)
+
+    if win_val is True:
+        wins += 1
+    elif win_val is False:
+        losses += 1
+
+    pnl_sum = float(stats.get("pnl_usd_sum") or 0.0) + float(pnl)
+
+    r_sum = float(stats.get("r_sum") or 0.0)
+    if r_val is not None:
+        r_sum += float(r_val)
+
+    r_mean = (r_sum / float(n)) if n > 0 else None
+
+    stats["n"] = n
+    stats["wins"] = wins
+    stats["losses"] = losses
+    stats["pnl_usd_sum"] = float(pnl_sum)
+    stats["r_sum"] = float(r_sum)
+    stats["r_mean"] = float(r_mean) if r_mean is not None else None
+    stats["last_seen_ts"] = now
+
+    rec["stats"] = stats
+
+    lifecycle = rec.get("lifecycle") if isinstance(rec.get("lifecycle"), dict) else {}
+    lifecycle["updated_ts"] = now
+    rec["lifecycle"] = lifecycle
+
+    # trim notes if later used
+    notes = rec.get("notes")
+    if isinstance(notes, str) and len(notes) > MEM_MAX_NOTES_LEN:
+        rec["notes"] = notes[:MEM_MAX_NOTES_LEN]
+
+    snapshot[memory_id] = rec
+    return rec
+
+
+def _emit_memory_from_enriched(enriched: Dict[str, Any]) -> None:
+    """
+    Emit memory records ONLY from outcome_enriched.
+    v2.6.2: emit symbol-scoped + ANY records so tiered retrieval works.
+    """
+    try:
+        if enriched.get("event_type") != "outcome_enriched":
+            return
+
+        setup = enriched.get("setup") if isinstance(enriched.get("setup"), dict) else {}
+        policy = enriched.get("policy") if isinstance(enriched.get("policy"), dict) else {}
+        policy_hash = str(policy.get("policy_hash") or "").strip()
+
+        setup_payload = setup.get("payload") if isinstance(setup.get("payload"), dict) else {}
+        features = setup_payload.get("features") if isinstance(setup_payload.get("features"), dict) else {}
+
+        setup_fp = str((features.get("setup_fingerprint") if isinstance(features, dict) else "") or "").strip()
+        mem_fp = str((features.get("memory_fingerprint") if isinstance(features, dict) else "") or "").strip()
+
+        tf = _normalize_timeframe(enriched.get("timeframe") or setup.get("timeframe")) or "unknown"
+
+        symbol = str(enriched.get("symbol") or setup.get("symbol") or "").strip().upper()
+        if not symbol:
+            symbol = "UNKNOWN"
+
+        account_scope = "global"
+
+        if not mem_fp or not policy_hash:
+            return
+
+        stats_src = enriched.get("stats") if isinstance(enriched.get("stats"), dict) else {}
+        pnl = float(stats_src.get("pnl_usd") or 0.0)
+        r = stats_src.get("r_multiple")
+        r_val = float(r) if r is not None else None
+        win = stats_src.get("win")
+        win_val = bool(win) if win is not None else None
+
+        snapshot = _load_memory_snapshot()
+
+        # Tier A: symbol-scoped memory
+        recA = _upsert_memory_record(
+            snapshot=snapshot,
+            memory_fingerprint=mem_fp,
+            setup_fingerprint=setup_fp,
+            policy_hash=policy_hash,
+            timeframe=tf,
+            account_scope=account_scope,
+            symbol_scope=symbol,
+            pnl=pnl,
+            r_val=r_val,
+            win_val=win_val,
+        )
+        _append_jsonl(MEMORY_RECORDS_PATH, recA)
+        try:
+            memory_bus.append(recA)
+        except Exception:
+            pass
+
+        # Tier B: global aggregate (ANY) memory
+        recB = _upsert_memory_record(
+            snapshot=snapshot,
+            memory_fingerprint=mem_fp,
+            setup_fingerprint=setup_fp,
+            policy_hash=policy_hash,
+            timeframe=tf,
+            account_scope=account_scope,
+            symbol_scope="ANY",
+            pnl=pnl,
+            r_val=r_val,
+            win_val=win_val,
+        )
+        _append_jsonl(MEMORY_RECORDS_PATH, recB)
+        try:
+            memory_bus.append(recB)
+        except Exception:
+            pass
+
+        _save_memory_snapshot(snapshot)
+
+    except Exception as e:
+        log.warning("[ai_memory] Failed to emit memory: %r", e)
 
 
 # ---------------------------------------------------------------------------
@@ -237,38 +841,24 @@ def _merge_setup_and_outcome(
 # ---------------------------------------------------------------------------
 
 def publish_ai_event(event: Dict[str, Any]) -> None:
-    """
-    Push a raw AI event:
-      - ensure it has a timestamp
-      - write it to the appropriate JSONL file(s)
-      - update pending registry for setups
-      - attempt setup/outcome merge for outcomes
-      - append to in-process bus for any in-process consumers
-
-    Expected keys:
-        event["event_type"] : "setup_context" | "outcome_record" | ...
-        event["ts"]         : epoch_ms (int), auto-filled if missing
-
-    This function remains tolerant of partially-specified events so that
-    older callers don't break. Newer callers should prefer the typed
-    builders: build_setup_context() and build_outcome_record().
-    """
     if not isinstance(event, dict):
         return
-
     if "event_type" not in event:
         return
-
     if "ts" not in event:
         event["ts"] = _now_ms()
+
+    _stamp_policy(event)
+    _ensure_setup_fingerprint(event)
 
     etype = event.get("event_type")
 
     if etype == "setup_context":
-        # 1) Legacy behavior: write to setups.jsonl
         _append_jsonl(SETUPS_PATH, event)
 
-        # 2) Store in pending registry by trade_id
+        # Phase 4 enforcement: setup exists => decision exists
+        _ensure_decision_for_setup(event)
+
         trade_id = event.get("trade_id")
         if trade_id:
             try:
@@ -276,19 +866,13 @@ def publish_ai_event(event: Dict[str, Any]) -> None:
                 pending[str(trade_id)] = event
                 _save_pending(pending)
             except Exception as e:
-                log.warning(
-                    "[ai_events] Failed to update pending registry for trade_id=%r: %r",
-                    trade_id,
-                    e,
-                )
+                log.warning("[ai_events] Failed to update pending registry for trade_id=%r: %r", trade_id, e)
 
     elif etype == "outcome_record":
-        # 1) Always append raw outcome (for debugging & backfill)
         _append_jsonl(OUTCOMES_RAW_PATH, event)
 
         trade_id = event.get("trade_id")
         if trade_id:
-            # Attempt merge with existing setup
             try:
                 pending = _load_pending()
                 setup_evt = pending.get(str(trade_id))
@@ -296,40 +880,28 @@ def publish_ai_event(event: Dict[str, Any]) -> None:
                 setup_evt = None
 
             if setup_evt:
-                # We have a matching setup → build enriched record
                 enriched = _merge_setup_and_outcome(setup_evt, event)
                 _append_jsonl(OUTCOMES_PATH, enriched)
-                # Remove from pending
+                _emit_memory_from_enriched(enriched)
+
                 try:
                     pending.pop(str(trade_id), None)
                     _save_pending(pending)
                 except Exception as e:
-                    log.warning(
-                        "[ai_events] Failed to remove trade_id=%r from pending registry: %r",
-                        trade_id,
-                        e,
-                    )
+                    log.warning("[ai_events] Failed to remove trade_id=%r from pending registry: %r", trade_id, e)
             else:
-                # Outcome before setup (race / restart) → just log raw to legacy outcomes.jsonl
                 _append_jsonl(OUTCOMES_PATH, event)
         else:
-            # No trade_id at all → just keep raw
             _append_jsonl(OUTCOMES_PATH, event)
 
-    else:
-        # Unknown types can be wired later; for now we ignore them on disk
-        pass
-
-    # Still push into the in-process bus for any same-process listeners
     try:
         ai_events_bus.append(event)
     except Exception:
-        # If something is wrong with the bus, don't kill disk logging.
         pass
 
 
 # ---------------------------------------------------------------------------
-# Build Setup Context Event
+# Builders
 # ---------------------------------------------------------------------------
 
 def build_setup_context(
@@ -344,26 +916,8 @@ def build_setup_context(
     ai_profile: Optional[str] = None,
     extra: Optional[Dict[str, Any]] = None,
 ) -> SetupRecord:
-    """
-    Build a canonical SetupContext event.
+    tf = _normalize_timeframe(timeframe)
 
-    Parameters
-    ----------
-    trade_id : unique trade identifier (same as orderLinkId / executor trade_id)
-    symbol : e.g. "BTCUSDT"
-    account_label : e.g. "main", "flashback07"
-    strategy : human-readable strategy label (e.g. "Sub1_Trend")
-    features : dict of feature values at setup/open (numeric/categorical)
-    setup_type : optional label like "trend_pullback", "breakout_high"
-    timeframe : optional timeframe string like "5m", "15m"
-    ai_profile : optional AI profile name like "trend_v1"
-    extra : optional misc fields (mode, sub_uid, etc.)
-
-    Notes
-    -----
-    - Older callers that don't pass setup_type/timeframe/ai_profile
-      still work; those fields will just be omitted.
-    """
     payload: SetupRecord = {
         "event_type": "setup_context",
         "ts": _now_ms(),
@@ -371,28 +925,26 @@ def build_setup_context(
         "symbol": symbol,
         "account_label": account_label,
         "strategy": strategy,
-        "payload": {
-            "features": features or {},
-        },
+        "payload": {"features": features or {}},
     }
 
     if setup_type is not None:
         payload["setup_type"] = setup_type
-    if timeframe is not None:
-        payload["timeframe"] = timeframe
+    if tf is not None:
+        payload["timeframe"] = tf
     if ai_profile is not None:
         payload["ai_profile"] = ai_profile
 
-    if extra:
-        # Attach under payload["extra"] to keep features clean.
-        payload["payload"]["extra"] = extra
+    if extra or tf is not None:
+        payload_extra = dict(extra or {})
+        if tf is not None:
+            payload_extra["timeframe"] = tf
+        payload["payload"]["extra"] = payload_extra
 
+    _stamp_policy(payload)  # type: ignore[arg-type]
+    _ensure_setup_fingerprint(payload)  # type: ignore[arg-type]
     return payload
 
-
-# ---------------------------------------------------------------------------
-# Build Outcome Event
-# ---------------------------------------------------------------------------
 
 def build_outcome_record(
     *,
@@ -406,21 +958,6 @@ def build_outcome_record(
     exit_reason: Optional[str] = None,
     extra: Optional[Dict[str, Any]] = None,
 ) -> OutcomeRecord:
-    """
-    Build a canonical OutcomeRecord event.
-
-    Parameters
-    ----------
-    trade_id : same id used for SetupContext
-    symbol : e.g. "BTCUSDT"
-    account_label : "main", "flashback07", etc.
-    strategy : human-readable strategy label
-    pnl_usd : realized PnL in USDT (paper or live)
-    r_multiple : realized R (optional; can also be computed in merge step)
-    win : True/False if known (optional)
-    exit_reason : e.g. "tp_hit", "sl_hit", "manual_flatten"
-    extra : any additional fields to attach under payload["extra"]
-    """
     payload: OutcomeRecord = {
         "event_type": "outcome_record",
         "ts": _now_ms(),
@@ -439,29 +976,16 @@ def build_outcome_record(
     if extra:
         payload["payload"]["extra"] = extra
 
+    _stamp_policy(payload)  # type: ignore[arg-type]
     return payload
 
 
-# ---------------------------------------------------------------------------
-# Minimal main() so supervisor_ai_stack can run this worker
-# ---------------------------------------------------------------------------
-
 def main() -> None:
-    """
-    Minimal loop:
-      - Just emits heartbeats on "ai_events_spine"
-      - All real event logging is done via publish_ai_event()
-
-    This keeps supervisor_ai_stack happy and gives you liveness telemetry
-    without any extra plumbing.
-    """
-    log.info("AI Events Spine loop started (disk logger + heartbeat only, v2.2).")
-
+    log.info("AI Events Spine loop started (disk logger + heartbeat, v2.7.0).")
     while True:
         try:
             record_heartbeat("ai_events_spine")
         except Exception:
-            # Never crash over heartbeat issues.
             pass
         time.sleep(10)
 

@@ -355,62 +355,148 @@ def _extract_live_features(signal: Dict[str, Any]) -> Tuple[Dict[str, Any], list
 
     return feature_dict, vec
 
+# ──────────────────────────────────────────────────────────────────────────
+# Regime-Aware Model Loader & Classifier Enhancements
+# ──────────────────────────────────────────────────────────────────────────
 
-# ---------------------------------------------------------------------------
-# AI classifier entry (used by executor_v2)
-# ---------------------------------------------------------------------------
+# Internal storage for regime models
+_REGIME_MODELS: Dict[str, Any] = {}
+_REGIME_FEATURES: Dict[str, list[str]] = {}
+_MODEL_LOADED = False
+
+# Default global model (fallback)
+_GLOBAL_MODEL = None
+_GLOBAL_FEATURES: list[str] = []
+
+def _load_models_once() -> None:
+    """
+    Lazy load all regime expert models found in models/ directory.
+    Expected naming:
+      - setup_classifier_{regime}.pkl
+      - setup_classifier_{regime}_meta.json
+    """
+    global _REGIME_MODELS, _REGIME_FEATURES, _GLOBAL_MODEL, _GLOBAL_FEATURES, _MODEL_LOADED
+
+    if _MODEL_LOADED:
+        return
+    _MODEL_LOADED = True
+
+    import joblib
+    from pathlib import Path
+
+    models_root = Path(ROOT) / "models"
+    if not models_root.exists():
+        log.info("No models directory found; classifier will operate with no models.")
+        return
+
+    # Load all pickles ending with _classifier_*.pkl
+    for p in models_root.glob("setup_classifier_*.pkl"):
+        try:
+            regimen = p.stem.replace("setup_classifier_", "")
+            model_obj = joblib.load(p)
+            _REGIME_MODELS[regimen] = model_obj
+
+            # Try corresponding meta file
+            meta_path = models_root / f"{p.stem}_meta.json"
+            if meta_path.exists():
+                try:
+                    raw_meta = meta_path.read_text()
+                    meta = json.loads(raw_meta)
+                    feat_names = meta.get("feature_names") or []
+                    _REGIME_FEATURES[regimen] = list(feat_names)
+                except Exception:
+                    _REGIME_FEATURES[regimen] = []
+            else:
+                _REGIME_FEATURES[regimen] = []
+
+            log.info(f"Loaded regime model '{regimen}'")
+        except Exception as e:
+            log.warning(f"Failed to load regime model from {p}: {e}")
+
+    # Optionally also load a global fallback model
+    global_path = models_root / "setup_classifier.pkl"
+    global_meta = models_root / "setup_classifier_meta.json"
+    if global_path.exists():
+        try:
+            _GLOBAL_MODEL = joblib.load(global_path)
+            log.info("Loaded global fallback classifier")
+            if global_meta.exists():
+                raw_meta = global_meta.read_text()
+                gm = json.loads(raw_meta)
+                _GLOBAL_FEATURES = gm.get("feature_names") or []
+        except Exception as e:
+            log.warning("Failed to load global fallback classifier: %r", e)
+
+def _pick_model_for_regime(regime: str):
+    """
+    Return (model, feature_names, regime_key_used)
+    """
+    # Exact regime match
+    if regime in _REGIME_MODELS:
+        return _REGIME_MODELS[regime], _REGIME_FEATURES.get(regime, []), regime
+    # Fallback: try lowercase keys
+    low = regime.lower()
+    for rkey in _REGIME_MODELS:
+        if rkey.lower() == low:
+            return _REGIME_MODELS[rkey], _REGIME_FEATURES.get(rkey, []), rkey
+    # Fallback: global if available
+    if _GLOBAL_MODEL is not None:
+        return _GLOBAL_MODEL, _GLOBAL_FEATURES, "global"
+    # No model at all
+    return None, [], None
 
 def _classify_ai(signal: Dict[str, Any], strat_id: str) -> Dict[str, Any]:
     """
-    New AI gate interface:
-      (signal, strat_id) -> dict with allow, score, reason, features
+    Regime-aware AI classification:
     """
+    _load_models_once()
 
-    _load_model_once()
-
-    # Extract live features for logging & potential scoring
+    # Build features for this signal
     features_dict, vec = _extract_live_features(signal)
 
-    # Attach legacy label as an extra feature (for setup memory)
-    try:
-        leg_label = _legacy_label(signal, features_dict)
-    except Exception:
-        leg_label = "unknown"
-    features_dict["setup_label_heuristic"] = leg_label
+    # Determine regime (from normalized feature store)
+    # Expect it to be present in `signal["regime"]` or features_dict from builder
+    regime = str(signal.get("regime") or features_dict.get("regime") or "other")
 
-    # Attach policy threshold for later analysis
+    model_obj, feature_names, used_regime = _pick_model_for_regime(regime)
+
+    # Attach regime tag
+    features_dict["regime"] = regime
+    features_dict["used_regime_model"] = used_regime
+
+    # Check absence of model
+    if model_obj is None:
+        return {
+            "allow": True,
+            "score": None,
+            "reason": f"no_model_for_regime_{regime}",
+            "features": features_dict
+        }
+
+    # Attempt model inference
+    try:
+        # If needed, reorder vec to match regime model features
+        # We assume _extract_live_features makes vec in a default order.
+        probs = model_obj.predict_proba([vec])[0]
+        score = float(probs[1]) if len(probs) > 1 else float(probs[0])
+    except Exception as e:
+        log.warning(f"Model inference failed for regime={regime}: {e}")
+        return {
+            "allow": True,
+            "score": None,
+            "reason": f"inference_error:{e}",
+            "features": features_dict
+        }
+
+    # Apply per-strategy policy
     try:
         min_score = _policy_min_ai_score(strat_id)
     except Exception:
         min_score = 0.5
     features_dict["min_ai_score"] = float(min_score)
 
-    if _MODEL is None:
-        # No model: allow by default, no score, but still return features
-        return {
-            "allow": True,
-            "score": None,
-            "reason": "no_model_loaded",
-            "features": features_dict,
-        }
-
-    # Try model inference
-    try:
-        # scikit-learn pipeline expects 2D array
-        probs = _MODEL.predict_proba([vec])[0]  # type: ignore[attr-defined]
-        score = float(probs[1]) if len(probs) > 1 else float(probs[0])
-    except Exception as e:
-        log.warning("Model inference failed for %s: %r", strat_id, e)
-        return {
-            "allow": True,
-            "score": None,
-            "reason": f"model_inference_error: {e}",
-            "features": features_dict,
-        }
-
-    # Policy-aware allow rule
     allow = bool(score >= min_score)
-    reason = "score_ok" if allow else f"below_min_ai_score_{min_score:.2f}"
+    reason = "score_ok" if allow else f"below_min_ai_score_{min_score:.3f}"
 
     return {
         "allow": allow,
@@ -418,7 +504,6 @@ def _classify_ai(signal: Dict[str, Any], strat_id: str) -> Dict[str, Any]:
         "reason": reason,
         "features": features_dict,
     }
-
 
 # ---------------------------------------------------------------------------
 # Public entrypoint with dual behavior

@@ -1,46 +1,20 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Flashback — AI Stack Supervisor v2.8 (import-hardened)
+Flashback — AI Stack Supervisor v3.2 (Ops Truth + worker telemetry bundle)
 
-Fixes vs v2.7
--------------
-- Correct ROOT fallback (project root, not /app)
-- ws_switchboard import is now resilient:
-    tries app.ws.ws_switchboard, app.core.ws_switchboard, app.bots.ws_switchboard
-- Entry function detection is resilient:
-    prefers main(), else loop(), else run(), else module-level __main__ style main()
-- Adds clearer BOOT logging so you know what module got launched
+Bundle upgrades (v3.2):
+1) Writes supervisor status into state/ops_snapshot.json (best-effort)
+2) Writes per-worker status entries (alive/dead, pid, exitcode)
+3) Tracks restart counts + last restart reason per worker
+4) Rate-limits WARN/ERROR alerts to avoid spam during crash loops
+5) Publishes a compact stack summary (enabled/running/dead)
 
-Role
-----
-Single entrypoint to run the "AI stack" for ONE ACCOUNT_LABEL:
-
-    • ws_switchboard           (WS → positions_bus / orderbook_bus / trades_bus)
-    • tp_sl_manager            (position-bus aware TP/SL manager)
-    • ai_pilot                 (AI brain reading ai_state_bus)
-    • ai_action_router         (routes AI decisions into notifications / later exec)
-    • ai_journal (no-op)       (legacy placeholder, ai_events_spine is called directly)
-    • risk_daemon (optional)   (global guards)
-    • trade_outcomes           (tails ws_executions → ai_events.outcomes)
-    • paper_price_feeder       (feeds WS prices into PaperBroker for LEARN_DRY)
-
-Design
-------
-- One OS process per worker using multiprocessing.Process.
-- Windows-safe: worker targets are TOP-LEVEL functions.
-- Supervisor:
-    • Reads AI_STACK_ENABLE_* env flags (prefers .env file values).
-    • Starts enabled workers if not running.
-    • Restarts workers that die.
-    • Writes heartbeat via flashback_common.record_heartbeat("supervisor_ai_stack").
-    • Respects config/subaccounts.yaml enable_ai_stack per ACCOUNT_LABEL (if present).
-
-Notes
------
-- Backward compatible:
-    • AI_STACK_ENABLE_PAPER_TICK_DAEMON (old) is treated as alias for
-      AI_STACK_ENABLE_PAPER_PRICE_FEEDER (new).
+Keeps:
+- Windows spawn-safe: ZERO side effects at import time.
+- HARD GATE config validation before starting stack
+- Canonical WS launch: app.bots.ws_switchboard only
+- Multiprocessing worker supervision + restarts
 """
 
 from __future__ import annotations
@@ -51,19 +25,20 @@ import signal
 import sys
 import time
 from pathlib import Path
-from typing import Callable, Dict, Optional
+from typing import Callable, Dict, Optional, List, Tuple, Any
+
 
 # ---------------------------------------------------------------------------
-# Logging
+# Logging (import-safe)
 # ---------------------------------------------------------------------------
 
-try:
-    from app.core.log import get_logger
-except Exception:  # pragma: no cover
-    import logging
-
-    def get_logger(name: str) -> "logging.Logger":  # type: ignore
-        logger_ = logging.getLogger(name)
+def _get_logger():
+    try:
+        from app.core.log import get_logger  # type: ignore
+        return get_logger("supervisor_ai_stack")
+    except Exception:  # pragma: no cover
+        import logging
+        logger_ = logging.getLogger("supervisor_ai_stack")
         if not logger_.handlers:
             handler = logging.StreamHandler(sys.stdout)
             fmt = logging.Formatter("%(asctime)s [%(levelname)s] [%(name)s] %(message)s")
@@ -73,56 +48,94 @@ except Exception:  # pragma: no cover
         return logger_
 
 
-log = get_logger("supervisor_ai_stack")
-
 # ---------------------------------------------------------------------------
-# ROOT + .env loading (critical for AI_STACK_* flags)
+# ROOT + dotenv (must be called only in MainProcess)
 # ---------------------------------------------------------------------------
 
-try:
-    from app.core.config import settings
-    ROOT: Path = Path(settings.ROOT)  # type: ignore
-except Exception:
-    # Correct fallback: .../app/bots/supervisor_ai_stack.py -> project root is parents[2]
-    ROOT = Path(__file__).resolve().parents[2]
+def _resolve_root() -> Path:
+    try:
+        from app.core.config import settings  # type: ignore
+        return Path(settings.ROOT)  # type: ignore
+    except Exception:
+        return Path(__file__).resolve().parents[2]
 
-# First pass: load .env into process env
-try:  # pragma: no cover
-    from dotenv import load_dotenv, dotenv_values  # type: ignore
 
-    load_dotenv(ROOT / ".env")
-    ENV_FILE_VARS = dotenv_values(ROOT / ".env")
-    log.info("Loaded .env from %s", ROOT / ".env")
-except Exception:
-    log.info("Could not load .env via python-dotenv; relying on OS environment only.")
-    ENV_FILE_VARS = {}
+def _load_env_file(root: Path, log) -> Dict[str, str]:
+    """
+    Load .env into process env, and return dotenv_values (file-first behavior).
+    Must run only in MainProcess to avoid spam on spawn imports.
+    """
+    try:  # pragma: no cover
+        from dotenv import load_dotenv, dotenv_values  # type: ignore
+        load_dotenv(root / ".env")
+        vals = dotenv_values(root / ".env") or {}
+        log.info("Loaded .env from %s", root / ".env")
+        out: Dict[str, str] = {}
+        for k, v in vals.items():
+            if k is None or v is None:
+                continue
+            out[str(k)] = str(v)
+        return out
+    except Exception:
+        log.info("Could not load .env via python-dotenv; relying on OS environment only.")
+        return {}
 
-# ---------------------------------------------------------------------------
-# Core helpers (TG / heartbeat)
-# ---------------------------------------------------------------------------
-
-try:
-    from app.core.flashback_common import (
-        record_heartbeat,
-        send_tg,
-        alert_bot_error,
-    )
-except Exception:
-    # Minimal fallbacks
-    def record_heartbeat(name: str) -> None:
-        return None
-
-    def send_tg(msg: str) -> None:
-        log.info("[TG Fallback] %s", msg)
-
-    def alert_bot_error(bot_name: str, msg: str, level: str = "ERROR") -> None:
-        if level.upper() in ("WARN", "WARNING"):
-            log.warning("[%s] %s", bot_name, msg)
-        else:
-            log.error("[%s] %s", bot_name, msg)
 
 # ---------------------------------------------------------------------------
-# Env helpers
+# Ops Snapshot writer (best-effort)
+# ---------------------------------------------------------------------------
+
+def _now_ms() -> int:
+    return int(time.time() * 1000)
+
+
+def _ops_write(component: str, account_label: str, ok: bool, details: Dict[str, Any]) -> None:
+    """
+    Best-effort write into ops_snapshot.json. Never break supervisor if ops fails.
+    """
+    try:
+        from app.ops.ops_state import write_component_status  # type: ignore
+        write_component_status(
+            component=component,
+            account_label=account_label,
+            ok=ok,
+            details=details,
+            ts_ms=_now_ms(),
+        )
+    except Exception:
+        return
+
+
+# ---------------------------------------------------------------------------
+# Core helpers (TG / heartbeat) - import safe wrappers
+# ---------------------------------------------------------------------------
+
+def _load_common(log):
+    try:
+        from app.core.flashback_common import (  # type: ignore
+            record_heartbeat,
+            send_tg,
+            alert_bot_error,
+        )
+        return record_heartbeat, send_tg, alert_bot_error
+    except Exception:
+        def record_heartbeat(name: str) -> None:
+            return None
+
+        def send_tg(msg: str) -> None:
+            log.info("[TG Fallback] %s", msg)
+
+        def alert_bot_error(bot_name: str, msg: str, level: str = "ERROR") -> None:
+            if level.upper() in ("WARN", "WARNING"):
+                log.warning("[%s] %s", bot_name, msg)
+            else:
+                log.error("[%s] %s", bot_name, msg)
+
+        return record_heartbeat, send_tg, alert_bot_error
+
+
+# ---------------------------------------------------------------------------
+# Env helpers (file-first)
 # ---------------------------------------------------------------------------
 
 def _env_int(name: str, default: str) -> int:
@@ -131,27 +144,22 @@ def _env_int(name: str, default: str) -> int:
     except Exception:
         return int(default)
 
-def _file_first_bool(name: str, default: str = "false") -> bool:
-    """
-    Prefer value from .env file (ENV_FILE_VARS) if present.
-    Fall back to process env, then default.
-    """
-    if name in ENV_FILE_VARS and ENV_FILE_VARS[name] is not None:
-        raw = str(ENV_FILE_VARS[name]).strip().lower()
+
+def _file_first_bool(env_file_vars: Dict[str, str], name: str, default: str = "false") -> bool:
+    if name in env_file_vars:
+        raw = str(env_file_vars[name]).strip().lower()
     else:
         raw = os.getenv(name, default).strip().lower()
     return raw in ("1", "true", "yes", "y", "on")
 
-def _file_first_bool_alias(primary_name: str, alias_name: str, default: str = "false") -> bool:
-    """
-    Prefer primary_name from .env; if absent, fall back to alias_name; then env; then default.
-    """
-    if primary_name in ENV_FILE_VARS and ENV_FILE_VARS[primary_name] is not None:
-        raw = str(ENV_FILE_VARS[primary_name]).strip().lower()
+
+def _file_first_bool_alias(env_file_vars: Dict[str, str], primary_name: str, alias_name: str, default: str = "false") -> bool:
+    if primary_name in env_file_vars:
+        raw = str(env_file_vars[primary_name]).strip().lower()
         return raw in ("1", "true", "yes", "y", "on")
 
-    if alias_name in ENV_FILE_VARS and ENV_FILE_VARS[alias_name] is not None:
-        raw = str(ENV_FILE_VARS[alias_name]).strip().lower()
+    if alias_name in env_file_vars:
+        raw = str(env_file_vars[alias_name]).strip().lower()
         return raw in ("1", "true", "yes", "y", "on")
 
     if os.getenv(primary_name) is not None:
@@ -165,75 +173,66 @@ def _file_first_bool_alias(primary_name: str, alias_name: str, default: str = "f
     raw = str(default).strip().lower()
     return raw in ("1", "true", "yes", "y", "on")
 
-ACCOUNT_LABEL: str = os.getenv("ACCOUNT_LABEL", "main").strip() or "main"
 
-# For AI stack toggles we *trust the .env file* over OS env
-AI_STACK_ENABLE_WS_SWITCHBOARD: bool = _file_first_bool("AI_STACK_ENABLE_WS_SWITCHBOARD", "true")
-AI_STACK_ENABLE_TP_SL_MANAGER: bool = _file_first_bool("AI_STACK_ENABLE_TP_SL_MANAGER", "true")
-AI_STACK_ENABLE_AI_PILOT: bool = _file_first_bool("AI_STACK_ENABLE_AI_PILOT", "true")
-AI_STACK_ENABLE_AI_ACTION_ROUTER: bool = _file_first_bool("AI_STACK_ENABLE_AI_ACTION_ROUTER", "true")
-AI_STACK_ENABLE_AI_JOURNAL: bool = _file_first_bool("AI_STACK_ENABLE_AI_JOURNAL", "false")  # default off; no-op
-AI_STACK_ENABLE_RISK_DAEMON: bool = _file_first_bool("AI_STACK_ENABLE_RISK_DAEMON", "false")  # safer default off
-AI_STACK_ENABLE_TRADE_OUTCOMES: bool = _file_first_bool("AI_STACK_ENABLE_TRADE_OUTCOMES", "true")
+# ---------------------------------------------------------------------------
+# HARD GATE: Config validation
+# ---------------------------------------------------------------------------
 
-# Renamed flag: paper_tick_daemon -> paper_price_feeder
-AI_STACK_ENABLE_PAPER_PRICE_FEEDER: bool = _file_first_bool_alias(
-    "AI_STACK_ENABLE_PAPER_PRICE_FEEDER",
-    "AI_STACK_ENABLE_PAPER_TICK_DAEMON",
-    "true",
-)
+def _hard_gate_validate_config(log, send_tg) -> bool:
+    try:
+        from app.tools.validate_config import main as validate_config_main  # type: ignore
+    except Exception as e:
+        msg = f"🛑 Config validator import failed: {e}. Refusing to start AI stack."
+        log.error(msg)
+        try:
+            send_tg(msg)
+        except Exception:
+            pass
+        return False
 
-SUPERVISOR_POLL_SECONDS: int = _env_int("AI_STACK_SUPERVISOR_POLL_SECONDS", "3")
+    try:
+        rc = validate_config_main()
+        if rc != 0:
+            msg = f"🛑 Config validation FAILED (rc={rc}). Refusing to start AI stack."
+            log.error(msg)
+            try:
+                send_tg(msg)
+            except Exception:
+                pass
+            return False
 
-log.info(
-    "BOOT | ROOT=%s | ACCOUNT_LABEL=%s | poll=%ss",
-    ROOT, ACCOUNT_LABEL, SUPERVISOR_POLL_SECONDS
-)
+        log.info("Config validation PASS ✅")
+        return True
+    except Exception as e:
+        msg = f"🛑 Config validator crashed: {e}. Refusing to start AI stack."
+        log.error(msg)
+        try:
+            send_tg(msg)
+        except Exception:
+            pass
+        return False
 
-log.info(
-    "Flags (file-first): WS=%s TP/SL=%s PILOT=%s ROUTER=%s RISK=%s OUTCOMES=%s PAPER_FEED=%s",
-    AI_STACK_ENABLE_WS_SWITCHBOARD,
-    AI_STACK_ENABLE_TP_SL_MANAGER,
-    AI_STACK_ENABLE_AI_PILOT,
-    AI_STACK_ENABLE_AI_ACTION_ROUTER,
-    AI_STACK_ENABLE_RISK_DAEMON,
-    AI_STACK_ENABLE_TRADE_OUTCOMES,
-    AI_STACK_ENABLE_PAPER_PRICE_FEEDER,
-)
 
 # ---------------------------------------------------------------------------
 # Subaccount gating (config/subaccounts.yaml)
 # ---------------------------------------------------------------------------
 
-def _label_ai_stack_allowed(label: str) -> bool:
-    """
-    Check config/subaccounts.yaml for this label.
-
-    If an entry exists:
-        - If enabled: false                -> deny
-        - If enable_ai_stack: false        -> deny
-        - Else                             -> allow
-
-    If file missing or label not present, default = allow.
-    """
-    sub_path = ROOT / "config" / "subaccounts.yaml"
+def _label_ai_stack_allowed(root: Path, log, label: str) -> bool:
+    sub_path = root / "config" / "subaccounts.yaml"
     if not sub_path.exists():
         return True
 
     try:
         import yaml  # type: ignore
     except Exception:
-        log.warning(
-            "config/subaccounts.yaml present but PyYAML not available; "
-            "cannot gate AI stack by label. Defaulting to allow."
-        )
+        log.warning("subaccounts.yaml present but PyYAML missing; default allow.")
         return True
 
     try:
         with sub_path.open("r", encoding="utf-8") as f:
             cfg = yaml.safe_load(f) or {}
     except Exception as e:
-        log.warning("Failed to parse %s: %s. Defaulting to allow for label=%s", sub_path, e, label)
+        log.warning("Failed to parse %s: %s. Default allow for label=%s", sub_path, e, label)
         return True
 
     accounts = cfg.get("accounts") or []
@@ -241,10 +240,9 @@ def _label_ai_stack_allowed(label: str) -> bool:
         return True
 
     for acc in accounts:
-        try:
-            acc_label = str(acc.get("account_label") or "").strip()
-        except Exception:
+        if not isinstance(acc, dict):
             continue
+        acc_label = str(acc.get("account_label") or "").strip()
         if not acc_label or acc_label != label:
             continue
 
@@ -252,24 +250,23 @@ def _label_ai_stack_allowed(label: str) -> bool:
         enable_ai_stack = acc.get("enable_ai_stack", False)
 
         if not enabled:
-            log.info("subaccounts.yaml: account_label=%s has enabled=false -> AI stack disabled.", label)
+            log.info("subaccounts.yaml: %s enabled=false -> AI stack disabled.", label)
             return False
-
         if not enable_ai_stack:
-            log.info("subaccounts.yaml: account_label=%s has enable_ai_stack=false -> AI stack disabled.", label)
+            log.info("subaccounts.yaml: %s enable_ai_stack=false -> AI stack disabled.", label)
             return False
 
-        log.info("subaccounts.yaml: account_label=%s has enable_ai_stack=true -> AI stack allowed.", label)
+        log.info("subaccounts.yaml: %s enable_ai_stack=true -> AI stack allowed.", label)
         return True
 
     return True
 
 
 # ---------------------------------------------------------------------------
-# Dynamic import helpers (so ws_switchboard stops being a landmine)
+# Dynamic import helpers
 # ---------------------------------------------------------------------------
 
-def _import_first(mod_names: list[str]):
+def _import_first(log, mod_names: List[str]):
     last_err = None
     for m in mod_names:
         try:
@@ -281,10 +278,8 @@ def _import_first(mod_names: list[str]):
             log.warning("Import failed: %s (%s)", m, e)
     raise ImportError(f"All imports failed: {mod_names}. Last error: {last_err}")
 
-def _call_entry(module, bot_name: str) -> None:
-    """
-    Prefer main() then loop() then run().
-    """
+
+def _call_entry(log, module, bot_name: str) -> None:
     for fn_name in ("main", "loop", "run"):
         fn = getattr(module, fn_name, None)
         if callable(fn):
@@ -295,102 +290,84 @@ def _call_entry(module, bot_name: str) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Worker targets (must be top-level for Windows)
+# Worker targets (top-level for Windows)
 # ---------------------------------------------------------------------------
 
 def _run_ws_switchboard() -> None:
-    """
-    WS Switchboard → fills position_bus / market_bus.
-    """
+    log = _get_logger()
+    _, _, alert_bot_error = _load_common(log)
     try:
-        # Order preference: canonical WS package, then core, then bots (legacy)
-        mod = _import_first([
-            "app.ws.ws_switchboard",
-            "app.core.ws_switchboard",
-            "app.bots.ws_switchboard",
-        ])
-        _call_entry(mod, "ws_switchboard")
+        mod = _import_first(log, ["app.bots.ws_switchboard"])
+        _call_entry(log, mod, "ws_switchboard")
     except Exception as e:
         alert_bot_error("ws_switchboard", f"import/runtime error: {e}", "ERROR")
 
 
 def _run_tp_sl_manager() -> None:
-    """
-    TP/SL Manager → reads position_bus, posts exit ladders.
-    """
+    log = _get_logger()
+    _, _, alert_bot_error = _load_common(log)
     try:
-        mod = _import_first(["app.bots.tp_sl_manager"])
-        _call_entry(mod, "tp_sl_manager")
+        mod = _import_first(log, ["app.bots.tp_sl_manager"])
+        _call_entry(log, mod, "tp_sl_manager")
     except Exception as e:
         alert_bot_error("tp_sl_manager", f"import/runtime error: {e}", "ERROR")
 
 
 def _run_ai_pilot() -> None:
-    """
-    AI Pilot → builds ai_state snapshot & emits AI actions (DRY-RUN by default).
-    """
+    log = _get_logger()
+    _, _, alert_bot_error = _load_common(log)
     try:
-        mod = _import_first(["app.bots.ai_pilot"])
-        _call_entry(mod, "ai_pilot")
+        mod = _import_first(log, ["app.bots.ai_pilot"])
+        _call_entry(log, mod, "ai_pilot")
     except Exception as e:
         alert_bot_error("ai_pilot", f"import/runtime error: {e}", "ERROR")
 
 
 def _run_ai_action_router() -> None:
-    """
-    AI Action Router → tails state/ai_actions.jsonl and routes to Telegram.
-    """
+    log = _get_logger()
+    _, _, alert_bot_error = _load_common(log)
     try:
-        mod = _import_first(["app.bots.ai_action_router"])
-        _call_entry(mod, "ai_action_router")
+        mod = _import_first(log, ["app.bots.ai_action_router"])
+        _call_entry(log, mod, "ai_action_router")
     except Exception as e:
         alert_bot_error("ai_action_router", f"import/runtime error: {e}", "ERROR")
 
 
 def _run_ai_journal() -> None:
-    """
-    Legacy AI journal worker (NO-OP).
-    """
-    log.info(
-        "ai_journal worker is a no-op; ai_events_spine is used via direct calls. "
-        "Set AI_STACK_ENABLE_AI_JOURNAL=false to disable this worker."
-    )
+    log = _get_logger()
+    record_heartbeat, _, _ = _load_common(log)
+    log.info("ai_journal is a no-op; disable with AI_STACK_ENABLE_AI_JOURNAL=false.")
     while True:
         record_heartbeat("ai_journal")
         time.sleep(60)
 
 
 def _run_risk_daemon() -> None:
-    """
-    Risk daemon (optional).
-    """
+    log = _get_logger()
+    _, _, alert_bot_error = _load_common(log)
     try:
-        mod = _import_first(["app.bots.risk_daemon"])
-        _call_entry(mod, "risk_daemon")
+        mod = _import_first(log, ["app.bots.risk_daemon"])
+        _call_entry(log, mod, "risk_daemon")
     except Exception as e:
         alert_bot_error("risk_daemon", f"import/runtime error (optional): {e}", "WARN")
 
 
 def _run_trade_outcomes() -> None:
-    """
-    Trade outcome recorder (optional).
-    """
+    log = _get_logger()
+    _, _, alert_bot_error = _load_common(log)
     try:
-        # Your earlier code imported from app.ai.trade_outcome_recorder.
-        # Keep that, but be resilient.
-        mod = _import_first(["app.ai.trade_outcome_recorder", "app.bots.trade_outcome_recorder"])
-        _call_entry(mod, "trade_outcomes")
+        mod = _import_first(log, ["app.ai.trade_outcome_recorder", "app.bots.trade_outcome_recorder"])
+        _call_entry(log, mod, "trade_outcomes")
     except Exception as e:
         alert_bot_error("trade_outcomes", f"import/runtime error (optional): {e}", "WARN")
 
 
 def _run_paper_price_feeder() -> None:
-    """
-    Paper Price Feeder (optional).
-    """
+    log = _get_logger()
+    _, _, alert_bot_error = _load_common(log)
     try:
-        mod = _import_first(["app.sim.paper_price_feeder"])
-        _call_entry(mod, "paper_price_feeder")
+        mod = _import_first(log, ["app.sim.paper_price_feeder"])
+        _call_entry(log, mod, "paper_price_feeder")
     except Exception as e:
         alert_bot_error("paper_price_feeder", f"import/runtime error (optional): {e}", "WARN")
 
@@ -405,73 +382,61 @@ class WorkerSpec:
         self.enabled = enabled
         self.target = target
         self.process: Optional[mp.Process] = None
+        # telemetry
+        self.restart_count: int = 0
+        self.last_restart_ms: int = 0
+        self.last_exitcode: Optional[int] = None
+        self.last_reason: str = ""
 
 
-def _build_worker_specs() -> Dict[str, WorkerSpec]:
+def _build_worker_specs(env_file_vars: Dict[str, str]) -> Dict[str, WorkerSpec]:
+    ws = _file_first_bool(env_file_vars, "AI_STACK_ENABLE_WS_SWITCHBOARD", "true")
+    tp = _file_first_bool(env_file_vars, "AI_STACK_ENABLE_TP_SL_MANAGER", "true")
+    pilot = _file_first_bool(env_file_vars, "AI_STACK_ENABLE_AI_PILOT", "true")
+    router = _file_first_bool(env_file_vars, "AI_STACK_ENABLE_AI_ACTION_ROUTER", "true")
+    journal = _file_first_bool(env_file_vars, "AI_STACK_ENABLE_AI_JOURNAL", "false")
+    risk = _file_first_bool(env_file_vars, "AI_STACK_ENABLE_RISK_DAEMON", "false")
+    outcomes = _file_first_bool(env_file_vars, "AI_STACK_ENABLE_TRADE_OUTCOMES", "true")
+    paper = _file_first_bool_alias(env_file_vars, "AI_STACK_ENABLE_PAPER_PRICE_FEEDER", "AI_STACK_ENABLE_PAPER_TICK_DAEMON", "true")
+
     return {
-        "ws_switchboard": WorkerSpec(
-            name="ws_switchboard",
-            enabled=AI_STACK_ENABLE_WS_SWITCHBOARD,
-            target=_run_ws_switchboard,
-        ),
-        "tp_sl_manager": WorkerSpec(
-            name="tp_sl_manager",
-            enabled=AI_STACK_ENABLE_TP_SL_MANAGER,
-            target=_run_tp_sl_manager,
-        ),
-        "ai_pilot": WorkerSpec(
-            name="ai_pilot",
-            enabled=AI_STACK_ENABLE_AI_PILOT,
-            target=_run_ai_pilot,
-        ),
-        "ai_action_router": WorkerSpec(
-            name="ai_action_router",
-            enabled=AI_STACK_ENABLE_AI_ACTION_ROUTER,
-            target=_run_ai_action_router,
-        ),
-        "ai_journal": WorkerSpec(
-            name="ai_journal",
-            enabled=AI_STACK_ENABLE_AI_JOURNAL,
-            target=_run_ai_journal,
-        ),
-        "risk_daemon": WorkerSpec(
-            name="risk_daemon",
-            enabled=AI_STACK_ENABLE_RISK_DAEMON,
-            target=_run_risk_daemon,
-        ),
-        "trade_outcomes": WorkerSpec(
-            name="trade_outcomes",
-            enabled=AI_STACK_ENABLE_TRADE_OUTCOMES,
-            target=_run_trade_outcomes,
-        ),
-        "paper_price_feeder": WorkerSpec(
-            name="paper_price_feeder",
-            enabled=AI_STACK_ENABLE_PAPER_PRICE_FEEDER,
-            target=_run_paper_price_feeder,
-        ),
+        "ws_switchboard": WorkerSpec("ws_switchboard", ws, _run_ws_switchboard),
+        "tp_sl_manager": WorkerSpec("tp_sl_manager", tp, _run_tp_sl_manager),
+        "ai_pilot": WorkerSpec("ai_pilot", pilot, _run_ai_pilot),
+        "ai_action_router": WorkerSpec("ai_action_router", router, _run_ai_action_router),
+        "ai_journal": WorkerSpec("ai_journal", journal, _run_ai_journal),
+        "risk_daemon": WorkerSpec("risk_daemon", risk, _run_risk_daemon),
+        "trade_outcomes": WorkerSpec("trade_outcomes", outcomes, _run_trade_outcomes),
+        "paper_price_feeder": WorkerSpec("paper_price_feeder", paper, _run_paper_price_feeder),
     }
+
+
+# ---------------------------------------------------------------------------
+# Alert rate limiting
+# ---------------------------------------------------------------------------
+
+def _should_alert(last_alert_ms: int, min_interval_sec: int) -> bool:
+    if min_interval_sec <= 0:
+        return True
+    return (_now_ms() - last_alert_ms) >= int(min_interval_sec * 1000)
 
 
 # ---------------------------------------------------------------------------
 # Supervisor core
 # ---------------------------------------------------------------------------
 
-def _start_worker(spec: WorkerSpec) -> None:
+def _start_worker(log, spec: WorkerSpec) -> None:
     if spec.process is not None and spec.process.is_alive():
         return
 
     log.info("Starting worker %s ...", spec.name)
-    p = mp.Process(
-        target=spec.target,
-        name=f"fb_{spec.name}",
-        daemon=False,
-    )
+    p = mp.Process(target=spec.target, name=f"fb_{spec.name}", daemon=False)
     p.start()
     spec.process = p
     log.info("Worker %s started with pid=%s", spec.name, p.pid)
 
 
-def _stop_worker(spec: WorkerSpec) -> None:
+def _stop_worker(log, spec: WorkerSpec) -> None:
     p = spec.process
     if p is None:
         return
@@ -501,70 +466,200 @@ def _stop_worker(spec: WorkerSpec) -> None:
     log.info("Worker %s stopped.", spec.name)
 
 
-def _supervisor_loop() -> None:
+def _supervisor_loop(root: Path, account_label: str, poll_seconds: int, env_file_vars: Dict[str, str]) -> None:
+    log = _get_logger()
+    record_heartbeat, send_tg, alert_bot_error = _load_common(log)
+
+    # alert throttle
+    alert_min_sec = int(os.getenv("AI_STACK_ALERT_MIN_INTERVAL_SEC", "20") or "20")
+    last_alert_ms = 0
+
+    log.info("BOOT | ROOT=%s | ACCOUNT_LABEL=%s | poll=%ss", root, account_label, poll_seconds)
+
+    specs = _build_worker_specs(env_file_vars)
+
     log.info(
-        "AI Stack Supervisor starting for ACCOUNT_LABEL=%s (poll=%ss)",
-        ACCOUNT_LABEL,
-        SUPERVISOR_POLL_SECONDS,
+        "Flags (file-first): WS=%s TP/SL=%s PILOT=%s ROUTER=%s RISK=%s OUTCOMES=%s PAPER_FEED=%s",
+        specs["ws_switchboard"].enabled,
+        specs["tp_sl_manager"].enabled,
+        specs["ai_pilot"].enabled,
+        specs["ai_action_router"].enabled,
+        specs["risk_daemon"].enabled,
+        specs["trade_outcomes"].enabled,
+        specs["paper_price_feeder"].enabled,
+    )
+
+    log.info("AI Stack Supervisor starting for ACCOUNT_LABEL=%s (poll=%ss)", account_label, poll_seconds)
+
+    # ops snapshot: supervisor boot
+    _ops_write(
+        component="supervisor_ai_stack",
+        account_label=account_label,
+        ok=True,
+        details={
+            "phase": "boot",
+            "poll_seconds": poll_seconds,
+            "note": "supervisor online",
+        },
     )
 
     try:
-        send_tg(f"🧩 AI Stack Supervisor online (label={ACCOUNT_LABEL}, poll={SUPERVISOR_POLL_SECONDS}s)")
+        send_tg(f"🧩 AI Stack Supervisor online (label={account_label}, poll={poll_seconds}s)")
     except Exception:
-        log.info("AI Stack Supervisor online (TG notify failed or disabled).")
-
-    specs = _build_worker_specs()
+        pass
 
     for name, spec in specs.items():
         log.info("Worker %-18s enabled=%s", name, spec.enabled)
 
     while True:
         record_heartbeat("supervisor_ai_stack")
-        record_heartbeat(f"supervisor_ai_stack:{ACCOUNT_LABEL}")
+        record_heartbeat(f"supervisor_ai_stack:{account_label}")
+
+        enabled_names: List[str] = []
+        running_names: List[str] = []
+        dead_names: List[str] = []
 
         for name, spec in specs.items():
+            if spec.enabled:
+                enabled_names.append(name)
+
+            # enforce disabled workers are stopped
             if not spec.enabled:
                 if spec.process is not None and spec.process.is_alive():
                     log.info("Worker %s disabled -> stopping.", name)
-                    _stop_worker(spec)
+                    _stop_worker(log, spec)
+
+                # write per-worker ops state
+                _ops_write(
+                    component=f"worker_{name}",
+                    account_label=account_label,
+                    ok=True,
+                    details={"enabled": False, "state": "disabled"},
+                )
                 continue
 
-            if spec.process is None or not spec.process.is_alive():
+            # enabled worker: ensure running
+            alive = (spec.process is not None and spec.process.is_alive())
+            if not alive:
+                # if it existed, record exitcode + restart telemetry
                 if spec.process is not None:
-                    exitcode = spec.process.exitcode
-                    alert_bot_error(
-                        "supervisor_ai_stack",
-                        f"Worker {name} died (label={ACCOUNT_LABEL}, exitcode={exitcode}); restarting.",
-                        "WARN",
-                    )
-                _start_worker(spec)
+                    spec.last_exitcode = spec.process.exitcode
+                    spec.restart_count += 1
+                    spec.last_restart_ms = _now_ms()
+                    spec.last_reason = f"died exitcode={spec.last_exitcode}"
 
-        time.sleep(SUPERVISOR_POLL_SECONDS)
+                    if _should_alert(last_alert_ms, alert_min_sec):
+                        last_alert_ms = _now_ms()
+                        alert_bot_error(
+                            "supervisor_ai_stack",
+                            f"Worker {name} died (label={account_label}, exitcode={spec.last_exitcode}); restarting.",
+                            "WARN",
+                        )
+                else:
+                    spec.last_reason = "not_started"
+
+                _start_worker(log, spec)
+
+            # refresh alive status after possible restart
+            alive = (spec.process is not None and spec.process.is_alive())
+            pid = spec.process.pid if spec.process is not None else None
+            if alive:
+                running_names.append(name)
+            else:
+                dead_names.append(name)
+
+            # write per-worker ops state
+            _ops_write(
+                component=f"worker_{name}",
+                account_label=account_label,
+                ok=bool(alive),
+                details={
+                    "enabled": True,
+                    "alive": bool(alive),
+                    "pid": pid,
+                    "last_exitcode": spec.last_exitcode,
+                    "restart_count": spec.restart_count,
+                    "last_restart_ms": spec.last_restart_ms,
+                    "last_reason": spec.last_reason,
+                },
+            )
+
+        # supervisor summary in ops snapshot
+        ok_stack = (len(dead_names) == 0)
+        _ops_write(
+            component="supervisor_ai_stack",
+            account_label=account_label,
+            ok=ok_stack,
+            details={
+                "phase": "running",
+                "poll_seconds": poll_seconds,
+                "enabled": enabled_names,
+                "running": running_names,
+                "dead": dead_names,
+                "counts": {
+                    "enabled": len(enabled_names),
+                    "running": len(running_names),
+                    "dead": len(dead_names),
+                },
+            },
+        )
+
+        time.sleep(poll_seconds)
 
 
 def main() -> None:
-    if not _label_ai_stack_allowed(ACCOUNT_LABEL):
-        msg = f"AI Stack Supervisor disabled for label={ACCOUNT_LABEL} by config/subaccounts.yaml"
+    # Make spawn behavior deterministic on Windows.
+    try:
+        mp.set_start_method("spawn", force=False)
+    except RuntimeError:
+        pass
+
+    log = _get_logger()
+    root = _resolve_root()
+
+    # Only MainProcess should do dotenv + boot gating.
+    if mp.current_process().name != "MainProcess":
+        return
+
+    env_file_vars = _load_env_file(root, log)
+
+    account_label = os.getenv("ACCOUNT_LABEL", "main").strip() or "main"
+    poll_seconds = _env_int("AI_STACK_SUPERVISOR_POLL_SECONDS", "3")
+
+    record_heartbeat, send_tg, _ = _load_common(log)
+
+    # 1) Gate by subaccounts.yaml if present
+    if not _label_ai_stack_allowed(root, log, account_label):
+        msg = f"AI Stack Supervisor disabled for label={account_label} by config/subaccounts.yaml"
         log.info(msg)
+        _ops_write("supervisor_ai_stack", account_label, False, {"phase": "disabled", "reason": "subaccounts.yaml gate"})
         try:
             send_tg(f"🛑 {msg}")
         except Exception:
             pass
         return
 
-    try:
-        mp.set_start_method("spawn", force=False)
-    except RuntimeError:
-        pass
+    # 2) HARD gate by config validator
+    if not _hard_gate_validate_config(log, send_tg):
+        _ops_write("supervisor_ai_stack", account_label, False, {"phase": "blocked", "reason": "config validation failed"})
+        return
 
+    # 3) Supervisor loop
     try:
-        _supervisor_loop()
+        _supervisor_loop(root, account_label, poll_seconds, env_file_vars)
     except KeyboardInterrupt:
         log.info("AI Stack Supervisor interrupted by user; shutting down...")
+        record_heartbeat("supervisor_ai_stack_stopped")
+        _ops_write("supervisor_ai_stack", account_label, False, {"phase": "stopped", "reason": "KeyboardInterrupt"})
     except Exception as e:
-        alert_bot_error("supervisor_ai_stack", f"fatal error: {e}", "ERROR")
+        log.exception("supervisor_ai_stack fatal error: %s", e)
+        _ops_write("supervisor_ai_stack", account_label, False, {"phase": "fatal", "error": str(e)})
         raise
 
 
 if __name__ == "__main__":
+    try:
+        mp.freeze_support()
+    except Exception:
+        pass
     main()

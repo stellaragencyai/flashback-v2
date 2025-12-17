@@ -7,42 +7,15 @@ Purpose
 -------
 Central place to define in-process "buses" used by various workers.
 
-Right now we only need:
-    - ai_events_bus: deque of AI-related events, consumed by
-      app.ai.ai_events_spine (and any future AI workers).
-
-Later you can extend this with:
-    - order_events_bus
-    - trade_events_bus
-    - heartbeat_bus
-    etc.
+Right now we need:
+    - ai_events_bus: deque of AI-related events
+    - memory_bus: deque of canonical MemoryRecord events (Phase 4+)
 
 Design
 ------
 - Buses are simple deques in memory.
 - Writers push events with .append(...)
 - Readers (workers) pop with .popleft() in a loop.
-
-AI Event Shapes
----------------
-For AI learning we standardize two main event shapes:
-
-    SetupRecord (event_type="setup_context"):
-        - trade_id: unique trade identifier
-        - symbol, account_label, strategy
-        - optional setup_type, timeframe, ai_profile
-        - payload.features: dict of numeric/categorical features
-        - payload.extra: optional misc metadata
-
-    OutcomeRecord (event_type="outcome_record"):
-        - trade_id: same identifier as SetupRecord
-        - symbol, account_label, strategy
-        - payload.pnl_usd, r_multiple, win, exit_reason
-        - payload.extra: optional misc metadata
-
-These map directly onto:
-    state/ai_events/setups.jsonl
-    state/ai_events/outcomes.jsonl
 """
 
 from __future__ import annotations
@@ -53,7 +26,7 @@ from typing import Literal, TypedDict
 
 
 # ---------------------------------------------------------------------------
-# Typed schemas for AI events
+# Typed schemas for AI events (Phase 3)
 # ---------------------------------------------------------------------------
 
 class SetupRecord(TypedDict, total=False):
@@ -83,8 +56,7 @@ class OutcomeRecord(TypedDict, total=False):
     """
     Canonical AI Outcome event.
 
-    Linked to a SetupRecord by trade_id. The enriched outcomes.jsonl file
-    may embed both the original setup + outcome and computed stats.
+    Linked to a SetupRecord by trade_id.
     """
     event_type: Literal["outcome_record"]
     ts: int
@@ -93,39 +65,62 @@ class OutcomeRecord(TypedDict, total=False):
     account_label: str
     strategy: str
 
-    # payload:
-    #   pnl_usd: float
-    #   r_multiple: Optional[float]
-    #   win: Optional[bool]
-    #   exit_reason: Optional[str]
-    #   extra: Optional[Dict[str, Any]]
     payload: Dict[str, Any]
 
 
-# Generic AI event type for the bus; at runtime this is just a dict.
+# ---------------------------------------------------------------------------
+# Typed schema for Memory (Phase 4)
+# ---------------------------------------------------------------------------
+
+class MemoryRecord(TypedDict, total=False):
+    """
+    Canonical AI Memory record (Phase 4 contract).
+
+    This is what the learning layer should consume. It is intentionally:
+      - bounded
+      - append/merge-stats only
+      - policy-stamped
+      - fingerprint-indexed
+
+    NOTE: Memory is derived from Phase 3 artifacts; it does NOT rewrite history.
+    """
+    event_type: Literal["memory_record"]
+    ts: int
+
+    # contract + versioning
+    schema_version: int
+
+    # deterministic identity
+    memory_id: str
+    setup_fingerprint: str
+    policy_hash: str
+
+    # scopes
+    timeframe: str
+    symbol_scope: str        # "ANY" or a symbol like "BTCUSDT"
+    account_scope: str       # "global" or a specific account label
+
+    # lightweight stats (merge-stats only)
+    stats: Dict[str, Any]
+
+    # lifecycle guardrails
+    lifecycle: Dict[str, Any]
+
+    # optional for search/filtering
+    tags: Any
+    notes: str
+
+
+# Generic runtime event types
 AIEvent = Dict[str, Any]
+MemoryEvent = Dict[str, Any]
 
 
 # ---------------------------------------------------------------------------
-# AI events bus
+# Buses
 # ---------------------------------------------------------------------------
 
-# Event shape is flexible at runtime, but expected to match one of:
-#   - SetupRecord (event_type="setup_context")
-#   - OutcomeRecord (event_type="outcome_record")
-#
-# See app.ai.ai_events_spine for canonical builders.
 ai_events_bus: Deque[AIEvent] = deque()
 
-# ---------------------------------------------------------------------------
-# Placeholder for future buses (documented, but not required yet)
-# ---------------------------------------------------------------------------
-#
-# Example (uncomment/extend when you actually use them):
-#
-# order_events_bus: Deque[Dict[str, Any]] = deque()
-# trade_events_bus: Deque[Dict[str, Any]] = deque()
-# heartbeat_bus: Deque[Dict[str, Any]] = deque()
-#
-# Each worker that uses them should import from here, not define
-# its own separate deque, so everything stays on a single spine.
+# Phase 4: canonical memory bus for in-process consumers (optional)
+memory_bus: Deque[MemoryEvent] = deque()

@@ -1,283 +1,368 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Flashback — Outcome Joiner / AI Outcome Logger
+Flashback — Outcome Joiner v2.0 (canonical + terminal-only)
 
-Purpose
--------
-Read executions from WS execution bus and join them into
-high-level trade outcomes for AI training:
+What it does
+------------
+- Reads WS execution events from: state/ws_executions.jsonl
+- Uses cursor: state/ws_executions.cursor
+- Joins executions -> setup_context via trade_id (prefers orderId)
+- Emits canonical AI events to: state/ai_events/outcomes.jsonl
+  ONLY when terminal:
+    extra.is_terminal=True
+    extra.final_status in {"WIN","LOSS","BREAKEVEN"}
 
-    - Consume state/ws_executions.jsonl (written by ws_switchboard).
-    - Group executions by trade_id (orderLinkId).
-    - When a position is fully closed (or we decide it's "done enough"),
-      emit an OutcomeRecord AI event via app.ai.ai_events:
+Also writes raw audit lines to: state/ai_events/outcomes_raw.jsonl
 
-        event_type="outcome_record"
-        → state/ai_events/outcomes.jsonl
-
-Notes
------
-This is a first-pass, simple implementation:
-
-    - We look at each execution row.
-    - We try to infer:
-        * side (Buy/Sell)
-        * symbol
-        * realized PnL (if available)
-        * orderLinkId (used as trade_id)
-    - For now, we log a "partial" outcome whenever we see a fully
-      filled order with a non-zero cumExecQty / cumExecValue.
-    - You can refine the logic later (e.g. actual position PnL via REST).
-
-This is *good enough* to start feeding the AI with:
-    - trade_id
-    - symbol
-    - pnl_usd (approx)
-    - win/loss flag (based on pnl > 0)
+Why
+---
+Your v1 joiner was dumping non-canonical rows into outcomes.jsonl and
+logging non-terminal fragments, which Phase 3 integrity correctly flags as 100% broken.
 """
 
 from __future__ import annotations
 
+import json
 import time
+import logging
 from pathlib import Path
 from typing import Any, Dict, Optional, Tuple
 
 import orjson
 
 from app.core.config import settings
+from app.core.position_bus import get_positions_snapshot as bus_get_positions_snapshot
 
-# Robust logger import
+# Prefer spine publisher if available
 try:
-    from app.core.logger import get_logger  # type: ignore
+    from app.ai.ai_events_spine import publish_ai_event  # type: ignore
 except Exception:
-    try:
-        from app.core.log import get_logger  # type: ignore
-    except Exception:
-        import logging
+    publish_ai_event = None  # type: ignore
 
-        def get_logger(name: str) -> "logging.Logger":  # type: ignore
-            logger_ = logging.getLogger(name)
-            if not logger_.handlers:
-                handler = logging.StreamHandler()
-                fmt = logging.Formatter(
-                    "%(asctime)s [%(levelname)s] [%(name)s] %(message)s"
-                )
-                handler.setFormatter(fmt)
-                logger_.addHandler(handler)
-            logger_.setLevel(logging.INFO)
-            return logger_
 
-log = get_logger("outcome_joiner")
-
-from app.ai.ai_events_spine import build_outcome_record, publish_ai_event  # noqa: E402
-
+log = logging.getLogger("outcome_joiner")
+if not log.handlers:
+    h = logging.StreamHandler()
+    h.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] [%(name)s] %(message)s"))
+    log.addHandler(h)
+log.setLevel(logging.INFO)
 
 ROOT: Path = settings.ROOT
-STATE_DIR: Path = ROOT / "state"
-STATE_DIR.mkdir(parents=True, exist_ok=True)
 
-EXEC_PATH: Path = STATE_DIR / "ws_executions.jsonl"
-CURSOR_PATH: Path = STATE_DIR / "ws_executions.cursor"
+EXEC_FILE: Path = ROOT / "state" / "ws_executions.jsonl"
+CURSOR_FILE: Path = ROOT / "state" / "ws_executions.cursor"
+
+AI_DIR: Path = ROOT / "state" / "ai_events"
+AI_DIR.mkdir(parents=True, exist_ok=True)
+
+SETUPS_FILE: Path = AI_DIR / "setups.jsonl"
+
+OUTCOMES_FILE: Path = AI_DIR / "outcomes.jsonl"
+OUTCOMES_RAW_FILE: Path = AI_DIR / "outcomes_raw.jsonl"
+OUTCOMES_UNMATCHED_FILE: Path = AI_DIR / "outcomes_unmatched.jsonl"
+
+DEDUPE_FILE: Path = AI_DIR / "outcome_dedupe.json"
 
 
-def _load_cursor() -> int:
-    if not CURSOR_PATH.exists():
+def _now_ms() -> int:
+    return int(time.time() * 1000)
+
+
+def _read_cursor() -> int:
+    if not CURSOR_FILE.exists():
         return 0
     try:
-        return int(CURSOR_PATH.read_text().strip() or "0")
+        return int(CURSOR_FILE.read_text("utf-8").strip() or "0")
     except Exception:
         return 0
 
 
-def _save_cursor(pos: int) -> None:
+def _write_cursor(pos: int) -> None:
     try:
-        CURSOR_PATH.write_text(str(pos))
+        CURSOR_FILE.write_text(str(pos), encoding="utf-8")
     except Exception as e:
-        log.warning("Failed to save executions cursor %s: %r", pos, e)
+        log.warning("failed to write cursor: %r", e)
 
 
-def _parse_exec_line(raw_line: bytes) -> Optional[Dict[str, Any]]:
-    """
-    Parse one JSONL line from ws_executions.jsonl.
-
-    Expected format (from ws_switchboard):
-
-        {
-          "label": "<account_label_lower>",
-          "ts": <epoch_ms>,
-          "row": { ...raw Bybit exec row... }
-        }
-    """
+def _load_dedupe() -> Dict[str, int]:
+    if not DEDUPE_FILE.exists():
+        return {}
     try:
-        line = raw_line.decode("utf-8").strip()
-    except Exception as e:
-        log.warning("Failed to decode execution line: %r", e)
-        return None
-
-    if not line:
-        return None
-
-    try:
-        obj = orjson.loads(line)
-    except Exception as e:
-        log.warning("Invalid JSON in ws_executions.jsonl: %r", e)
-        return None
-
-    if not isinstance(obj, dict):
-        return None
-
-    return obj
-
-
-def _extract_basic_outcome(exec_obj: Dict[str, Any]) -> Optional[Tuple[str, str, str, float]]:
-    """
-    From one execution object, try to extract:
-
-        trade_id  (orderLinkId)
-        symbol
-        account_label
-        pnl_usd
-
-    Returns:
-        (trade_id, symbol, account_label, pnl_usd)
-    or None if we can't infer enough.
-    """
-    label = str(exec_obj.get("label") or "main")
-    row = exec_obj.get("row") or {}
-    if not isinstance(row, dict):
-        return None
-
-    symbol = row.get("symbol")
-    if not symbol:
-        return None
-
-    trade_id = (
-        row.get("orderLinkId")
-        or row.get("order_link_id")
-        or row.get("orderLinkID")
-        or row.get("orderId")
-        or row.get("order_id")
-    )
-    if not trade_id:
-        return None
-
-    # Realized PnL is sometimes included in exec rows. Try multiple keys.
-    pnl_raw = (
-        row.get("execPnL")
-        or row.get("realizedPnl")
-        or row.get("realizedPnl")
-        or 0
-    )
-
-    try:
-        pnl_usd = float(pnl_raw or 0.0)
+        return json.loads(DEDUPE_FILE.read_text("utf-8") or "{}")
     except Exception:
-        pnl_usd = 0.0
-
-    return str(trade_id), str(symbol), label, pnl_usd
+        return {}
 
 
-def _build_and_publish_outcome(exec_obj: Dict[str, Any]) -> None:
-    extracted = _extract_basic_outcome(exec_obj)
-    if not extracted:
-        return
-
-    trade_id, symbol, account_label, pnl_usd = extracted
-
-    # Simple win flag: pnl > 0 → win, pnl < 0 → loss, 0 → None
-    if pnl_usd > 0:
-        win_flag: Optional[bool] = True
-    elif pnl_usd < 0:
-        win_flag = False
-    else:
-        win_flag = None
-
-    # R-multiple is unknown for now (0 or None). You can backfill later from features.
-    r_multiple = None
-
-    # Strategy name is not directly in the exec row.
-    # For now, we just label it as "unknown", and the join
-    # for training can match trade_id back to setups/features.
-    strategy_name = "unknown"
-
-    # Build OutcomeRecord AI event
-    ev = build_outcome_record(
-        trade_id=trade_id,
-        symbol=symbol,
-        account_label=account_label,
-        strategy=strategy_name,
-        pnl_usd=pnl_usd,
-        r_multiple=r_multiple,
-        win=win_flag,
-        exit_reason="exec_row",
-        extra={
-            "raw_exec": exec_obj,
-        },
-    )
-
-    publish_ai_event(ev)
-    log.info(
-        "Logged outcome_record: trade_id=%s symbol=%s account=%s pnl_usd=%.4f win=%s",
-        trade_id,
-        symbol,
-        account_label,
-        pnl_usd,
-        win_flag,
-    )
+def _save_dedupe(d: Dict[str, int]) -> None:
+    try:
+        DEDUPE_FILE.write_text(json.dumps(d), encoding="utf-8")
+    except Exception as e:
+        log.warning("failed to save dedupe: %r", e)
 
 
-def outcome_loop(poll_seconds: float = 0.5) -> None:
+def _append_jsonl(path: Path, obj: Dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("ab") as f:
+        f.write(orjson.dumps(obj) + b"\n")
+
+
+def _load_setup_index(max_lines: int = 20000) -> Dict[str, Dict[str, Any]]:
     """
-    Main loop:
-
-        - tail ws_executions.jsonl from last cursor
-        - for each new line, parse + emit outcome_record
-        - sleep briefly, repeat
+    Build an index: trade_id -> {"setup_fingerprint": ..., "symbol": ..., "account_label": ...}
+    from setups.jsonl. Loads last max_lines for speed.
     """
-    pos = _load_cursor()
-    log.info("Outcome joiner starting at cursor=%s", pos)
+    idx: Dict[str, Dict[str, Any]] = {}
+    if not SETUPS_FILE.exists():
+        return idx
 
-    while True:
-        try:
-            if not EXEC_PATH.exists():
-                time.sleep(poll_seconds)
+    try:
+        lines = SETUPS_FILE.read_bytes().splitlines()
+        if max_lines and len(lines) > max_lines:
+            lines = lines[-max_lines:]
+        for raw in lines:
+            try:
+                e = orjson.loads(raw)
+            except Exception:
                 continue
+            if not isinstance(e, dict):
+                continue
+            if e.get("event_type") != "setup_context":
+                continue
+            trade_id = e.get("trade_id")
+            payload = e.get("payload") or {}
+            feats = (payload.get("features") or {}) if isinstance(payload, dict) else {}
+            fp = feats.get("setup_fingerprint")
+            sym = payload.get("symbol") if isinstance(payload, dict) else None
+            acct = payload.get("account_label") if isinstance(payload, dict) else None
+            if trade_id and fp:
+                idx[str(trade_id)] = {
+                    "setup_fingerprint": fp,
+                    "symbol": sym,
+                    "account_label": acct,
+                }
+    except Exception as e:
+        log.warning("failed building setup index: %r", e)
+    return idx
 
-            file_size = EXEC_PATH.stat().st_size
-            if pos > file_size:
-                log.info(
-                    "Executions file truncated (size=%s, cursor=%s). Resetting cursor to 0.",
-                    file_size,
-                    pos,
-                )
-                pos = 0
-                _save_cursor(pos)
 
-            with EXEC_PATH.open("rb") as f:
-                f.seek(pos)
-                for raw in f:
-                    pos = f.tell()
-                    exec_obj = _parse_exec_line(raw)
-                    if not exec_obj:
-                        continue
+def _extract_trade_id_and_symbol(row: Dict[str, Any]) -> Tuple[Optional[str], Optional[str], Optional[str]]:
+    """
+    Try to normalize execution row fields across your various formats.
+    Returns: (trade_id, symbol, account_label)
+    """
+    symbol = row.get("symbol") or row.get("s")
+    account_label = row.get("account_label") or row.get("label") or row.get("account") or "main"
 
-                    _build_and_publish_outcome(exec_obj)
-                    _save_cursor(pos)
+    order_id = row.get("orderId") or row.get("order_id") or row.get("orderID")
+    link_id = row.get("orderLinkId") or row.get("order_link_id") or row.get("orderLinkID")
 
-            time.sleep(poll_seconds)
+    # Prefer orderId because your WS feed often blanks orderLinkId
+    if order_id:
+        return str(order_id), str(symbol) if symbol else None, str(account_label) if account_label else "main"
+    if link_id:
+        return str(link_id), str(symbol) if symbol else None, str(account_label) if account_label else "main"
+    return None, str(symbol) if symbol else None, str(account_label) if account_label else "main"
 
-        except KeyboardInterrupt:
-            log.info("Outcome joiner stopped by user.")
-            break
-        except Exception as e:
-            log.exception("Outcome loop error: %r; backing off 1s", e)
-            time.sleep(1.0)
+
+def _is_terminal_for_symbol(account_label: str, symbol: str) -> bool:
+    """
+    Terminal heuristic:
+    - If no open position exists for this symbol on this account_label, we call it terminal.
+    This isn't perfect but it's consistent and works with the rest of your stack.
+    """
+    try:
+        rows = bus_get_positions_snapshot(
+            label=account_label,
+            category="linear",
+            max_age_seconds=10,
+            allow_rest_fallback=True,
+        )
+        if not isinstance(rows, list):
+            return False
+        for p in rows:
+            if not isinstance(p, dict):
+                continue
+            if str(p.get("symbol") or "") != str(symbol):
+                continue
+            # any non-zero size means still open
+            try:
+                size = float(p.get("size") or 0)
+            except Exception:
+                size = 0.0
+            if abs(size) > 0.0:
+                return False
+        return True
+    except Exception:
+        # If position bus fails, do NOT claim terminal.
+        return False
+
+
+def _final_status_from_pnl(pnl_usd: float) -> str:
+    if pnl_usd > 0:
+        return "WIN"
+    if pnl_usd < 0:
+        return "LOSS"
+    return "BREAKEVEN"
+
+
+def _build_canonical_outcome(
+    trade_id: str,
+    symbol: str,
+    account_label: str,
+    pnl_usd: float,
+    setup_fingerprint: Optional[str],
+    source: str,
+    raw: Dict[str, Any],
+) -> Dict[str, Any]:
+    """
+    Canonical event envelope expected by Phase 3 integrity.
+    """
+    ts = _now_ms()
+    final_status = _final_status_from_pnl(pnl_usd)
+
+    payload: Dict[str, Any] = {
+        "trade_id": trade_id,
+        "symbol": symbol,
+        "account_label": account_label,
+        "pnl_usd": float(pnl_usd),
+        "setup_fingerprint": setup_fingerprint,
+        "extra": {
+            "is_terminal": True,
+            "final_status": final_status,
+            "source": source,
+        },
+        "raw": raw,
+    }
+
+    return {
+        "event_type": "outcome_record",
+        "ts_ms": ts,
+        "trade_id": trade_id,
+        "payload": payload,
+        "schema_version": "ai_event_v1",
+    }
 
 
 def main() -> None:
-    outcome_loop()
+    pos = _read_cursor()
+    log.info("Outcome joiner starting at cursor=%s", pos)
+
+    published = 0
+    skipped = 0
+
+    dedupe = _load_dedupe()
+    setup_idx = _load_setup_index()
+
+    if not EXEC_FILE.exists():
+        log.warning("Missing executions file: %s", str(EXEC_FILE))
+        return
+
+    with EXEC_FILE.open("rb") as f:
+        f.seek(pos)
+        for raw_line in f:
+            pos = f.tell()
+
+            try:
+                row = orjson.loads(raw_line)
+            except Exception:
+                skipped += 1
+                continue
+            if not isinstance(row, dict):
+                skipped += 1
+                continue
+
+            # Always keep raw audit
+            try:
+                _append_jsonl(OUTCOMES_RAW_FILE, row)
+            except Exception:
+                pass
+
+            trade_id, symbol, account_label = _extract_trade_id_and_symbol(row)
+            if not trade_id or not symbol:
+                skipped += 1
+                continue
+
+            # Dedupe key: trade_id + execId (if present) else trade_id + ts
+            exec_id = row.get("execId") or row.get("exec_id") or row.get("executionId")
+            k = f"{trade_id}:{exec_id or row.get('ts_ms') or row.get('time') or ''}"
+            if k in dedupe:
+                skipped += 1
+                continue
+            dedupe[k] = _now_ms()
+
+            # Extract pnl
+            pnl = row.get("closedPnl") or row.get("closed_pnl") or row.get("pnl") or row.get("pnl_usd")
+            try:
+                pnl_usd = float(pnl) if pnl is not None else 0.0
+            except Exception:
+                pnl_usd = 0.0
+
+            # terminal-only gate
+            if not _is_terminal_for_symbol(account_label or "main", symbol):
+                # Not terminal: keep an unmatched breadcrumb (optional)
+                _append_jsonl(
+                    OUTCOMES_UNMATCHED_FILE,
+                    {
+                        "ts_ms": _now_ms(),
+                        "trade_id": trade_id,
+                        "symbol": symbol,
+                        "account_label": account_label,
+                        "reason": "not_terminal_yet",
+                        "raw": row,
+                    },
+                )
+                skipped += 1
+                continue
+
+            # Join setup fingerprint
+            fp = None
+            meta = setup_idx.get(trade_id)
+            if meta:
+                fp = meta.get("setup_fingerprint")
+
+            outcome_event = _build_canonical_outcome(
+                trade_id=trade_id,
+                symbol=symbol,
+                account_label=account_label or "main",
+                pnl_usd=pnl_usd,
+                setup_fingerprint=fp,
+                source="ws_executions",
+                raw=row,
+            )
+
+            # Publish canonical: use spine publisher if available, else append to outcomes.jsonl directly
+            try:
+                if publish_ai_event:
+                    publish_ai_event(outcome_event)  # type: ignore
+                else:
+                    _append_jsonl(OUTCOMES_FILE, outcome_event)
+                published += 1
+                log.info(
+                    "Logged outcome_record: trade_id=%s symbol=%s account=%s pnl_usd=%.6f terminal=True final=%s fp=%s",
+                    trade_id,
+                    symbol,
+                    account_label,
+                    pnl_usd,
+                    outcome_event["payload"]["extra"]["final_status"],
+                    "yes" if fp else "no",
+                )
+            except Exception as e:
+                log.warning("failed to publish outcome: %r", e)
+                skipped += 1
+
+            if (published + skipped) % 250 == 0:
+                log.info("Progress: published=%s skipped=%s cursor=%s", published, skipped, pos)
+                _write_cursor(pos)
+                _save_dedupe(dedupe)
+
+    _write_cursor(pos)
+    _save_dedupe(dedupe)
+    log.info("Done: published=%s skipped=%s cursor=%s", published, skipped, pos)
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except KeyboardInterrupt:
+        log.info("Outcome joiner stopped by user.")

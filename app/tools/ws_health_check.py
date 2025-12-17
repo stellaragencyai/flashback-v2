@@ -2,30 +2,35 @@
 # -*- coding: utf-8 -*-
 
 """
-Flashback — WS Health Check
+Flashback — WS Health Check (v2.3 + ops_snapshot + ai_memory + ai_decisions)
 
 What it does:
-- Watches the WS-fed state files for freshness:
+- Watches WS-fed state files for freshness:
     state/positions_bus.json
     state/orderbook_bus.json
     state/trades_bus.json
     state/ws_switchboard_heartbeat_<ACCOUNT_LABEL>.txt
 
-- Prints age seconds for each.
-- Exits non-zero if any critical bus is stale.
+- Watches log growth risk:
+    state/public_trades.jsonl
+    state/ws_executions.jsonl
 
-Why this matters:
-- If these buses aren't fresh, everything downstream (TP/SL, outcomes, AI)
-  is reading dead air and you’ll chase phantom bugs forever.
+- Watches AI Memory health (Phase 4):
+    state/ai_memory/memory_snapshot.json
+    state/ai_memory/memory_records.jsonl
+
+- Watches AI Decisions health (Phase 4):
+    state/ai_decisions.jsonl (tail parse + schema validate + freshness)
+
+- Writes canonical status into state/ops_snapshot.json via app.ops.ops_state
 """
 
 from __future__ import annotations
 
 import os
-import sys
 import time
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Tuple, Dict, Any
 
 try:
     from app.core.config import settings
@@ -38,6 +43,15 @@ STATE_DIR = ROOT / "state"
 POSITIONS = STATE_DIR / "positions_bus.json"
 ORDERBOOK = STATE_DIR / "orderbook_bus.json"
 TRADES = STATE_DIR / "trades_bus.json"
+
+PUBLIC_TRADES_JSONL = STATE_DIR / "public_trades.jsonl"
+WS_EXECUTIONS_JSONL = STATE_DIR / "ws_executions.jsonl"
+
+AI_MEMORY_DIR = STATE_DIR / "ai_memory"
+MEMORY_SNAPSHOT = AI_MEMORY_DIR / "memory_snapshot.json"
+MEMORY_RECORDS = AI_MEMORY_DIR / "memory_records.jsonl"
+
+AI_DECISIONS_JSONL = STATE_DIR / "ai_decisions.jsonl"
 
 
 def _now_ms() -> int:
@@ -74,6 +88,175 @@ def _age_from_updated_ms(updated_ms: Optional[int]) -> Optional[float]:
     return (_now_ms() - updated_ms) / 1000.0
 
 
+def _env_bool(name: str, default: str = "false") -> bool:
+    raw = os.getenv(name, default)
+    return str(raw).strip().lower() in ("1", "true", "yes", "y", "on")
+
+
+def _file_size_mb(path: Path) -> Optional[float]:
+    try:
+        if not path.exists():
+            return None
+        return float(path.stat().st_size) / (1024.0 * 1024.0)
+    except Exception:
+        return None
+
+
+def _safe_replace(src: Path, dst: Path, retries: int = 8, sleep_sec: float = 0.05) -> bool:
+    for _ in range(max(1, retries)):
+        try:
+            os.replace(str(src), str(dst))
+            return True
+        except Exception:
+            time.sleep(sleep_sec)
+    return False
+
+
+def _rotate_file(path: Path, keep: int = 3) -> Tuple[bool, str]:
+    try:
+        if not path.exists():
+            return (False, "missing")
+
+        if keep < 1:
+            keep = 1
+
+        for i in range(keep, 0, -1):
+            older = path.with_name(f"{path.name}.{i}")
+            newer = path.with_name(f"{path.name}.{i+1}")
+            if older.exists():
+                _safe_replace(older, newer)
+
+        rotated_1 = path.with_name(f"{path.name}.1")
+        ok = _safe_replace(path, rotated_1)
+        if not ok:
+            return (False, "rotate_failed (file lock?)")
+
+        try:
+            path.write_text("", encoding="utf-8")
+        except Exception:
+            with path.open("a", encoding="utf-8"):
+                pass
+
+        return (True, f"rotated -> {rotated_1.name}")
+    except Exception as e:
+        return (False, f"rotate_exception: {e}")
+
+
+def _write_ops(account_label: str, ok: bool, details: Dict[str, Any]) -> None:
+    try:
+        from app.ops.ops_state import write_component_status  # type: ignore
+        write_component_status(
+            component="ws_health_check",
+            account_label=account_label,
+            ok=ok,
+            details=details,
+            ts_ms=_now_ms(),
+        )
+    except Exception:
+        return
+
+
+def _read_memory_snapshot_meta() -> Dict[str, Any]:
+    meta: Dict[str, Any] = {
+        "exists": MEMORY_SNAPSHOT.exists(),
+        "age_sec": _file_age_sec(MEMORY_SNAPSHOT),
+        "parse_ok": False,
+        "count": None,
+        "latest_updated_ts": None,
+        "sample_key": None,
+    }
+    if not MEMORY_SNAPSHOT.exists():
+        return meta
+
+    try:
+        import json
+        data = json.loads(MEMORY_SNAPSHOT.read_text(encoding="utf-8"))
+        if not isinstance(data, dict):
+            return meta
+
+        meta["parse_ok"] = True
+        meta["count"] = len(data)
+
+        latest = 0
+        sample_key = None
+        scanned = 0
+        for k, rec in data.items():
+            if sample_key is None:
+                sample_key = k
+            if isinstance(rec, dict):
+                lifecycle = rec.get("lifecycle") if isinstance(rec.get("lifecycle"), dict) else {}
+                u = lifecycle.get("updated_ts") or rec.get("ts") or 0
+                try:
+                    u_i = int(u)
+                except Exception:
+                    u_i = 0
+                latest = max(latest, u_i)
+            scanned += 1
+            if scanned >= 500:
+                break
+
+        meta["latest_updated_ts"] = latest if latest > 0 else None
+        meta["sample_key"] = sample_key
+        return meta
+    except Exception:
+        return meta
+
+
+def _tail_last_jsonl_line(path: Path, max_bytes: int = 65536) -> Tuple[bool, Optional[str], Optional[Dict[str, Any]]]:
+    """
+    Read and parse last JSON line from a JSONL file (best effort).
+    Returns: (ok, error, obj)
+    """
+    if not path.exists():
+        return (False, "missing", None)
+    try:
+        size = path.stat().st_size
+        if size <= 0:
+            return (False, "empty", None)
+
+        read_n = min(int(max_bytes), int(size))
+        with path.open("rb") as f:
+            f.seek(-read_n, 2)
+            chunk = f.read(read_n)
+
+        # Split lines, find last non-empty
+        lines = chunk.splitlines()
+        for raw in reversed(lines):
+            raw = raw.strip()
+            if not raw:
+                continue
+            try:
+                import json
+                obj = json.loads(raw.decode("utf-8", errors="ignore"))
+                if not isinstance(obj, dict):
+                    return (False, "last_line_not_dict", None)
+                return (True, None, obj)
+            except Exception:
+                return (False, "json_parse_failed", None)
+
+        return (False, "no_nonempty_lines", None)
+    except Exception as e:
+        return (False, f"tail_exception:{e}", None)
+
+
+def _validate_decision_obj(obj: Dict[str, Any]) -> Tuple[bool, str, Optional[list]]:
+    """
+    Uses app.core.ai_decision_validate.validate_pilot_decision if available.
+    Returns: (ok, reason, errs)
+    """
+    try:
+        from app.core.ai_decision_validate import validate_pilot_decision  # type: ignore
+        ok, errs = validate_pilot_decision(obj)
+        return (bool(ok), "valid" if ok else "invalid", errs)
+    except Exception:
+        # If validator doesn't exist, we do a minimal sanity check instead.
+        required = ("schema_version", "ts", "decision", "tier_used", "gates")
+        missing = [k for k in required if k not in obj]
+        if missing:
+            return (False, "missing_fields", missing)
+        return (True, "validator_missing_minimal_ok", None)
+
+
 def main() -> int:
     account_label = os.getenv("ACCOUNT_LABEL", "main")
     hb = STATE_DIR / f"ws_switchboard_heartbeat_{account_label}.txt"
@@ -83,37 +266,263 @@ def main() -> int:
     tr_age = _age_from_updated_ms(_read_json_updated_ms(TRADES))
     hb_age = _file_age_sec(hb)
 
-    def fmt(x: Optional[float]) -> str:
+    def fmt_age(x: Optional[float]) -> str:
         return "MISSING" if x is None else f"{x:.2f}s"
+
+    def fmt_mb(x: Optional[float]) -> str:
+        return "MISSING" if x is None else f"{x:.2f} MB"
 
     print("\n=== WS HEALTH CHECK ===")
     print(f"ACCOUNT_LABEL: {account_label}")
-    print(f"positions_bus.json  age: {fmt(pos_age)}")
-    print(f"orderbook_bus.json  age: {fmt(ob_age)}")
-    print(f"trades_bus.json     age: {fmt(tr_age)}")
-    print(f"heartbeat file      age: {fmt(hb_age)}")
+    print(f"positions_bus.json  age: {fmt_age(pos_age)}")
+    print(f"orderbook_bus.json  age: {fmt_age(ob_age)}")
+    print(f"trades_bus.json     age: {fmt_age(tr_age)}")
+    print(f"heartbeat file      age: {fmt_age(hb_age)}")
 
-    # Guardrails (tuneable via env)
+    # Freshness guardrails
     max_pos = float(os.getenv("WS_MAX_POS_AGE_SEC", "30"))
-    max_ob  = float(os.getenv("WS_MAX_OB_AGE_SEC", "10"))
-    max_tr  = float(os.getenv("WS_MAX_TRADES_AGE_SEC", "10"))
-    max_hb  = float(os.getenv("WS_MAX_HB_AGE_SEC", "60"))
+    max_ob = float(os.getenv("WS_MAX_OB_AGE_SEC", "10"))
+    max_tr = float(os.getenv("WS_MAX_TRADES_AGE_SEC", "10"))
+    max_hb = float(os.getenv("WS_MAX_HB_AGE_SEC", "60"))
 
     failures = []
     if pos_age is None or pos_age > max_pos:
-        failures.append(f"positions stale ({fmt(pos_age)} > {max_pos}s)")
+        failures.append(f"positions stale ({fmt_age(pos_age)} > {max_pos}s)")
     if ob_age is None or ob_age > max_ob:
-        failures.append(f"orderbook stale ({fmt(ob_age)} > {max_ob}s)")
+        failures.append(f"orderbook stale ({fmt_age(ob_age)} > {max_ob}s)")
     if tr_age is None or tr_age > max_tr:
-        failures.append(f"trades stale ({fmt(tr_age)} > {max_tr}s)")
+        failures.append(f"trades stale ({fmt_age(tr_age)} > {max_tr}s)")
     if hb_age is None or hb_age > max_hb:
-        failures.append(f"heartbeat stale ({fmt(hb_age)} > {max_hb}s)")
+        failures.append(f"heartbeat stale ({fmt_age(hb_age)} > {max_hb}s)")
 
+    # Log growth guardrails
+    warn_mb = float(os.getenv("WS_LOG_WARN_MB", "50"))
+    cap_mb = float(os.getenv("WS_LOG_CAP_MB", "150"))
+    keep_n = int(os.getenv("WS_LOG_ROTATE_KEEP", "3") or "3")
+
+    auto_rotate = _env_bool("WS_LOG_AUTO_ROTATE", "true")
+    fail_on_bloat = _env_bool("WS_FAIL_ON_LOG_BLOAT", "false")
+
+    pub_mb = _file_size_mb(PUBLIC_TRADES_JSONL)
+    exe_mb = _file_size_mb(WS_EXECUTIONS_JSONL)
+
+    print("\n--- LOG SIZE CHECK ---")
+    print(f"public_trades.jsonl  size: {fmt_mb(pub_mb)}")
+    print(f"ws_executions.jsonl  size: {fmt_mb(exe_mb)}")
+    print(f"policy: warn>{warn_mb:.0f}MB cap>{cap_mb:.0f}MB keep={keep_n} auto_rotate={auto_rotate} fail_on_bloat={fail_on_bloat}")
+
+    bloat_issues = []
+    rotations: Dict[str, str] = {}
+
+    def check_one(path: Path, size_mb: Optional[float], label: str) -> None:
+        if size_mb is None:
+            return
+        if size_mb >= warn_mb:
+            print(f"WARNING: {label} is large ({size_mb:.2f} MB).")
+        if size_mb >= cap_mb:
+            if auto_rotate:
+                ok, msg = _rotate_file(path, keep=keep_n)
+                if ok:
+                    print(f"ROTATED: {label} ({size_mb:.2f} MB) {msg}")
+                    rotations[label] = msg
+                else:
+                    print(f"ROTATE FAILED: {label} ({size_mb:.2f} MB) {msg}")
+                    bloat_issues.append(f"{label} rotation failed ({msg})")
+            else:
+                bloat_issues.append(f"{label} exceeds cap ({size_mb:.2f} MB >= {cap_mb:.2f} MB)")
+
+    check_one(PUBLIC_TRADES_JSONL, pub_mb, "public_trades.jsonl")
+    check_one(WS_EXECUTIONS_JSONL, exe_mb, "ws_executions.jsonl")
+
+    # AI Memory health
+    mem_warn_mb = float(os.getenv("MEM_LOG_WARN_MB", "25"))
+    mem_cap_mb = float(os.getenv("MEM_LOG_CAP_MB", "200"))
+    mem_fail_on_bloat = _env_bool("MEM_FAIL_ON_BLOAT", "false")
+
+    mem_max_age = float(os.getenv("MEM_MAX_SNAPSHOT_AGE_SEC", "3600"))
+    mem_max_count = int(os.getenv("MEM_MAX_COUNT", "50000"))
+
+    mem_snapshot_mb = _file_size_mb(MEMORY_SNAPSHOT)
+    mem_records_mb = _file_size_mb(MEMORY_RECORDS)
+
+    mem_meta = _read_memory_snapshot_meta()
+    mem_failures = []
+    mem_bloat = []
+
+    print("\n--- AI MEMORY CHECK ---")
+    print(f"memory_snapshot.json age: {fmt_age(mem_meta.get('age_sec'))}  size: {fmt_mb(mem_snapshot_mb)}  parse_ok: {mem_meta.get('parse_ok')}")
+    print(f"memory_records.jsonl size: {fmt_mb(mem_records_mb)}")
+    print(f"memory_count: {mem_meta.get('count')}  sample_key: {mem_meta.get('sample_key')}")
+    print(f"policy: max_age<{mem_max_age:.0f}s max_count<={mem_max_count} warn>{mem_warn_mb:.0f}MB cap>{mem_cap_mb:.0f}MB fail_on_bloat={mem_fail_on_bloat}")
+
+    if not bool(mem_meta.get("exists")):
+        mem_failures.append("memory_snapshot missing")
+    else:
+        if not bool(mem_meta.get("parse_ok")):
+            mem_failures.append("memory_snapshot parse failed (invalid JSON?)")
+        age_sec = mem_meta.get("age_sec")
+        if age_sec is None or float(age_sec) > mem_max_age:
+            mem_failures.append(f"memory_snapshot stale ({fmt_age(age_sec)} > {mem_max_age}s)")
+        cnt = mem_meta.get("count")
+        if cnt is None:
+            mem_failures.append("memory_count missing (parse?)")
+        else:
+            try:
+                if int(cnt) > mem_max_count:
+                    mem_bloat.append(f"memory_count too high ({cnt} > {mem_max_count})")
+            except Exception:
+                mem_failures.append("memory_count not int")
+
+    def check_mem_size(size_mb: Optional[float], label: str) -> None:
+        if size_mb is None:
+            return
+        if size_mb >= mem_warn_mb:
+            print(f"WARNING: {label} is large ({size_mb:.2f} MB).")
+        if size_mb >= mem_cap_mb:
+            mem_bloat.append(f"{label} exceeds cap ({size_mb:.2f} MB >= {mem_cap_mb:.2f} MB)")
+
+    check_mem_size(mem_snapshot_mb, "memory_snapshot.json")
+    check_mem_size(mem_records_mb, "memory_records.jsonl")
+
+    # -------------------------
+    # AI Decisions Health (Phase 4)
+    # -------------------------
+    dec_warn_mb = float(os.getenv("AI_DECISIONS_WARN_MB", "10"))
+    dec_cap_mb = float(os.getenv("AI_DECISIONS_CAP_MB", "50"))
+    dec_fail_on_bloat = _env_bool("AI_DECISIONS_FAIL_ON_BLOAT", "false")
+
+    dec_max_age = float(os.getenv("AI_DECISIONS_MAX_AGE_SEC", "3600"))  # 1 hour
+    dec_size_mb = _file_size_mb(AI_DECISIONS_JSONL)
+    dec_age = _file_age_sec(AI_DECISIONS_JSONL)
+
+    dec_tail_ok, dec_tail_err, dec_last = _tail_last_jsonl_line(AI_DECISIONS_JSONL)
+    dec_valid_ok = False
+    dec_valid_reason = "missing"
+    dec_valid_errs = None
+
+    if dec_tail_ok and isinstance(dec_last, dict):
+        dec_valid_ok, dec_valid_reason, dec_valid_errs = _validate_decision_obj(dec_last)
+
+    dec_failures = []
+    dec_bloat = []
+
+    print("\n--- AI DECISIONS CHECK ---")
+    print(f"ai_decisions.jsonl age: {fmt_age(dec_age)}  size: {fmt_mb(dec_size_mb)}")
+    print(f"tail_parse_ok: {dec_tail_ok}  tail_error: {dec_tail_err}")
+    print(f"schema_valid: {dec_valid_ok}  reason: {dec_valid_reason}")
+
+    if not AI_DECISIONS_JSONL.exists():
+        dec_failures.append("ai_decisions.jsonl missing")
+    else:
+        if dec_age is None or float(dec_age) > dec_max_age:
+            dec_failures.append(f"ai_decisions stale ({fmt_age(dec_age)} > {dec_max_age}s)")
+        if not dec_tail_ok:
+            dec_failures.append(f"ai_decisions tail parse failed ({dec_tail_err})")
+        elif not dec_valid_ok:
+            dec_failures.append(f"ai_decisions invalid schema ({dec_valid_reason}:{dec_valid_errs})")
+
+        if dec_size_mb is not None:
+            if dec_size_mb >= dec_warn_mb:
+                print(f"WARNING: ai_decisions.jsonl is large ({dec_size_mb:.2f} MB).")
+            if dec_size_mb >= dec_cap_mb:
+                dec_bloat.append(f"ai_decisions.jsonl exceeds cap ({dec_size_mb:.2f} MB >= {dec_cap_mb:.2f} MB)")
+
+    # Overall OK?
+    ok = (
+        len(failures) == 0
+        and not (bloat_issues and fail_on_bloat)
+        and len(mem_failures) == 0
+        and not (mem_bloat and mem_fail_on_bloat)
+        and len(dec_failures) == 0
+        and not (dec_bloat and dec_fail_on_bloat)
+    )
+
+    # ops_snapshot write
+    _write_ops(
+        account_label=account_label,
+        ok=ok,
+        details={
+            "ages_sec": {"positions": pos_age, "orderbook": ob_age, "trades": tr_age, "heartbeat": hb_age},
+            "thresholds_sec": {"max_pos": max_pos, "max_ob": max_ob, "max_tr": max_tr, "max_hb": max_hb},
+            "log_sizes_mb": {"public_trades": pub_mb, "ws_executions": exe_mb},
+            "log_policy": {"warn_mb": warn_mb, "cap_mb": cap_mb, "keep": keep_n, "auto_rotate": auto_rotate, "fail_on_bloat": fail_on_bloat},
+            "rotations": rotations,
+            "failures": failures,
+            "bloat_issues": bloat_issues,
+            "ai_memory": {
+                "snapshot_age_sec": mem_meta.get("age_sec"),
+                "snapshot_size_mb": mem_snapshot_mb,
+                "records_size_mb": mem_records_mb,
+                "parse_ok": mem_meta.get("parse_ok"),
+                "count": mem_meta.get("count"),
+                "sample_key": mem_meta.get("sample_key"),
+                "policy": {
+                    "max_age_sec": mem_max_age,
+                    "max_count": mem_max_count,
+                    "warn_mb": mem_warn_mb,
+                    "cap_mb": mem_cap_mb,
+                    "fail_on_bloat": mem_fail_on_bloat,
+                },
+                "failures": mem_failures,
+                "bloat": mem_bloat,
+            },
+            "ai_decisions": {
+                "exists": AI_DECISIONS_JSONL.exists(),
+                "age_sec": dec_age,
+                "size_mb": dec_size_mb,
+                "tail_parse_ok": dec_tail_ok,
+                "tail_error": dec_tail_err,
+                "schema_valid": dec_valid_ok,
+                "schema_reason": dec_valid_reason,
+                "schema_errs": dec_valid_errs,
+                "policy": {
+                    "max_age_sec": dec_max_age,
+                    "warn_mb": dec_warn_mb,
+                    "cap_mb": dec_cap_mb,
+                    "fail_on_bloat": dec_fail_on_bloat,
+                },
+                "failures": dec_failures,
+                "bloat": dec_bloat,
+            },
+        },
+    )
+
+    # Print failures
     if failures:
         print("\nFAIL:")
         for f in failures:
             print(f" - {f}")
         return 2
+
+    if bloat_issues and fail_on_bloat:
+        print("\nFAIL (LOG BLOAT):")
+        for b in bloat_issues:
+            print(f" - {b}")
+        return 3
+
+    if mem_failures:
+        print("\nFAIL (AI MEMORY):")
+        for f in mem_failures:
+            print(f" - {f}")
+        return 4
+
+    if mem_bloat and mem_fail_on_bloat:
+        print("\nFAIL (AI MEMORY BLOAT):")
+        for b in mem_bloat:
+            print(f" - {b}")
+        return 5
+
+    if dec_failures:
+        print("\nFAIL (AI DECISIONS):")
+        for f in dec_failures:
+            print(f" - {f}")
+        return 6
+
+    if dec_bloat and dec_fail_on_bloat:
+        print("\nFAIL (AI DECISIONS BLOAT):")
+        for b in dec_bloat:
+            print(f" - {b}")
+        return 7
 
     print("\nPASS ✅")
     return 0

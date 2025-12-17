@@ -63,7 +63,7 @@ from __future__ import annotations
 
 import math
 import sys
-from collections import Counter, defaultdict
+from collections import Counter
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 

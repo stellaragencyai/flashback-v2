@@ -135,6 +135,77 @@ STRAT_SWING_H1 = StrategyProfile(
     tags=["swing", "trend"],
 )
 
+STRAT_HFT_MM = StrategyProfile(
+    id="HFT_MM",
+    name="HFT Market Maker",
+    description="High-frequency market making on BTCUSDT & ETHUSDT",
+    preferred_sub_uid="flashback05",
+    symbols=["BTCUSDT", "ETHUSDT"],
+    timeframes=["1m"],
+    bias_timeframe="5m",
+    risk_pct_per_trade=0.05,
+    max_positions=3,
+    max_notional_pct_per_position=3.0,
+    exit_profile="SCALP_3",
+    automation_mode="PAPER",
+    regime=RegimeFilter(min_adx=0.0, max_atr_pct=6.0),
+    tags=["hft", "market_maker"],
+)
+
+STRAT_SPECULATIVE = StrategyProfile(
+    id="SPECULATIVE",
+    name="Speculative Microcap",
+    description="Microcap/speculative plays at short timeframes",
+    preferred_sub_uid="flashback06",
+    symbols=["FARTCOINUSDT", "PUMPFUNUSDT", "HBARUSDT"],
+    timeframes=["1m", "5m"],
+    bias_timeframe="15m",
+    risk_pct_per_trade=0.10,
+    max_positions=1,
+    max_notional_pct_per_position=2.0,
+    exit_profile="STANDARD_5",
+    automation_mode="PAPER",
+    regime=RegimeFilter(min_adx=0.0, max_atr_pct=6.0),
+    tags=["microcap", "speculative"],
+)
+
+STRAT_SWING_MULTI = StrategyProfile(
+    id="SWING_MULTI",
+    name="Swing Multi-Asset",
+    description="Swing logic across a larger asset universe",
+    preferred_sub_uid="flashback08",
+    symbols=[
+        "BTCUSDT","ETHUSDT","SOLUSDT","XRPUSDT","ADAUSDT",
+        "LINKUSDT","INJUSDT","OPUSDT","AVAXUSDT","MATICUSDT",
+        "NEARUSDT","ARBUSDT","HBARUSDT",
+    ],
+    timeframes=["30m", "240m"],
+    bias_timeframe="4h",
+    risk_pct_per_trade=0.10,
+    max_positions=3,
+    max_notional_pct_per_position=4.0,
+    exit_profile="STANDARD_5",
+    automation_mode="PAPER",
+    regime=RegimeFilter(min_adx=12.0, max_atr_pct=8.0),
+    tags=["swing","multi_asset"],
+)
+STRAT_RANGE_INTRADAY = StrategyProfile(
+    id="RANGE_INTRADAY",
+    name="Range Intraday Fade",
+    description="Intraday range and failed-breakout fading",
+    preferred_sub_uid="flashback09",
+    symbols=["BTCUSDT","ETHUSDT","XRPUSDT","ADAUSDT","LINKUSDT","DOGEUSDT"],
+    timeframes=["5m","15m"],
+    bias_timeframe="1h",
+    risk_pct_per_trade=0.10,
+    max_positions=2,
+    max_notional_pct_per_position=3.0,
+    exit_profile="STANDARD_5",
+    automation_mode="PAPER",
+    regime=RegimeFilter(min_adx=0.0, max_atr_pct=5.0),
+    tags=["range","mean_reversion","intraday"],
+)
+
 # Placeholder profiles for other subs we’ll refine later
 STRAT_SCALP_M1 = StrategyProfile(
     id="SCALP_M1",
@@ -190,6 +261,10 @@ STRATEGIES: Dict[str, StrategyProfile] = {
         STRAT_SWING_H1,
         STRAT_SCALP_M1,
         STRAT_RANGE_M15,
+        STRAT_HFT_MM,
+        STRAT_SPECULATIVE,
+        STRAT_SWING_MULTI,
+        STRAT_RANGE_INTRADAY,
     ]
 }
 
@@ -201,6 +276,10 @@ SUBACCOUNT_STRATEGY: Dict[str, str] = {
     "flashback03": "SCALP_M1",
     "flashback04": "RANGE_M15",
     "flashback07": "CANARY_TREND_M5",  # AI sandbox / canary
+    "flashback05": "HFT_MM",
+    "flashback06": "SPECULATIVE",
+    "flashback08": "SWING_MULTI",
+    "flashback09": "RANGE_INTRADAY",
     # others can be added later (flashback05, 06, 08, 09, 10)
 }
 

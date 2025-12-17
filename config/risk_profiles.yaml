@@ -1,38 +1,78 @@
 # config/risk_profiles.yaml
-version: 1
+#
+# Flashback — Risk Profiles (v2, Phase-5 aligned)
+#
+# Purpose:
+#   - Provide portfolio-safe default envelopes by horizon/role.
+#   - Keep leverage/risk sane and consistent with Phase-5 strategy roles.
+#   - Manual profiles exist, but automation must still respect automation_mode=OFF.
+
+version: 2
 notes: |
-  Minimal starter risk profiles so config validator passes.
-  Tune later.
+  v2:
+    - Phase-5 aligned envelopes:
+        * intraday_fast: higher leverage, tight risk caps
+        * midterm_core : moderate leverage
+        * swing_position: low leverage, wider horizons
+        * canary_low_risk: smallest risk, safest leverage
+        * hft_mm: microstructure profile
+        * spec_intraday: volatile microcap/spec profile
+        * manual_only: explicit manual flag
+        * main_manual_exits_only: executor must not trade main (OFF), but exits may use profile constraints
 
 profiles:
-  main_manual:
-    risk_pct: 0.25
+  # --------------------------------------------------------
+  # MAIN — Manual entries, system-managed exits only
+  # --------------------------------------------------------
+  main_manual_exits_only:
+    risk_pct: 0.01
     max_concurrent_positions: 1
     max_leverage: 75
     allow_cross: true
     allow_isolated: true
+    manual_only: true
 
-  default_sub:
-    risk_pct: 0.25
-    max_concurrent_positions: 1
+  # --------------------------------------------------------
+  # Intraday (1m–5m signals, flat/short holds)
+  # --------------------------------------------------------
+  intraday_fast:
+    risk_pct: 0.10
+    max_concurrent_positions: 2
     max_leverage: 50
     allow_cross: true
     allow_isolated: true
 
-  hft_mm:
+  # Spec intraday (volatile names, single position)
+  spec_intraday:
     risk_pct: 0.10
-    max_concurrent_positions: 3
-    max_leverage: 25
-    allow_cross: true
-    allow_isolated: true
-
-  spec_small:
-    risk_pct: 0.15
     max_concurrent_positions: 1
     max_leverage: 75
     allow_cross: true
     allow_isolated: true
 
+  # --------------------------------------------------------
+  # Mid-term (15m–1h signals, hours to ~2 days)
+  # --------------------------------------------------------
+  midterm_core:
+    risk_pct: 0.10
+    max_concurrent_positions: 2
+    max_leverage: 25
+    allow_cross: true
+    allow_isolated: true
+
+  # --------------------------------------------------------
+  # Swing / Position (4h–1D signals, days+ holds)
+  # --------------------------------------------------------
+  swing_position:
+    risk_pct: 0.10
+    max_concurrent_positions: 1
+    max_leverage: 10
+    allow_cross: true
+    allow_isolated: true
+
+  # --------------------------------------------------------
+  # Canary (smallest risk, safest envelope)
+  # --------------------------------------------------------
   canary_low_risk:
     risk_pct: 0.05
     max_concurrent_positions: 1
@@ -40,16 +80,22 @@ profiles:
     allow_cross: true
     allow_isolated: true
 
-  swing_default:
-    risk_pct: 0.20
-    max_concurrent_positions: 1
-    max_leverage: 10
+  # --------------------------------------------------------
+  # HFT / Market Making (microstructure)
+  # --------------------------------------------------------
+  hft_mm:
+    risk_pct: 0.05
+    max_concurrent_positions: 3
+    max_leverage: 25
     allow_cross: true
     allow_isolated: true
 
+  # --------------------------------------------------------
+  # Manual-only subaccount (hard block for executor)
+  # --------------------------------------------------------
   manual_only:
-    risk_pct: 0.25
-    max_concurrent_positions: 1
+    risk_pct: 0.01
+    max_concurrent_positions: 0
     max_leverage: 75
     allow_cross: true
     allow_isolated: true

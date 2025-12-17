@@ -29,6 +29,11 @@ Snapshot v2 additions
 - schema_version = 2
 - freshness block + safety block (is_safe + reasons)
 - stable return type (dict, not tuple)
+
+PATCH (2025-12-14)
+------------------
+- If include_trades=False, DO NOT enforce trades_bus staleness.
+  Otherwise AI Pilot gets blocked even though it doesn't request trades.
 """
 
 from __future__ import annotations
@@ -286,6 +291,7 @@ def _evaluate_snapshot_safety(
             f"orderbook_bus_stale ({orderbook_bus_age_sec:.2f}s > {_OB_MAX_AGE_SEC:.2f}s)"
         )
 
+    # NOTE: If trades_bus_age_sec is None, we treat it as "not required".
     if trades_bus_age_sec is not None and trades_bus_age_sec > _TR_MAX_AGE_SEC:
         is_safe = False
         reasons.append(
@@ -371,9 +377,12 @@ def build_symbol_state(
         trades_limit=trades_limit,
     )
 
-    # Bus ages / safety, same semantics as global snapshot
     pos_age_sec = _to_float(positions.get("snapshot_age_sec"))
+
+    # PATCH: only require trades bus freshness if include_trades=True
     ob_age_sec, tr_age_sec = _market_bus_ages()
+    if not include_trades:
+        tr_age_sec = None
 
     freshness = {
         "positions_bus_age_sec": pos_age_sec,
@@ -425,7 +434,11 @@ def build_ai_snapshot(
     positions = _positions_state()
 
     pos_age_sec = _to_float(positions.get("snapshot_age_sec"))
+
+    # PATCH: only require trades bus freshness if include_trades=True
     ob_age_sec, tr_age_sec = _market_bus_ages()
+    if not include_trades:
+        tr_age_sec = None
 
     # Determine which symbols to include in market view
     symbols_set = set()

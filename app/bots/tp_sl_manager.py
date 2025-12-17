@@ -1,16 +1,18 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Flashback — TP/SL Manager v6.12 (strategy API compatible, safer defaults)
+Flashback — TP/SL Manager v6.16 (PAPER ledger overlay + trade_id-linked TP orderLinkIds + Phase4 decision gate hardened + CONSOLE PROOF)
 
-Patched (Step 2):
-- Position bus is now called with explicit label=ACCOUNT_LABEL (no more label=None).
-- max_age_seconds now respects TPM_BUS_MAX_AGE_SEC for deterministic BUS vs REST behavior.
+v6.15 Patch (PAPER positions visibility):
+- tp_sl_manager can now "see" PAPER positions opened by PaperBroker by reading:
+    state/paper/<ACCOUNT_LABEL>.json
+- Converts paper open_positions into position dicts compatible with _ensure_exits_for_position()
+- Merges PAPER positions into the positions list returned by position_bus/REST
 
-Keeps:
-- Strategy API compatibility: supports get_strategy_for_sub OR get_strategy_by_sub_uid
-- Safer default exit profile = standard_5 (avoids phantom standard_7)
-- Your telemetry + stable sizing logic
+v6.16 Patch (Phase 4 Step 3 proof):
+- When AI gate blocks TP/SL actions, we print a deterministic CONSOLE line:
+    [tp_sl_manager] 🚫 GATE_BLOCKED symbol=... trade_id=... reason=...
+  This is in addition to alert_bot_error() + Telegram.
 """
 
 import os
@@ -41,6 +43,21 @@ from app.core.flashback_common import (
 )
 
 from app.core.position_bus import get_positions_snapshot as bus_get_positions_snapshot
+
+# -------------------------
+# Phase 4: AI decision enforcement (optional)
+# -------------------------
+try:
+    from app.ai.ai_decision_enforcer import enforce_decision  # type: ignore
+except Exception:
+    enforce_decision = None  # type: ignore
+
+# Throttle gate block noise (symbol -> last_notice_ts)
+_GATE_BLOCK_THROTTLE_SEC = float(os.getenv("TPM_GATE_BLOCK_THROTTLE_SEC", "30"))
+_GATE_BLOCK_LAST: Dict[str, float] = {}
+
+# Deterministic PAPER test override (useful for Step 3 proof)
+_TPM_FORCE_TRADE_ID = os.getenv("TPM_FORCE_TRADE_ID", "").strip()
 
 try:
     import websocket  # type: ignore
@@ -97,13 +114,17 @@ _LAST_SET_SL: Dict[str, Decimal] = {}
 _EXIT_CACHE_TTL = int(os.getenv("TPM_EXIT_CACHE_SEC", "30"))
 _EXIT_CACHE: Dict[str, Any] = {"ts": 0.0, "profiles": {}}
 
-# SAFER: your strategies.yaml and validator are standard_5 / standard_10 driven.
 DEFAULT_EXIT_PROFILE_NAME = os.getenv("TPM_DEFAULT_EXIT_PROFILE", "standard_5").strip() or "standard_5"
 
 TPM_STATUS_EVERY_SEC = int(os.getenv("TPM_STATUS_EVERY_SEC", "10"))
 TPM_VERBOSE_STATUS = os.getenv("TPM_VERBOSE_STATUS", "true").strip().lower() == "true"
 
 POSITIONS_BUS_PATH_ENV = os.getenv("POSITIONS_BUS_PATH", "")  # optional override
+
+# ---- Phase 3 Step 1: infer parent trade_id from executions ----
+_TRADE_ID_CACHE_TTL = int(os.getenv("TPM_TRADE_ID_CACHE_SEC", "30"))
+_EXEC_LOOKBACK_LIMIT = int(os.getenv("TPM_EXEC_LOOKBACK_LIMIT", "80"))
+_TRADE_ID_CACHE: Dict[str, Tuple[float, str]] = {}  # symbol -> (ts, trade_id)
 
 
 def _project_root() -> Path:
@@ -138,6 +159,7 @@ def _cred_presence_snapshot() -> Dict[str, str]:
         "TG_BOT_TOKEN": "***" if os.getenv("TG_BOT_TOKEN") else "(missing)",
         "TG_CHAT_ID": "***" if os.getenv("TG_CHAT_ID") else "(missing)",
         "BYBIT_WS_PRIVATE_URL": os.getenv("BYBIT_WS_PRIVATE_URL", BYBIT_WS_PRIVATE_URL),
+        "TPM_FORCE_TRADE_ID": _TPM_FORCE_TRADE_ID or "(none)",
     }
 
 
@@ -155,7 +177,7 @@ def _print_boot_banner(mode: str, label: str) -> None:
 
     print("\n" + "=" * 80)
     print("[tp_sl_manager] BOOT")
-    print("  version               : v6.12 + step2_label_aware_bus")
+    print("  version               : v6.16 + paper_overlay + phase3_trade_id_linked_tps + phase4_gate_hardened + console_proof")
     print(f"  ACCOUNT_LABEL         : {label}")
     print(f"  CATEGORY              : {CATEGORY}")
     print(f"  MODE                  : {mode}")
@@ -164,6 +186,8 @@ def _print_boot_banner(mode: str, label: str) -> None:
     print(f"  TRAILING_ENABLED      : {TRAILING_ENABLED}")
     print(f"  TPM_RESPECT_MANUAL_TPS: {_RESPECT_MANUAL_TPS}")
     print(f"  DEFAULT_EXIT_PROFILE  : {DEFAULT_EXIT_PROFILE_NAME}")
+    print(f"  TPM_TRADE_ID_CACHE_SEC: {_TRADE_ID_CACHE_TTL}")
+    print(f"  TPM_EXEC_LOOKBACK_LIMIT: {_EXEC_LOOKBACK_LIMIT}")
     print(f"  positions_bus.json    : {pos_path}")
     print(f"  ws_switchboard hb     : {hb_path}")
     print("  creds (sanitized)     :")
@@ -187,6 +211,263 @@ def _infer_position_source(label: str, bus_max_age_sec: Optional[float]) -> Tupl
         return "BUS_WS", pos_age, hb_age
 
     return "REST_FALLBACK(likely)", pos_age, hb_age
+
+
+# ---------------------------------------------------------------------------
+# PAPER overlay: read PaperBroker ledger into tp_sl_manager "positions" format
+# ---------------------------------------------------------------------------
+
+def _paper_ledger_path(account_label: str) -> Path:
+    return _project_root() / "state" / "paper" / f"{account_label}.json"
+
+
+def _paper_side_to_bus(side: Any) -> Optional[str]:
+    s = str(side or "").strip().lower()
+    if s in ("long", "buy"):
+        return "buy"
+    if s in ("short", "sell"):
+        return "sell"
+    return None
+
+
+def _load_paper_positions(account_label: str) -> List[dict]:
+    """
+    Load PAPER open_positions for this ACCOUNT_LABEL from:
+      state/paper/<account_label>.json
+
+    Returns a list of dicts shaped like the bus positions expected by _ensure_exits_for_position().
+    """
+    path = _paper_ledger_path(account_label)
+    if not path.exists():
+        return []
+
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8", errors="ignore") or "{}")
+    except Exception:
+        return []
+
+    open_positions = raw.get("open_positions") or []
+    if not isinstance(open_positions, list):
+        return []
+
+    out: List[dict] = []
+    for pos in open_positions:
+        if not isinstance(pos, dict):
+            continue
+
+        symbol = pos.get("symbol")
+        side = _paper_side_to_bus(pos.get("side"))
+        entry = pos.get("entry_price")
+        size = pos.get("size")
+        sl = pos.get("stop_price")
+        trade_id = pos.get("trade_id")
+
+        if not symbol or not side or entry in (None, "", 0, "0") or size in (None, "", 0, "0"):
+            continue
+
+        out.append(
+            {
+                "symbol": str(symbol),
+                "side": str(side),
+                "avgPrice": str(entry),
+                "size": str(size),
+                "stopLoss": str(sl) if sl not in (None, "", 0, "0") else None,
+                "mode": "PAPER",
+                "account_label": str(account_label),
+                "trade_id": str(trade_id) if trade_id else None,
+                "timeframe": pos.get("timeframe"),
+                "setup_type": pos.get("setup_type"),
+            }
+        )
+
+    return out
+
+
+def _merge_positions(bus_positions: List[dict], paper_positions: List[dict]) -> List[dict]:
+    """
+    Merge lists without duplicating exact same trade_id records.
+    If trade_id is missing, fall back to (symbol, side, avgPrice, size, account_label).
+    """
+    out: List[dict] = []
+    seen: set = set()
+
+    def key(p: dict) -> tuple:
+        tid = p.get("trade_id") or p.get("client_trade_id")
+        if tid:
+            return ("trade_id", str(tid))
+        return (
+            "fallback",
+            str(p.get("account_label") or ""),
+            str(p.get("symbol") or ""),
+            str(p.get("side") or ""),
+            str(p.get("avgPrice") or ""),
+            str(p.get("size") or ""),
+        )
+
+    for p in (bus_positions or []):
+        if not isinstance(p, dict):
+            continue
+        k = key(p)
+        if k in seen:
+            continue
+        seen.add(k)
+        out.append(p)
+
+    for p in (paper_positions or []):
+        if not isinstance(p, dict):
+            continue
+        k = key(p)
+        if k in seen:
+            continue
+        seen.add(k)
+        out.append(p)
+
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Phase 4: Trade ID extraction (PAPER-friendly)
+# ---------------------------------------------------------------------------
+
+def _extract_trade_id_from_position(p: dict) -> Optional[str]:
+    if not isinstance(p, dict):
+        return None
+
+    candidates = [
+        "trade_id",
+        "client_trade_id",
+        "parent_trade_id",
+        "entry_trade_id",
+        "entry_order_link_id",
+        "orderLinkId",
+        "order_link_id",
+        "entryOrderLinkId",
+    ]
+
+    for k in candidates:
+        v = p.get(k)
+        if v is None:
+            continue
+        s = str(v).strip()
+        if s and s.lower() not in ("none", "null", "0"):
+            return s
+
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Phase 3: Trade ID inference (parent link from executions) - LIVE
+# ---------------------------------------------------------------------------
+
+def _is_truthy(v: Any) -> bool:
+    return str(v).strip().lower() in ("1", "true", "yes", "y", "on")
+
+
+def _side_to_bybit(side_now: str) -> str:
+    return "Buy" if side_now.lower() == "buy" else "Sell"
+
+
+def _infer_trade_id_from_executions(symbol: str, side_now: str) -> Optional[str]:
+    now = time.time()
+    cached = _TRADE_ID_CACHE.get(symbol)
+    if cached is not None:
+        ts, tid = cached
+        if (now - ts) < _TRADE_ID_CACHE_TTL and tid:
+            return tid
+
+    try:
+        res = bybit_get("/v5/execution/list", {"category": CATEGORY, "symbol": symbol, "limit": str(_EXEC_LOOKBACK_LIMIT)})
+        rows = res.get("result", {}).get("list", []) or []
+    except Exception as e:
+        alert_bot_error("tp_sl_manager", f"{symbol} execution lookup failed: {e}", "WARN")
+        return None
+
+    want_side = _side_to_bybit(side_now)
+    best_tid: Optional[str] = None
+    best_ts: int = -1
+
+    for ex in rows:
+        try:
+            ex_side = ex.get("side")
+            if ex_side != want_side:
+                continue
+
+            ro = ex.get("reduceOnly")
+            if ro is not None and _is_truthy(ro):
+                continue
+
+            lid = str(ex.get("orderLinkId") or "").strip()
+            if not lid:
+                continue
+
+            ts_raw = ex.get("execTime") or ex.get("execTimestamp") or ex.get("time") or "0"
+            try:
+                ts_i = int(str(ts_raw))
+            except Exception:
+                ts_i = 0
+
+            if ts_i > best_ts:
+                best_ts = ts_i
+                best_tid = lid
+        except Exception:
+            continue
+
+    if best_tid:
+        _TRADE_ID_CACHE[symbol] = (now, best_tid)
+        return best_tid
+
+    return None
+
+
+def _tp_link_id(trade_id: str, idx: int) -> str:
+    return f"{trade_id}:TP{idx}"
+
+
+# ---------------------------------------------------------------------------
+# Phase 4: Gate helper (skip TP/SL sync if blocked)
+# ---------------------------------------------------------------------------
+
+def _gate_allows_trade(symbol: str, trade_id: Optional[str]) -> Tuple[bool, str]:
+    if enforce_decision is None:
+        return True, "enforcer_missing"
+    if not trade_id:
+        return True, "no_trade_id"
+
+    try:
+        verdict = enforce_decision(str(trade_id))
+    except Exception as e:
+        # Fail-open: do not brick exits on tooling error
+        return True, f"enforcer_error:{e}"
+
+    allow = bool(verdict.get("allow", False))
+    reason = str(verdict.get("reason") or verdict.get("decision_code") or "blocked").strip()
+
+    if allow:
+        return True, reason
+
+    now = time.time()
+    last = float(_GATE_BLOCK_LAST.get(symbol, 0.0) or 0.0)
+    if (now - last) >= _GATE_BLOCK_THROTTLE_SEC:
+        _GATE_BLOCK_LAST[symbol] = now
+
+        # ✅ Deterministic console proof (this is what you were missing)
+        print(
+            f"[tp_sl_manager] 🚫 GATE_BLOCKED symbol={symbol} trade_id={trade_id} reason={reason}",
+            flush=True,
+        )
+
+        # Existing telemetry
+        alert_bot_error(
+            "tp_sl_manager",
+            f"🚫 Gate blocked TP/SL sync for {symbol} trade_id={trade_id} reason={reason}",
+            "WARN",
+        )
+        try:
+            send_tg(f"🚫 AI gate blocked TP/SL sync for {symbol} (trade_id={trade_id}) reason={reason}")
+        except Exception:
+            pass
+
+    return False, reason
 
 
 # ---------------------------------------------------------------------------
@@ -596,7 +877,15 @@ def _split_qty_by_pcts(size: Decimal, pcts: List[Decimal], step: Decimal) -> Lis
     return qtys
 
 
-def _sync_tp_ladder(symbol: str, side_now: str, size: Decimal, target_tps: List[Decimal], target_qtys: List[Decimal]) -> None:
+def _resolve_trade_id(symbol: str, side_now: str, position_trade_id: Optional[str]) -> Optional[str]:
+    if _TPM_FORCE_TRADE_ID:
+        return _TPM_FORCE_TRADE_ID
+    if position_trade_id:
+        return position_trade_id
+    return _infer_trade_id_from_executions(symbol, side_now)
+
+
+def _sync_tp_ladder(symbol: str, side_now: str, size: Decimal, target_tps: List[Decimal], target_qtys: List[Decimal], position_trade_id: Optional[str]) -> None:
     tick, step, _ = get_ticks(symbol)
 
     pairs = [(px, q) for px, q in zip(target_tps, target_qtys) if q > 0]
@@ -609,6 +898,13 @@ def _sync_tp_ladder(symbol: str, side_now: str, size: Decimal, target_tps: List[
     orders_all = _open_orders(symbol)
     tpo = _tp_orders(orders_all, side_now)
 
+    trade_id = _resolve_trade_id(symbol, side_now, position_trade_id)
+
+    
+    allow, _reason = _gate_allows_trade(symbol, trade_id)
+    if not allow:
+        return
+
     if not tpo:
         _MANUAL_TP_MODE.pop(symbol, None)
         if tps:
@@ -616,9 +912,10 @@ def _sync_tp_ladder(symbol: str, side_now: str, size: Decimal, target_tps: List[
             delta = base_safe - tps[0]
             tps = [psnap(px + delta, tick) for px in tps]
 
-        for px, q in zip(tps, qtys):
+        for idx, (px, q) in enumerate(zip(tps, qtys), start=1):
             try:
-                place_reduce_tp(symbol, side_now, q, px)
+                lid = _tp_link_id(trade_id, idx) if trade_id else None
+                place_reduce_tp(symbol, side_now, q, px, link_id=lid)
             except Exception as e:
                 alert_bot_error("tp_sl_manager", f"{symbol} TP create error: {e}", "WARN")
         return
@@ -678,9 +975,10 @@ def _sync_tp_ladder(symbol: str, side_now: str, size: Decimal, target_tps: List[
             _cancel_tp_order(symbol, o)
 
     if len(tps) > len(tpo_sorted):
-        for px, q in zip(tps[len(tpo_sorted):], qtys[len(tpo_sorted):]):
+        for idx, (px, q) in enumerate(zip(tps[len(tpo_sorted):], qtys[len(tpo_sorted):]), start=len(tpo_sorted) + 1):
             try:
-                place_reduce_tp(symbol, side_now, q, px)
+                lid = _tp_link_id(trade_id, idx) if trade_id else None
+                place_reduce_tp(symbol, side_now, q, px, link_id=lid)
             except Exception as e:
                 alert_bot_error("tp_sl_manager", f"{symbol} TP create (extra rung) error: {e}", "WARN")
 
@@ -697,6 +995,13 @@ def _ensure_exits_for_position(p: dict, seen_state: Dict[str, Tuple[Decimal, Dec
         _MANUAL_SL_MODE.pop(symbol, None)
         _TRAIL_STATE.pop(symbol, None)
         _LAST_SET_SL.pop(symbol, None)
+        return
+
+    position_trade_id = _extract_trade_id_from_position(p)
+    trade_id = _resolve_trade_id(symbol, side_now, position_trade_id)
+
+    allow, _reason = _gate_allows_trade(symbol, trade_id)
+    if not allow:
         return
 
     profile_name = _get_exit_profile_name_for_position(p)
@@ -740,7 +1045,7 @@ def _ensure_exits_for_position(p: dict, seen_state: Dict[str, Tuple[Decimal, Dec
             set_stop_loss(symbol, sl_effective)
             _LAST_SET_SL[symbol] = sl_effective
 
-    _sync_tp_ladder(symbol, side_now, size, tp_prices, tp_qtys)
+    _sync_tp_ladder(symbol, side_now, size, tp_prices, tp_qtys, position_trade_id=position_trade_id)
 
     prev = seen_state.get(symbol)
     state = (entry, size, sl_effective)
@@ -761,10 +1066,10 @@ def _ensure_exits_for_position(p: dict, seen_state: Dict[str, Tuple[Decimal, Dec
 
 def _loop_http_poll() -> None:
     label = os.getenv("ACCOUNT_LABEL", "main").strip() or "main"
-    _print_boot_banner(mode="HTTP + position_bus (with REST fallback)", label=label)
+    _print_boot_banner(mode="HTTP + position_bus (with REST fallback) + PAPER overlay", label=label)
 
     try:
-        send_tg(f"🎛 Flashback TP/SL Manager ONLINE (HTTP+position_bus, label={label}, poll={POLL_SECONDS}s).")
+        send_tg(f"🎛 Flashback TP/SL Manager ONLINE (HTTP+position_bus+PAPER overlay, label={label}, poll={POLL_SECONDS}s).")
     except Exception:
         pass
 
@@ -776,22 +1081,24 @@ def _loop_http_poll() -> None:
     while True:
         record_heartbeat("tp_sl_manager")
         try:
-            # ✅ Step 2: Explicit label routing (NO more label=None)
-            positions = bus_get_positions_snapshot(
+            bus_positions = bus_get_positions_snapshot(
                 label=label,
                 category=CATEGORY,
                 max_age_seconds=int(BUS_MAX_AGE_SEC),
                 allow_rest_fallback=True,
             )
 
+            paper_positions = _load_paper_positions(label)
+            positions = _merge_positions(bus_positions, paper_positions)
+
             now = time.time()
             if TPM_VERBOSE_STATUS and (now - last_status_print) >= TPM_STATUS_EVERY_SEC:
                 src, pos_age, hb_age = _infer_position_source(label, bus_max_age_sec=BUS_MAX_AGE_SEC)
                 print(
-                    f"[tp_sl_manager] status | label={label} | mode=HTTP | source={src} | "
+                    f"[tp_sl_manager] status | label={label} | mode=HTTP | source={src}+PAPER | "
                     f"positions_bus_age={('MISSING' if pos_age is None else f'{pos_age:.2f}s')} | "
                     f"ws_hb_age={('MISSING' if hb_age is None else f'{hb_age:.2f}s')} | "
-                    f"positions={len(positions)}"
+                    f"positions={len(positions)} (bus={len(bus_positions)}, paper={len(paper_positions)})"
                 )
                 last_status_print = now
 
@@ -853,6 +1160,7 @@ def _handle_ws_position_message(msg: dict, seen: Dict[str, Tuple[Decimal, Decima
             "size": p.get("size"),
             "stopLoss": p.get("stopLoss") or p.get("stopLossPrice") or p.get("slPrice"),
             "sub_uid": p.get("sub_uid") or p.get("subAccountId") or p.get("accountId") or p.get("subId"),
+            "trade_id": p.get("trade_id") or p.get("client_trade_id") or p.get("orderLinkId") or p.get("entry_order_link_id"),
         }
         _ensure_exits_for_position(norm, seen_state=seen)
 

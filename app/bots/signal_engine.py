@@ -66,6 +66,170 @@ except Exception:
 
 from dotenv import load_dotenv
 
+# -------------------------------
+# Strategy Setup Logic Dispatch
+# -------------------------------
+
+from typing import Callable, List
+
+from statistics import mean, stdev
+
+def compute_regime_indicators(candles: List[Dict[str, Any]]) -> dict:
+    """
+    Computes basic regime indicators for a list of candles (oldest->newest):
+      - ADX (simple approx trend strength)
+      - ATR % (volatility relative to close)
+      - Volume z-score (relative volume)
+    """
+
+    # Helper for ATR
+    trs = []
+    closes = [c["close"] for c in candles]
+    highs = [c["high"] for c in candles]
+    lows  = [c["low"] for c in candles]
+
+    for i in range(1, len(candles)):
+        tr = max(
+            highs[i] - lows[i],
+            abs(highs[i] - closes[i-1]),
+            abs(lows[i] - closes[i-1]),
+        )
+        trs.append(tr)
+
+    # ATR % = last ATR / last close * 100
+    if trs:
+        atr = mean(trs[-14:])  # approx 14-period ATR
+    else:
+        atr = 0.0
+
+    last_close = closes[-1]
+    atr_pct = (atr / last_close * 100) if last_close else 0.0
+
+    # Rough volume z-score (over last 50)
+    vols = [c["volume"] for c in candles]
+    if len(vols) >= 10:
+        mu = mean(vols)
+        sigma = stdev(vols) if len(vols) > 1 else 1.0
+        vol_z = (vols[-1] - mu) / sigma if sigma != 0 else 0.0
+    else:
+        vol_z = 0.0
+
+    # Rough ADX proxy: absolute slope of close over last N
+    if len(closes) >= 2:
+        diffs = [abs(closes[i] - closes[i-1]) for i in range(1, len(closes))]
+        adx = mean(diffs[-14:]) / last_close * 100 if last_close else 0.0
+    else:
+        adx = 0.0
+
+    return {
+        "adx": adx,
+        "atr_pct": atr_pct,
+        "vol_z": vol_z,
+    }
+
+def passes_regime_filters(strategy_raw: dict, regime_ind: dict) -> bool:
+    """
+    Checks the regime_ind values against the strategy's regime filters
+    if they are defined in the strategy raw dict from YAML.
+    """
+    # Try reading the regime block from the raw strategy config
+    regime_cfg = strategy_raw.get("regime") or {}
+
+    # Default permissive if no regime specified
+    min_adx = regime_cfg.get("min_adx", 0.0)
+    max_atr = regime_cfg.get("max_atr_pct", float("inf"))
+    min_vol_z = regime_cfg.get("min_vol_z", -float("inf"))
+    max_vol_z = regime_cfg.get("max_vol_z", float("inf"))
+
+    # Extract computed indicators
+    adx_val = regime_ind.get("adx", 0.0)
+    atr_val = regime_ind.get("atr_pct", 0.0)
+    vol_val = regime_ind.get("vol_z", 0.0)
+
+    # Check all conditions
+    if adx_val < min_adx:
+        return False
+    if atr_val > max_atr:
+        return False
+    if vol_val < min_vol_z:
+        return False
+    if vol_val > max_vol_z:
+        return False
+
+    return True
+
+
+# Each function returns (side: "LONG"/"SHORT"/None, reason: str)
+
+# Simple helpers for common patterns
+def signal_ma_trend(candles: List[dict]) -> Tuple[Optional[str], str]:
+    """
+    Simple trend-follow logic:
+      - LONG if price closes above recent MA
+      - SHORT if price closes below recent MA
+    """
+    closes = [c["close"] for c in candles]
+    ma = sum(closes[-8:]) / min(len(closes[-8:]), 8)
+    last = candles[-1]["close"]
+    prev = candles[-2]["close"]
+    if last > prev and last > ma:
+        return "LONG", "trend_ma"
+    if last < prev and last < ma:
+        return "SHORT", "trend_ma"
+    return None, "trend_ma_none"
+
+
+def signal_breakout(candles: List[dict]) -> Tuple[Optional[str], str]:
+    """
+    Simple breakout logic:
+      - LONG if latest close is higher than last X highs
+      - SHORT if lower than last X lows
+    """
+    highs = [c["high"] for c in candles[:-1]]
+    lows  = [c["low"]  for c in candles[:-1]]
+    last_close = candles[-1]["close"]
+    if last_close > max(highs):
+        return "LONG", "breakout_high"
+    if last_close < min(lows):
+        return "SHORT", "breakout_low"
+    return None, "breakout_none"
+
+
+# Dispatch mapping
+SETUP_LOGIC: Dict[str, Callable[[List[dict]], Tuple[Optional[str], str]]] = {
+    # Trend setups
+    "trend_pullback": signal_ma_trend,
+    "trend_breakout_retest": signal_breakout,
+    "ema_trend_follow": signal_ma_trend,
+
+    # Breakout setups
+    "breakout_high": signal_breakout,
+    "breakout_range": signal_breakout,
+    "squeeze_release": signal_breakout,
+
+    # Scalp setups
+    "scalp_liquidity_sweep": signal_ma_trend,
+    "scalp_trend_continuation": signal_ma_trend,
+    "scalp_reversal_snapback": signal_breakout,
+
+    # Swing reversion
+    "swing_reversion_extreme": signal_breakout,
+    "swing_reversion_channel": signal_breakout,
+
+    # HFT / micro
+    "mm_spread_capture": signal_ma_trend,
+    "mm_reversion_micro": signal_ma_trend,
+
+    # Microcap speculative
+    "pump_chase_momo": signal_ma_trend,
+    "dump_fade_reversion": signal_ma_trend,
+
+    # Range intraday
+    "intraday_range_fade": signal_breakout,
+    "failed_breakout_fade": signal_breakout,
+}
+
+
 # ---------- Telegram notifier ----------
 
 from app.core.notifier_bot import get_notifier
@@ -533,31 +697,73 @@ def main() -> None:
             # Only act once per bar for this (symbol, timeframe)
             last_ts = last_signal_bar.get(key)
             if last_ts is not None and bar_ts <= last_ts:
-                # Already processed this bar
                 continue
 
-            side, debug = compute_simple_signal(candles)
+            # --- Strategy-aware + regime-filtered signal generation ---
+            regime_ind = compute_regime_indicators(candles)
+
+            side = None
+            reason = ""
+            debug: Dict[str, Any] = {}
+
+            # 1) Try strategy setups with regime gating
+            if strat_list:
+                for strat in strat_list:
+                    raw = strat.get("raw") or {}
+                    setup_types = raw.get("setup_types", []) or []
+                    for setup in setup_types:
+                        logic_fn = SETUP_LOGIC.get(setup)
+                        if not logic_fn:
+                            continue
+                        s, r = logic_fn(candles)
+                        if not s:
+                            continue
+
+                        # check regime filters
+                        if not passes_regime_filters(raw, regime_ind):
+                            continue
+
+                        side = s
+                        reason = f"{setup}:{r}"
+                        debug["setup"] = setup
+                        debug["regime"] = regime_ind
+                        debug["signal_origin"] = "strategy"
+                        break
+                    if side:
+                        break
+
+            # 2) Fallback to simple signal if no strategy fired
             if side is None:
-                # No signal on this bar; still update last processed bar to avoid re-eval
+                simple_side, simple_debug = compute_simple_signal(candles)
+                if simple_side:
+                    side = simple_side
+                    reason = f"fallback:{simple_debug.get('reason')}"
+                    debug.update(simple_debug)
+                    debug["signal_origin"] = "fallback"
+                    debug["regime"] = regime_ind
+
+            # 3) If still no direction, skip this bar
+            if side is None:
                 last_signal_bar[key] = bar_ts
                 continue
 
+            # 4) Confirmed signal
             last_signal_bar[key] = bar_ts
             total_signals_this_loop += 1
 
             tf_label = tf_display(tf)
-            reason = debug.get("reason", "n/a")
-            ma_val = debug.get("ma")
-
             applicable_strats: List[Dict[str, Any]] = strat_list or []
 
+            # Build and send human-friendly message
             if applicable_strats:
-                strat_names_str = ", ".join(s.get("name", f"sub-{s.get('sub_uid')}") for s in applicable_strats)
+                strat_names_str = ", ".join(
+                    s.get("name", f"sub-{s.get('sub_uid')}") for s in applicable_strats
+                )
                 msg = (
                     f"📡 *Signal Engine v2* — {symbol} / {tf_label}\n"
                     f"Side: *{side}*\n"
                     f"Strategies: `{strat_names_str}`\n"
-                    f"Last close: `{last_close}` | MA({len([c['close'] for c in candles[-MA_LOOKBACK:]])}): `{ma_val}`\n"
+                    f"Last close: `{last_close}`\n"
                     f"Reason: `{reason}`\n"
                     f"(No orders placed here; executors handle trades.)"
                 )
@@ -565,7 +771,7 @@ def main() -> None:
                 msg = (
                     f"📡 *Signal Engine v2* — {symbol} / {tf_label}\n"
                     f"Side: *{side}*\n"
-                    f"Last close: `{last_close}` | MA({len([c['close'] for c in candles[-MA_LOOKBACK:]])}): `{ma_val}`\n"
+                    f"Last close: `{last_close}`\n"
                     f"Reason: `{reason}`\n"
                     f"(No orders placed here; executors handle trades, generic universe.)"
                 )
@@ -632,7 +838,7 @@ def main() -> None:
                         strategy_name=strat_name,
                     )
             else:
-                # Fallback: generic signal, no specific strategy
+                # Generic fallback
                 extra = dict(base_extra)
                 extra.update({"strategy_name": None, "strategy_automation_mode": None})
                 signal_id = log_signal_from_engine(
@@ -649,11 +855,9 @@ def main() -> None:
                     extra=extra,
                 )
                 print(
-                    f"[SIGNAL] {symbol} {tf_label} {side} | "
-                    f"strategy=GENERIC | signal_id={signal_id} | reason={reason}"
+                    f"[SIGNAL] {symbol} {tf_label} {side} | strategy=GENERIC | signal_id={signal_id} | reason={reason}"
                 )
 
-                # JSONL export generic
                 append_signal_jsonl(
                     symbol=symbol,
                     side_text=side,
@@ -682,9 +886,7 @@ def main() -> None:
             tg_info(hb)
             next_heartbeat = now + SIG_HEARTBEAT_SEC
 
-        # Sleep until next poll
-        elapsed = time.time() - loop_start
-        sleep_for = max(1.0, SIG_POLL_SEC - elapsed)
+        sleep_for = max(1.0, SIG_POLL_SEC - (time.time() - loop_start))
         time.sleep(sleep_for)
 
 

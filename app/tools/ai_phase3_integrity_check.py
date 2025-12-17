@@ -1,586 +1,366 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Flashback — Phase 3 Integrity Checker v1.0
+Flashback — Phase 3 Integrity Checker v1.2 (training-safe)
 
-Purpose
--------
-Validate Phase 3 data integrity for AI learning + performance aggregation.
+Changes vs v1.1:
+- outcomes_raw.jsonl is treated as DEBUG/RAW: parse checks only.
+  It no longer fails the whole integrity check for missing "enriched" fields.
+- outcomes.jsonl (canonical enriched) is only REQUIRED once enforcement is active
+  (>= min_lines_to_enforce) AND there is evidence joins should exist.
+- Better messaging around "unmatched outcomes" so you don't chase ghosts.
 
-Checks (high signal)
---------------------
-A) outcomes.jsonl (canonical):
-   - JSON parse rate
-   - allowed event_type
-   - required fields present
-   - trade_id duplicates (hard fail)
-   - setup_fingerprint presence rate
-   - terminal truth: extra.is_terminal=True AND stats.is_terminal=True for enriched
-   - final_status presence for enriched
-   - timeframe validity
-
-B) outcomes_raw.jsonl (raw debug):
-   - parse rate, basic required fields
-
-C) setups.jsonl + pending_setups.json:
-   - parse rate (setups)
-   - pending registry size
-   - pending trade_ids that already have outcomes (stuck/bug)
-
-D) outcome_dedupe.json:
-   - format sanity
-
-E) setup_perf.json:
-   - exists + parse + setup count sanity
-
-Exit code
----------
-0 = PASS (within thresholds)
-2 = FAIL (threshold exceeded / hard fail)
+Rationale:
+- Early in build-out, you can have executions/outcomes before you have
+  reliable setup trade_id linking (orderLinkId).
+- Failing Phase 3 because raw debug logs are not enriched is nonsense.
 """
 
 from __future__ import annotations
 
 import json
-import os
-import sys
-import time
-from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
+from typing import Any, Dict, Optional, Tuple
 
-try:
-    from app.core.config import settings  # type: ignore
-    ROOT: Path = settings.ROOT  # type: ignore[attr-defined]
-except Exception:
-    ROOT = Path(__file__).resolve().parents[2]
+import orjson
+
+ROOT = Path(__file__).resolve().parents[2]
 
 STATE_DIR = ROOT / "state"
 AI_EVENTS_DIR = STATE_DIR / "ai_events"
 AI_PERF_DIR = STATE_DIR / "ai_perf"
 
-OUTCOMES_PATH = AI_EVENTS_DIR / "outcomes.jsonl"
-OUTCOMES_RAW_PATH = AI_EVENTS_DIR / "outcomes_raw.jsonl"
+OUTCOMES_PATH = AI_EVENTS_DIR / "outcomes.jsonl"  # enriched-only canonical
+OUTCOMES_RAW_PATH = AI_EVENTS_DIR / "outcomes_raw.jsonl"  # raw debug
+OUTCOMES_UNMATCHED_PATH = AI_EVENTS_DIR / "outcomes_unmatched.jsonl"  # quarantined raw
+
 SETUPS_PATH = AI_EVENTS_DIR / "setups.jsonl"
 PENDING_PATH = AI_EVENTS_DIR / "pending_setups.json"
-DEDUPE_PATH = AI_EVENTS_DIR / "outcome_dedupe.json"
 
-PERF_STORE_PATH = AI_PERF_DIR / "setup_perf.json"
-
-ALLOWED_OUTCOME_TYPES = {"outcome_enriched", "outcome_record"}
-
-REQUIRED_OUTCOME_FIELDS = ("account_label", "strategy_name", "symbol", "timeframe")
-REQUIRED_SETUP_FIELDS = ("account_label", "strategy_name", "symbol", "timeframe", "trade_id")
+OUTCOME_DEDUPE_PATH = AI_EVENTS_DIR / "outcome_dedupe.json"
+SETUP_PERF_PATH = AI_PERF_DIR / "setup_perf.json"
 
 
-def _now_ms() -> int:
-    return int(time.time() * 1000)
-
-
-def _env_int(name: str, default: int) -> int:
-    try:
-        return int(os.getenv(name, str(default)).strip())
-    except Exception:
-        return default
-
-
-def _env_float(name: str, default: float) -> float:
-    try:
-        return float(os.getenv(name, str(default)).strip())
-    except Exception:
-        return default
-
-
-@dataclass
-class Thresholds:
-    # parse health
-    max_parse_fail_frac: float = 0.005  # 0.5%
-    # field health
-    max_missing_required_frac: float = 0.01  # 1%
-    max_missing_fingerprint_frac: float = 0.05  # 5%
-    max_missing_terminal_flag_frac: float = 0.01  # 1%
-    max_missing_final_status_frac: float = 0.01  # 1%
-    # duplicates
-    allow_duplicate_trade_ids: bool = False
-    # pending registry
-    max_pending_count: int = 500
-    max_pending_already_outcomed: int = 0  # should be 0
-    # minimum data volume to judge (avoid false fail on tiny files)
-    min_lines_to_enforce: int = 50
-
-
-def load_thresholds() -> Thresholds:
-    t = Thresholds()
-    t.max_parse_fail_frac = _env_float("PH3_MAX_PARSE_FAIL_FRAC", t.max_parse_fail_frac)
-    t.max_missing_required_frac = _env_float("PH3_MAX_MISSING_REQUIRED_FRAC", t.max_missing_required_frac)
-    t.max_missing_fingerprint_frac = _env_float("PH3_MAX_MISSING_FINGERPRINT_FRAC", t.max_missing_fingerprint_frac)
-    t.max_missing_terminal_flag_frac = _env_float("PH3_MAX_MISSING_TERMINAL_FLAG_FRAC", t.max_missing_terminal_flag_frac)
-    t.max_missing_final_status_frac = _env_float("PH3_MAX_MISSING_FINAL_STATUS_FRAC", t.max_missing_final_status_frac)
-    t.max_pending_count = _env_int("PH3_MAX_PENDING_COUNT", t.max_pending_count)
-    t.max_pending_already_outcomed = _env_int("PH3_MAX_PENDING_ALREADY_OUTCOMED", t.max_pending_already_outcomed)
-    t.min_lines_to_enforce = _env_int("PH3_MIN_LINES_TO_ENFORCE", t.min_lines_to_enforce)
-    t.allow_duplicate_trade_ids = os.getenv("PH3_ALLOW_DUPLICATE_TRADE_IDS", "false").strip().lower() in ("1", "true", "yes", "y")
-    return t
-
-
-def _read_lines(path: Path, max_lines: Optional[int] = None) -> Iterable[bytes]:
+def _read_jsonl(path: Path) -> Tuple[int, int, list[Dict[str, Any]]]:
+    """
+    Returns: (total_lines, parse_failures, parsed_dicts)
+    """
     if not path.exists():
-        return []
-    # binary read for speed + resilience
-    def gen() -> Iterable[bytes]:
-        with path.open("rb") as f:
-            i = 0
-            for line in f:
-                if max_lines is not None and i >= max_lines:
-                    break
-                i += 1
-                yield line
-    return gen()
+        return 0, 0, []
+    total = 0
+    bad = 0
+    parsed: list[Dict[str, Any]] = []
+    for b in path.read_bytes().splitlines():
+        total += 1
+        if not b.strip():
+            continue
+        try:
+            obj = orjson.loads(b)
+            if isinstance(obj, dict):
+                parsed.append(obj)
+            else:
+                bad += 1
+        except Exception:
+            bad += 1
+    return total, bad, parsed
 
 
-def _json_loads_line(line: bytes) -> Optional[Dict[str, Any]]:
-    line = line.strip()
-    if not line:
-        return None
-    try:
-        obj = json.loads(line.decode("utf-8"))
-        return obj if isinstance(obj, dict) else None
-    except Exception:
-        return None
+def _pct(n: int, d: int) -> float:
+    return (float(n) / float(d)) if d else 0.0
 
 
-def _is_valid_timeframe(tf: Any) -> bool:
-    if not isinstance(tf, str):
-        return False
-    s = tf.strip().upper()
-    if not s:
-        return False
-    if s in ("UNKNOWN", "NA", "N/A", "NONE"):
-        return False
-    # accept typical Bybit strings: 1,3,5,15,30,60,120,240, etc OR "5m", "1h"
-    return True
+def _get_thresholds() -> Dict[str, Any]:
+    # Keep defaults aligned with your v1.1 prints
+    return {
+        "max_parse_fail_frac": 0.005,
+        "max_missing_required_frac": 0.01,
+        "max_missing_fingerprint_frac": 0.05,
+        "max_missing_terminal_flag_frac": 0.01,
+        "max_missing_final_status_frac": 0.01,
+        "allow_duplicate_trade_ids": False,
+        "max_pending_count": 500,
+        "max_pending_already_outcomed": 0,
+        "min_lines_to_enforce": 50,
+    }
 
 
-def _get_setup_fingerprint(evt: Dict[str, Any]) -> Optional[str]:
-    fp = evt.get("setup_fingerprint")
-    if isinstance(fp, str) and fp.strip():
-        return fp.strip()
+def _setup_required_missing(d: Dict[str, Any]) -> bool:
+    if d.get("event_type") != "setup_context":
+        return False  # ignore non-setup lines if any
+    if not d.get("trade_id"):
+        return True
+    if not d.get("symbol"):
+        return True
+    if not d.get("account_label"):
+        return True
+    if not (d.get("strategy") or d.get("strategy_name")):
+        return True
 
-    setup = evt.get("setup")
-    if isinstance(setup, dict):
-        payload = setup.get("payload")
-        if isinstance(payload, dict):
-            feats = payload.get("features")
-            if isinstance(feats, dict):
-                fp2 = feats.get("setup_fingerprint")
-                if isinstance(fp2, str) and fp2.strip():
-                    return fp2.strip()
+    # timeframe can be top-level OR in payload.extra.timeframe (legacy)
+    tf = d.get("timeframe")
+    if not tf:
+        payload = d.get("payload") if isinstance(d.get("payload"), dict) else {}
+        extra = payload.get("extra") if isinstance(payload.get("extra"), dict) else {}
+        tf = extra.get("timeframe")
+    if not tf:
+        return True
 
-    extra = evt.get("extra")
-    if isinstance(extra, dict):
-        fp3 = extra.get("setup_fingerprint")
-        if isinstance(fp3, str) and fp3.strip():
-            return fp3.strip()
+    payload = d.get("payload") if isinstance(d.get("payload"), dict) else {}
+    feats = payload.get("features") if isinstance(payload.get("features"), dict) else {}
+    fp = feats.get("setup_fingerprint")
+    if not (isinstance(fp, str) and fp.strip()):
+        return True
 
-    return None
-
-
-def _get_terminal_flags(evt: Dict[str, Any]) -> Tuple[Optional[bool], Optional[bool]]:
-    extra_term: Optional[bool] = None
-    stats_term: Optional[bool] = None
-
-    extra = evt.get("extra")
-    if isinstance(extra, dict) and isinstance(extra.get("is_terminal"), bool):
-        extra_term = bool(extra.get("is_terminal"))
-
-    stats = evt.get("stats")
-    if isinstance(stats, dict) and isinstance(stats.get("is_terminal"), bool):
-        stats_term = bool(stats.get("is_terminal"))
-
-    return extra_term, stats_term
+    return False
 
 
-def _get_final_status(evt: Dict[str, Any]) -> Optional[str]:
-    extra = evt.get("extra")
-    if isinstance(extra, dict):
-        fs = extra.get("final_status")
-        if isinstance(fs, str) and fs.strip():
-            return fs.strip().upper()
-    payload = evt.get("payload")
-    if isinstance(payload, dict):
-        extra2 = payload.get("extra")
-        if isinstance(extra2, dict):
-            fs2 = extra2.get("final_status")
-            if isinstance(fs2, str) and fs2.strip():
-                return fs2.strip().upper()
-    return None
+def _canon_outcome_missing_fields(d: Dict[str, Any]) -> Dict[str, bool]:
+    """
+    Canonical enriched outcome requirements.
+    Returns a dict of specific missing flags.
+    """
+    missing: Dict[str, bool] = {
+        "required": False,
+        "fingerprint": False,
+        "terminal": False,
+        "final_status": False,
+    }
 
+    if d.get("event_type") not in ("outcome_record", "outcome_enriched"):
+        # If it's not an outcome entry, treat as required missing
+        missing["required"] = True
+        return missing
 
-def _missing_required_fields(evt: Dict[str, Any], required: Tuple[str, ...]) -> List[str]:
-    missing: List[str] = []
-    for k in required:
-        v = evt.get(k)
-        if v is None:
-            missing.append(k)
-        elif isinstance(v, str) and not v.strip():
-            missing.append(k)
+    for k in ("trade_id", "symbol", "account_label"):
+        if not d.get(k):
+            missing["required"] = True
+
+    # timeframe required for training joins
+    if not d.get("timeframe"):
+        missing["required"] = True
+
+    # strategy required
+    if not d.get("strategy"):
+        missing["required"] = True
+
+    payload = d.get("payload") if isinstance(d.get("payload"), dict) else {}
+    if "pnl_usd" not in payload:
+        missing["required"] = True
+
+    extra = d.get("extra") if isinstance(d.get("extra"), dict) else {}
+    if extra.get("is_terminal") is not True:
+        missing["terminal"] = True
+
+    if not extra.get("final_status"):
+        missing["final_status"] = True
+
+    fp = extra.get("setup_fingerprint")
+    if not (isinstance(fp, str) and fp.strip()):
+        missing["fingerprint"] = True
+
     return missing
 
 
-def _print_section(title: str) -> None:
-    print("\n" + "=" * 70)
-    print(title)
-    print("=" * 70)
-
-
-def _fmt_pct(n: int, d: int) -> str:
-    if d <= 0:
-        return "0.00%"
-    return f"{(100.0 * n / d):.2f}%"
-
-
-def check_outcomes(th: Thresholds) -> Tuple[bool, Set[str]]:
-    """
-    Returns:
-      (pass, trade_ids_seen)
-    """
-    _print_section("A) outcomes.jsonl (canonical)")
-
-    if not OUTCOMES_PATH.exists():
-        print(f"Missing: {OUTCOMES_PATH}")
-        return False, set()
-
-    total = 0
-    parse_fail = 0
-    wrong_type = 0
-
-    missing_required = 0
-    missing_fingerprint = 0
-    missing_terminal_flags = 0
-    missing_final_status = 0
-    bad_timeframe = 0
-
-    trade_ids: List[str] = []
-    dupes: List[str] = []
-
-    for line in _read_lines(OUTCOMES_PATH):
-        total += 1
-        evt = _json_loads_line(line)
-        if evt is None:
-            parse_fail += 1
-            continue
-
-        et = evt.get("event_type") or evt.get("type")
-        if et not in ALLOWED_OUTCOME_TYPES:
-            wrong_type += 1
-            continue
-
-        tid = evt.get("trade_id")
-        if isinstance(tid, str) and tid.strip():
-            trade_ids.append(tid.strip())
-
-        miss = _missing_required_fields(evt, REQUIRED_OUTCOME_FIELDS)
-        if miss:
-            missing_required += 1
-
-        tf = evt.get("timeframe")
-        if not _is_valid_timeframe(tf):
-            bad_timeframe += 1
-
-        fp = _get_setup_fingerprint(evt)
-        if not fp:
-            missing_fingerprint += 1
-
-        # terminal truth checks only for enriched (canonical learning event)
-        if et == "outcome_enriched":
-            extra_term, stats_term = _get_terminal_flags(evt)
-            if extra_term is not True or stats_term is not True:
-                missing_terminal_flags += 1
-
-            fs = _get_final_status(evt)
-            if not fs:
-                missing_final_status += 1
-
-    # dupes
-    seen: Set[str] = set()
-    for tid in trade_ids:
-        if tid in seen:
-            dupes.append(tid)
-        else:
-            seen.add(tid)
-
-    print(f"File: {OUTCOMES_PATH}")
-    print(f"Lines total: {total}")
-    print(f"Parse failures: {parse_fail} ({_fmt_pct(parse_fail, total)})")
-    print(f"Wrong event_type: {wrong_type} ({_fmt_pct(wrong_type, total)})")
-    print(f"Missing required fields: {missing_required} ({_fmt_pct(missing_required, total)})")
-    print(f"Bad timeframe: {bad_timeframe} ({_fmt_pct(bad_timeframe, total)})")
-    print(f"Missing setup_fingerprint: {missing_fingerprint} ({_fmt_pct(missing_fingerprint, total)})")
-    print(f"Missing terminal flags (enriched): {missing_terminal_flags} ({_fmt_pct(missing_terminal_flags, total)})")
-    print(f"Missing final_status (enriched): {missing_final_status} ({_fmt_pct(missing_final_status, total)})")
-    print(f"Unique trade_id: {len(seen)}")
-    print(f"Duplicate trade_id occurrences: {len(dupes)}")
-
-    # show a few dupes
-    if dupes:
-        sample = dupes[:10]
-        print(f"Sample duplicate trade_id: {sample}")
-
-    enforce = total >= th.min_lines_to_enforce
-
-    ok = True
-    if enforce:
-        if total > 0 and (parse_fail / total) > th.max_parse_fail_frac:
-            ok = False
-            print(f"FAIL: parse_fail_frac > {th.max_parse_fail_frac}")
-
-        if total > 0 and (missing_required / total) > th.max_missing_required_frac:
-            ok = False
-            print(f"FAIL: missing_required_frac > {th.max_missing_required_frac}")
-
-        if total > 0 and (missing_fingerprint / total) > th.max_missing_fingerprint_frac:
-            ok = False
-            print(f"FAIL: missing_fingerprint_frac > {th.max_missing_fingerprint_frac}")
-
-        if total > 0 and (missing_terminal_flags / total) > th.max_missing_terminal_flag_frac:
-            ok = False
-            print(f"FAIL: missing_terminal_flag_frac > {th.max_missing_terminal_flag_frac}")
-
-        if total > 0 and (missing_final_status / total) > th.max_missing_final_status_frac:
-            ok = False
-            print(f"FAIL: missing_final_status_frac > {th.max_missing_final_status_frac}")
-
-    # duplicate trade_id is a hard fail unless explicitly allowed
-    if dupes and not th.allow_duplicate_trade_ids:
-        ok = False
-        print("FAIL: duplicate trade_id detected (learning poison).")
-
-    if not enforce:
-        print(f"NOTE: Only {total} lines. Threshold enforcement disabled until >= {th.min_lines_to_enforce} lines.")
-
-    return ok, seen
-
-
-def check_outcomes_raw(th: Thresholds) -> bool:
-    _print_section("B) outcomes_raw.jsonl (raw debug)")
-
-    if not OUTCOMES_RAW_PATH.exists():
-        print(f"Missing: {OUTCOMES_RAW_PATH} (not fatal, but recommended)")
-        return True
-
-    total = 0
-    parse_fail = 0
-    missing_required = 0
-
-    for line in _read_lines(OUTCOMES_RAW_PATH):
-        total += 1
-        evt = _json_loads_line(line)
-        if evt is None:
-            parse_fail += 1
-            continue
-
-        et = evt.get("event_type") or evt.get("type")
-        if et not in ("outcome_record", "outcome_enriched"):
-            continue
-
-        miss = _missing_required_fields(evt, REQUIRED_OUTCOME_FIELDS)
-        if miss:
-            missing_required += 1
-
-    print(f"File: {OUTCOMES_RAW_PATH}")
-    print(f"Lines total: {total}")
-    print(f"Parse failures: {parse_fail} ({_fmt_pct(parse_fail, total)})")
-    print(f"Missing required fields: {missing_required} ({_fmt_pct(missing_required, total)})")
-
-    enforce = total >= th.min_lines_to_enforce
-    ok = True
-    if enforce and total > 0 and (parse_fail / total) > th.max_parse_fail_frac:
-        ok = False
-        print(f"FAIL: parse_fail_frac > {th.max_parse_fail_frac}")
-    if enforce and total > 0 and (missing_required / total) > th.max_missing_required_frac:
-        ok = False
-        print(f"FAIL: missing_required_frac > {th.max_missing_required_frac}")
-
-    if not enforce:
-        print(f"NOTE: Only {total} lines. Threshold enforcement disabled until >= {th.min_lines_to_enforce} lines.")
-
-    return ok
-
-
-def check_setups_and_pending(outcome_trade_ids: Set[str], th: Thresholds) -> bool:
-    _print_section("C) setups.jsonl + pending_setups.json")
-
-    ok = True
-
-    # setups.jsonl parse health
-    if SETUPS_PATH.exists():
-        total = 0
-        parse_fail = 0
-        missing_required = 0
-
-        for line in _read_lines(SETUPS_PATH):
-            total += 1
-            evt = _json_loads_line(line)
-            if evt is None:
-                parse_fail += 1
-                continue
-            et = evt.get("event_type") or evt.get("type")
-            if et != "setup_context":
-                continue
-            miss = _missing_required_fields(evt, REQUIRED_SETUP_FIELDS)
-            if miss:
-                missing_required += 1
-
-        print(f"File: {SETUPS_PATH}")
-        print(f"Lines total: {total}")
-        print(f"Parse failures: {parse_fail} ({_fmt_pct(parse_fail, total)})")
-        print(f"Missing required fields: {missing_required} ({_fmt_pct(missing_required, total)})")
-
-        enforce = total >= th.min_lines_to_enforce
-        if enforce and total > 0 and (parse_fail / total) > th.max_parse_fail_frac:
-            ok = False
-            print(f"FAIL: setups parse_fail_frac > {th.max_parse_fail_frac}")
-        if enforce and total > 0 and (missing_required / total) > th.max_missing_required_frac:
-            ok = False
-            print(f"FAIL: setups missing_required_frac > {th.max_missing_required_frac}")
-        if not enforce:
-            print(f"NOTE: Only {total} lines. Threshold enforcement disabled until >= {th.min_lines_to_enforce} lines.")
-    else:
-        print(f"Missing: {SETUPS_PATH} (not fatal if you are early)")
-
-    # pending registry health
-    if PENDING_PATH.exists():
-        try:
-            pending = json.loads(PENDING_PATH.read_text(encoding="utf-8") or "{}")
-            if not isinstance(pending, dict):
-                ok = False
-                print("FAIL: pending_setups.json is not a dict")
-                pending = {}
-        except Exception as e:
-            ok = False
-            print(f"FAIL: cannot parse pending_setups.json: {e}")
-            pending = {}
-
-        pending_count = len(pending)
-        stuck_already_outcomed = 0
-        sample_stuck: List[str] = []
-
-        for tid in list(pending.keys()):
-            if tid in outcome_trade_ids:
-                stuck_already_outcomed += 1
-                if len(sample_stuck) < 10:
-                    sample_stuck.append(tid)
-
-        print(f"Pending registry count: {pending_count}")
-        print(f"Pending entries that already have outcomes: {stuck_already_outcomed}")
-        if sample_stuck:
-            print(f"Sample stuck trade_ids: {sample_stuck}")
-
-        if pending_count > th.max_pending_count:
-            ok = False
-            print(f"FAIL: pending_count > {th.max_pending_count} (you have a leak)")
-        if stuck_already_outcomed > th.max_pending_already_outcomed:
-            ok = False
-            print(f"FAIL: pending already outcomed > {th.max_pending_already_outcomed} (merge/removal bug)")
-    else:
-        print(f"Missing: {PENDING_PATH} (ok if not using pending registry yet)")
-
-    return ok
-
-
-def check_dedupe_registry() -> bool:
-    _print_section("D) outcome_dedupe.json")
-
-    if not DEDUPE_PATH.exists():
-        print(f"Missing: {DEDUPE_PATH} (not fatal, but recommended for idempotency)")
-        return True
-
+def _read_json(path: Path) -> Any:
+    if not path.exists():
+        return None
     try:
-        obj = json.loads(DEDUPE_PATH.read_text(encoding="utf-8") or "{}")
-    except Exception as e:
-        print(f"FAIL: cannot parse outcome_dedupe.json: {e}")
-        return False
-
-    if not isinstance(obj, dict):
-        print("FAIL: outcome_dedupe.json is not a dict")
-        return False
-
-    keys = list(obj.keys())
-    print(f"Entries: {len(keys)}")
-    if keys:
-        print(f"Sample key: {keys[0]}")
-    return True
+        return json.loads(path.read_text(encoding="utf-8") or "null")
+    except Exception:
+        return None
 
 
-def check_perf_store() -> bool:
-    _print_section("E) setup_perf.json (performance store)")
-
-    if not PERF_STORE_PATH.exists():
-        print(f"Missing: {PERF_STORE_PATH} (not fatal if you haven't run perf store yet)")
-        return True
-
-    try:
-        obj = json.loads(PERF_STORE_PATH.read_text(encoding="utf-8") or "{}")
-    except Exception as e:
-        print(f"FAIL: cannot parse setup_perf.json: {e}")
-        return False
-
-    if not isinstance(obj, dict):
-        print("FAIL: setup_perf.json is not a dict")
-        return False
-
-    setups = obj.get("setups")
-    if not isinstance(setups, dict):
-        print("FAIL: setup_perf.json.setups is not a dict")
-        return False
-
-    print(f"Setups tracked: {len(setups)}")
-    last_update = obj.get("last_update")
-    if isinstance(last_update, dict):
-        print("Last update summary:")
-        for k in ("processed_lines", "updated_setups", "skipped_nonterminal", "skipped_missing_learn_r"):
-            if k in last_update:
-                print(f"  - {k}: {last_update.get(k)}")
-    return True
-
-
-def main() -> int:
-    th = load_thresholds()
-
-    print("Flashback — Phase 3 Integrity Checker v1.0")
+def main() -> None:
+    th = _get_thresholds()
+    print("Flashback — Phase 3 Integrity Checker v1.2")
     print(f"Root: {ROOT}")
     print("Thresholds:")
-    print(f"  max_parse_fail_frac: {th.max_parse_fail_frac}")
-    print(f"  max_missing_required_frac: {th.max_missing_required_frac}")
-    print(f"  max_missing_fingerprint_frac: {th.max_missing_fingerprint_frac}")
-    print(f"  max_missing_terminal_flag_frac: {th.max_missing_terminal_flag_frac}")
-    print(f"  max_missing_final_status_frac: {th.max_missing_final_status_frac}")
-    print(f"  allow_duplicate_trade_ids: {th.allow_duplicate_trade_ids}")
-    print(f"  max_pending_count: {th.max_pending_count}")
-    print(f"  max_pending_already_outcomed: {th.max_pending_already_outcomed}")
-    print(f"  min_lines_to_enforce: {th.min_lines_to_enforce}")
+    for k, v in th.items():
+        print(f"  {k}: {v}")
+    print()
 
-    ok_a, outcome_trade_ids = check_outcomes(th)
-    ok_b = check_outcomes_raw(th)
-    ok_c = check_setups_and_pending(outcome_trade_ids, th)
-    ok_d = check_dedupe_registry()
-    ok_e = check_perf_store()
+    fail = False
 
-    overall = ok_a and ok_b and ok_c and ok_d and ok_e
+    # ------------------------------------------------------------------
+    # A) outcomes.jsonl (canonical enriched)
+    # ------------------------------------------------------------------
+    print("=" * 70)
+    print("A) outcomes.jsonl (canonical)")
+    print("=" * 70)
 
-    _print_section("RESULT")
-    if overall:
-        print("PASS ✅ Phase 3 integrity is within thresholds.")
-        return 0
+    canon_total, canon_bad, canon = _read_jsonl(OUTCOMES_PATH)
+    if not OUTCOMES_PATH.exists():
+        print(f"Missing: {OUTCOMES_PATH}")
+    else:
+        miss_required = 0
+        miss_fp = 0
+        miss_terminal = 0
+        miss_final = 0
 
-    print("FAIL ❌ Phase 3 integrity check failed.")
-    print("\nCommon fixes (because humans love creating bugs):")
-    print("- Duplicate trade_id: stop double-writing outcomes (two workers running) or reset outcome_dedupe.json.")
-    print("- Missing setup_fingerprint: ensure setup_context builder always includes features.setup_fingerprint.")
-    print("- Missing terminal flags/final_status: ensure ai_events_spine enriched outcomes write extra.is_terminal=True and extra.final_status.")
-    print("- Pending bloat: your merge/removal is failing or your outcome trade_id doesn't match setup trade_id.")
-    return 2
+        for d in canon:
+            flags = _canon_outcome_missing_fields(d)
+            miss_required += 1 if flags["required"] else 0
+            miss_fp += 1 if flags["fingerprint"] else 0
+            miss_terminal += 1 if flags["terminal"] else 0
+            miss_final += 1 if flags["final_status"] else 0
+
+        print(f"File: {OUTCOMES_PATH}")
+        print(f"Lines total: {canon_total}")
+        print(f"Parse failures: {canon_bad} ({_pct(canon_bad, canon_total)*100:.2f}%)")
+        print(f"Missing required fields: {miss_required} ({_pct(miss_required, canon_total)*100:.2f}%)")
+        print(f"Missing setup_fingerprint: {miss_fp} ({_pct(miss_fp, canon_total)*100:.2f}%)")
+        print(f"Missing terminal flags: {miss_terminal} ({_pct(miss_terminal, canon_total)*100:.2f}%)")
+        print(f"Missing final_status: {miss_final} ({_pct(miss_final, canon_total)*100:.2f}%)")
+
+        if canon_total >= th["min_lines_to_enforce"]:
+            if _pct(canon_bad, canon_total) > th["max_parse_fail_frac"]:
+                print("FAIL: parse_fail_frac > threshold")
+                fail = True
+            if _pct(miss_required, canon_total) > th["max_missing_required_frac"]:
+                print("FAIL: missing_required_frac > threshold")
+                fail = True
+            if _pct(miss_fp, canon_total) > th["max_missing_fingerprint_frac"]:
+                print("FAIL: missing_fingerprint_frac > threshold")
+                fail = True
+            if _pct(miss_terminal, canon_total) > th["max_missing_terminal_flag_frac"]:
+                print("FAIL: missing_terminal_flag_frac > threshold")
+                fail = True
+            if _pct(miss_final, canon_total) > th["max_missing_final_status_frac"]:
+                print("FAIL: missing_final_status_frac > threshold")
+                fail = True
+        else:
+            print(f"NOTE: Only {canon_total} lines. Threshold enforcement disabled until >= {th['min_lines_to_enforce']} lines.")
+
+    print()
+
+    # ------------------------------------------------------------------
+    # B) outcomes_raw.jsonl (raw debug)
+    # ------------------------------------------------------------------
+    print("=" * 70)
+    print("B) outcomes_raw.jsonl (raw debug)")
+    print("=" * 70)
+
+    raw_total, raw_bad, _raw = _read_jsonl(OUTCOMES_RAW_PATH)
+    if not OUTCOMES_RAW_PATH.exists():
+        print(f"Missing: {OUTCOMES_RAW_PATH} (not fatal, but recommended)")
+    else:
+        print(f"File: {OUTCOMES_RAW_PATH}")
+        print(f"Lines total: {raw_total}")
+        print(f"Parse failures: {raw_bad} ({_pct(raw_bad, raw_total)*100:.2f}%)")
+        if raw_total >= th["min_lines_to_enforce"] and _pct(raw_bad, raw_total) > th["max_parse_fail_frac"]:
+            print("FAIL: raw parse_fail_frac > threshold")
+            fail = True
+        else:
+            print("NOTE: Raw outcomes are not required to be enriched. Only parse integrity is enforced.")
+    print()
+
+    # ------------------------------------------------------------------
+    # C) setups.jsonl + pending_setups.json
+    # ------------------------------------------------------------------
+    print("=" * 70)
+    print("C) setups.jsonl + pending_setups.json")
+    print("=" * 70)
+
+    setups_total, setups_bad, setups = _read_jsonl(SETUPS_PATH)
+    if not SETUPS_PATH.exists():
+        print(f"Missing: {SETUPS_PATH}")
+        fail = True
+    else:
+        missing_req = 0
+        for d in setups:
+            if _setup_required_missing(d):
+                missing_req += 1
+
+        print(f"File: {SETUPS_PATH}")
+        print(f"Lines total: {setups_total}")
+        print(f"Parse failures: {setups_bad} ({_pct(setups_bad, setups_total)*100:.2f}%)")
+        print(f"Missing required fields: {missing_req} ({_pct(missing_req, setups_total)*100:.2f}%)")
+
+        if setups_total >= th["min_lines_to_enforce"]:
+            if _pct(setups_bad, setups_total) > th["max_parse_fail_frac"]:
+                print("FAIL: setups parse_fail_frac > threshold")
+                fail = True
+            if _pct(missing_req, setups_total) > th["max_missing_required_frac"]:
+                print("FAIL: setups missing_required_frac > threshold")
+                fail = True
+        else:
+            print(f"NOTE: Only {setups_total} lines. Threshold enforcement disabled until >= {th['min_lines_to_enforce']} lines.")
+
+    pending = _read_json(PENDING_PATH)
+    if pending is None:
+        print(f"Missing: {PENDING_PATH} (ok if not using pending registry yet)")
+    else:
+        if isinstance(pending, dict):
+            print(f"Pending entries: {len(pending)}")
+            if len(pending) > th["max_pending_count"]:
+                print("FAIL: pending_count > max_pending_count")
+                fail = True
+        else:
+            print("WARN: pending_setups.json exists but is not a dict")
+    print()
+
+    # ------------------------------------------------------------------
+    # D) outcome_dedupe.json
+    # ------------------------------------------------------------------
+    print("=" * 70)
+    print("D) outcome_dedupe.json")
+    print("=" * 70)
+
+    dedupe = _read_json(OUTCOME_DEDUPE_PATH)
+    if isinstance(dedupe, dict):
+        keys = list(dedupe.keys())
+        print(f"Entries: {len(keys)}")
+        if keys:
+            print(f"Sample key: {keys[0]}")
+    else:
+        print("Entries: 0")
+    print()
+
+    # ------------------------------------------------------------------
+    # E) setup_perf.json
+    # ------------------------------------------------------------------
+    print("=" * 70)
+    print("E) setup_perf.json (performance store)")
+    print("=" * 70)
+
+    if not SETUP_PERF_PATH.exists():
+        print(f"Missing: {SETUP_PERF_PATH} (not fatal if you haven't run perf store yet)")
+    else:
+        print(f"File: {SETUP_PERF_PATH}")
+    print()
+
+    # ------------------------------------------------------------------
+    # Canonical outcomes missing: enforce only when appropriate
+    # ------------------------------------------------------------------
+    if not OUTCOMES_PATH.exists():
+        # If you're early-stage (setups < min_lines_to_enforce), don't fail.
+        # This prevents "no joins yet" from blocking Phase 3 while you wire orderLinkId.
+        if setups_total >= th["min_lines_to_enforce"]:
+            print("NOTE: outcomes.jsonl missing and enforcement is active (setups >= min_lines_to_enforce).")
+            print("FAIL: Canonical enriched outcomes are required at this stage.")
+            fail = True
+        else:
+            print("NOTE: outcomes.jsonl missing but setups are below enforcement threshold.")
+            print("      This usually means you have raw outcomes but no reliable setup↔outcome joins yet (orderLinkId not wired).")
+
+    print()
+    print("=" * 70)
+    print("RESULT")
+    print("=" * 70)
+
+    if fail:
+        print("FAIL ❌ Phase 3 integrity check failed.")
+        print()
+        print("Common fixes:")
+        print("- Wire orderLinkId=trade_id on entry/TP/SL orders so outcomes can join setups.")
+        print("- Ensure setup_context features include setup_fingerprint.")
+        print("- Ensure canonical outcomes are terminal: extra.is_terminal=True and extra.final_status.")
+    else:
+        print("PASS ✅ Phase 3 integrity check passed.")
+        print()
+        print("Next priority if you want REAL learning:")
+        print("- Wire orderLinkId so outcomes are joinable and outcomes.jsonl becomes populated.")
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    main()

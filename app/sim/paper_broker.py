@@ -1,50 +1,20 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Flashback — Paper Broker (LEARN_DRY engine, v1.2)
+Flashback — Paper Broker (LEARN_DRY engine, v1.3)
 
-Purpose
--------
-Simulated "paper exchange" for LEARN_DRY mode.
+Patch v1.3 (2025-12-13)
+-----------------------
+✅ Publishes PAPER positions into the canonical positions bus:
+    state/positions_bus.json
 
-This module manages PAPER positions and equity for ONE account_label:
+Why:
+- tp_sl_manager reads positions_bus.json
+- executor_v2 in PAPER mode opens positions via PaperBroker
+- previously PaperBroker only wrote state/paper/<account_label>.json
+  so TP/SL never saw paper positions (positions=0 forever)
 
-    - Loads strategy config from config/strategies.yaml
-    - Maintains a paper ledger on disk:
-        state/paper/<account_label>.json
-    - Opens positions when called by AI Pilot / Executor with a signal
-    - Monitors prices (via caller-provided price updates)
-    - Closes positions on TP/SL hits
-    - Emits:
-        * OutcomeRecord -> state/ai_events/outcomes*.jsonl
-      (SetupRecord should usually be logged by executor_v2)
-
-This is PURELY SIMULATION:
-    - No Bybit REST or WS calls
-    - No real orders are placed
-    - Only interacts with:
-        * config/strategies.yaml
-        * state/paper/*.json
-        * app.ai.ai_events_spine (for AI outcome logs)
-
-Integration model
------------------
-You are expected to:
-
-    - Create ONE PaperBroker per account_label in LEARN_DRY
-    - Wire Executor to call:
-        broker.open_position(...)  when a trade is approved
-        broker.update_price(...)   on each new price tick
-
-Executor is expected to:
-    - Generate the trade_id
-    - Log setup_context via ai_events_spine.build_setup_context/publish_ai_event
-    - Pass features INCLUDING risk_usd and size/qty
-
-PaperBroker then:
-    - Uses the provided trade_id, risk_usd, size
-    - Computes PnL and R on close
-    - Emits OutcomeRecord via build_outcome_record/publish_ai_event
+This patch makes paper trades visible system-wide without touching executor or tp_sl_manager.
 """
 
 from __future__ import annotations
@@ -78,7 +48,7 @@ except Exception:  # pragma: no cover
                 "%(asctime)s [%(levelname)s] [%(name)s] %(message)s"
             )
             handler.setFormatter(fmt)
-        logger_.addHandler(handler)
+            logger_.addHandler(handler)
         logger_.setLevel(logging.INFO)
         return logger_
 
@@ -165,17 +135,106 @@ def _load_strategy_for_label(account_label: str) -> Dict[str, Any]:
     data = yaml.safe_load(cfg_path.read_text(encoding="utf-8")) or {}
     subs = data.get("subaccounts") or []
 
-    # Prefer exact account_label match
     for sub in subs:
         if str(sub.get("account_label")) == account_label:
             return sub
 
-    # Fallback: match on name if nothing else
     for sub in subs:
         if str(sub.get("name")) == account_label:
             return sub
 
     raise ValueError(f"No strategy config found for account_label={account_label!r}")
+
+
+# ---------------------------------------------------------------------------
+# Positions bus writer (canonical visibility for TP/SL Manager)
+# ---------------------------------------------------------------------------
+
+_POSITIONS_BUS_PATH: Path = ROOT / "state" / "positions_bus.json"
+_POSITIONS_BUS_PATH.parent.mkdir(parents=True, exist_ok=True)
+
+
+def _safe_read_json(path: Path) -> Any:
+    if not path.exists():
+        return None
+    try:
+        return json.loads(path.read_text(encoding="utf-8", errors="ignore") or "")
+    except Exception:
+        return None
+
+
+def _safe_write_json(path: Path, obj: Any) -> None:
+    try:
+        path.write_text(json.dumps(obj, indent=2, sort_keys=True), encoding="utf-8")
+    except Exception as e:
+        log.warning("Failed to write %s: %r", path, e)
+
+
+def _paper_position_to_bus_row(account_label: str, pos: PaperPosition) -> Dict[str, Any]:
+    """
+    Minimal bus row schema that downstream readers can tolerate.
+    We intentionally keep this flat and boring.
+    """
+    return {
+        "trade_id": str(pos.trade_id),
+        "symbol": str(pos.symbol),
+        "account_label": str(account_label),
+        "side": "Buy" if pos.side == "long" else "Sell",
+        "position_side": "LONG" if pos.side == "long" else "SHORT",
+        "qty": float(pos.size),
+        "size": float(pos.size),
+        "avg_price": float(pos.entry_price),
+        "entry_price": float(pos.entry_price),
+        "stop_price": float(pos.stop_price),
+        "take_profit_price": float(pos.take_profit_price),
+        "risk_usd": float(pos.risk_usd),
+        "opened_ms": int(pos.opened_ms),
+        "mode": "PAPER",
+        "source": "paper_broker",
+        "setup_type": pos.setup_type,
+        "timeframe": pos.timeframe,
+        "ai_profile": pos.ai_profile,
+    }
+
+
+def _publish_positions_bus(account_label: str, open_positions: List[PaperPosition]) -> None:
+    """
+    Publish PAPER positions into state/positions_bus.json alongside any existing rows.
+
+    Rules:
+    - We replace ALL prior PAPER rows for this account_label
+    - We do NOT touch non-PAPER rows (live/other sources)
+    - This makes TP/SL Manager see paper positions without needing modifications
+    """
+    now_ms = _now_ms()
+    existing = _safe_read_json(_POSITIONS_BUS_PATH)
+
+    if isinstance(existing, dict):
+        rows = existing.get("positions") or []
+    elif isinstance(existing, list):
+        rows = existing
+    else:
+        rows = []
+
+    # Keep non-paper rows and paper rows from other accounts
+    kept: List[Dict[str, Any]] = []
+    for r in rows:
+        if not isinstance(r, dict):
+            continue
+        is_paper = str(r.get("mode") or "").upper() == "PAPER" or str(r.get("source") or "") == "paper_broker"
+        same_acct = str(r.get("account_label") or "") == account_label
+        if is_paper and same_acct:
+            continue
+        kept.append(r)
+
+    new_rows = [_paper_position_to_bus_row(account_label, p) for p in open_positions]
+
+    out = {
+        "ts_ms": now_ms,
+        "source": "paper_broker",
+        "positions": kept + new_rows,
+    }
+    _safe_write_json(_POSITIONS_BUS_PATH, out)
 
 
 # ---------------------------------------------------------------------------
@@ -185,20 +244,11 @@ def _load_strategy_for_label(account_label: str) -> Dict[str, Any]:
 class PaperBroker:
     """
     PaperBroker manages simulated positions & equity for one account_label.
-
-    Typical lifecycle:
-        broker = PaperBroker.load_or_create("flashback01", starting_equity=1000.0)
-        broker.open_position(...)
-        broker.update_price(symbol="BTCUSDT", price=50000.0)
     """
 
     def __init__(self, state: PaperAccountState, state_path: Path) -> None:
         self._state = state
         self._state_path = state_path
-
-    # ------------------------------
-    # Loading / saving
-    # ------------------------------
 
     @classmethod
     def load_or_create(
@@ -207,12 +257,6 @@ class PaperBroker:
         *,
         starting_equity: float = 1000.0,
     ) -> "PaperBroker":
-        """
-        Load an existing paper ledger from disk, or create a new one.
-
-        The ledger lives at:
-            state/paper/<account_label>.json
-        """
         paper_dir = ROOT / "state" / "paper"
         paper_dir.mkdir(parents=True, exist_ok=True)
         state_path = paper_dir / f"{account_label}.json"
@@ -263,9 +307,12 @@ class PaperBroker:
                 len(state.open_positions),
                 len(state.closed_trades),
             )
-            return cls(state, state_path)
 
-        # Fresh ledger
+            broker = cls(state, state_path)
+            # ✅ Publish bus visibility on load (so TP/SL sees existing open paper positions)
+            _publish_positions_bus(account_label, state.open_positions)
+            return broker
+
         now = _now_ms()
         state = PaperAccountState(
             account_label=account_label,
@@ -281,6 +328,7 @@ class PaperBroker:
         )
         broker = cls(state, state_path)
         broker._save()
+        _publish_positions_bus(account_label, state.open_positions)
         log.info(
             "Created new paper ledger for %s (starting_equity=%.2f, risk_pct=%.4f)",
             account_label,
@@ -290,9 +338,6 @@ class PaperBroker:
         return broker
 
     def _save(self) -> None:
-        """
-        Persist the current state to disk.
-        """
         self._state.updated_ms = _now_ms()
         payload: Dict[str, Any] = {
             "account_label": self._state.account_label,
@@ -318,10 +363,6 @@ class PaperBroker:
                 e,
             )
 
-    # ------------------------------
-    # Core operations
-    # ------------------------------
-
     @property
     def account_label(self) -> str:
         return self._state.account_label
@@ -340,14 +381,7 @@ class PaperBroker:
     def list_closed_trades(self) -> List[PaperPosition]:
         return list(self._state.closed_trades)
 
-    # ------------------------------
-    # Trade lifecycle
-    # ------------------------------
-
     def _generate_trade_id(self, symbol: str) -> str:
-        """
-        Generate a stable, unique trade_id if executor didn't provide one.
-        """
         suffix = uuid.uuid4().hex[:10]
         return f"{self._state.account_label}-{symbol}-{suffix}"
 
@@ -366,17 +400,6 @@ class PaperBroker:
         trade_id: Optional[str] = None,
         log_setup: bool = False,
     ) -> PaperPosition:
-        """
-        Open a new PAPER position.
-
-        This method:
-            - Uses risk_usd/size from features if present
-            - Otherwise falls back to equity * risk_pct sizing
-            - Optionally logs a SetupRecord (log_setup=True) but normally
-              expects executor_v2 to have already done setup logging.
-            - Adds the position to open_positions
-            - Persists the paper ledger
-        """
         if entry_price <= 0 or stop_price <= 0:
             raise ValueError("entry_price and stop_price must be > 0")
 
@@ -386,7 +409,6 @@ class PaperBroker:
 
         features_ext = dict(features or {})
 
-        # Prefer risk_usd from features (executor-computed).
         if "risk_usd" in features_ext and features_ext["risk_usd"] is not None:
             try:
                 risk_amount = float(features_ext["risk_usd"])
@@ -402,8 +424,6 @@ class PaperBroker:
                 self._state.account_label,
             )
 
-        # Prefer size/qty from features; otherwise derive from risk / stop distance
-        size_val: float
         if "size" in features_ext and features_ext["size"] is not None:
             try:
                 size_val = float(features_ext["size"])
@@ -418,11 +438,9 @@ class PaperBroker:
             size_val = risk_amount / stop_distance if stop_distance > 0 else 0.0
             features_ext["size"] = float(size_val)
 
-        # Ensure we have a trade_id (executor should normally pass one)
         trade_id_final = trade_id or self._generate_trade_id(symbol)
         now = _now_ms()
 
-        # Optional setup logging (normally handled by executor_v2)
         if log_setup:
             try:
                 from app.ai.ai_events_spine import (  # type: ignore
@@ -462,6 +480,9 @@ class PaperBroker:
         self._state.open_positions.append(pos)
         self._save()
 
+        # ✅ Publish to canonical bus so tp_sl_manager sees it
+        _publish_positions_bus(self._state.account_label, self._state.open_positions)
+
         log.info(
             "[paper_broker] OPEN %s %s side=%s size=%.4f entry=%.4f sl=%.4f tp=%.4f risk_usd=%.2f",
             self._state.account_label,
@@ -482,10 +503,6 @@ class PaperBroker:
         exit_price: float,
         exit_reason: str,
     ) -> None:
-        """
-        Close an existing PAPER position, compute PnL & R, emit OutcomeRecord,
-        and move it from open_positions → closed_trades.
-        """
         if exit_price <= 0:
             raise ValueError("exit_price must be > 0")
 
@@ -507,7 +524,6 @@ class PaperBroker:
         pos.pnl_usd = float(pnl)
         pos.r_multiple = r_mult
 
-        # Update equity
         self._state.equity += float(pnl)
         equity_after = float(self._state.equity)
 
@@ -537,17 +553,20 @@ class PaperBroker:
                 "trade_duration_ms": trade_duration_ms,
                 "equity_before": equity_before,
                 "equity_after": equity_after,
+                "mode": "PAPER",
+                "source": "paper_broker",
             },
         )
         publish_ai_event(outcome_event)
 
-        # Remove from open_positions
         self._state.open_positions = [
             p for p in self._state.open_positions if p.trade_id != pos.trade_id
         ]
-        # Append to closed_trades
         self._state.closed_trades.append(pos)
         self._save()
+
+        # ✅ Publish updated bus after close
+        _publish_positions_bus(self._state.account_label, self._state.open_positions)
 
         log.info(
             "[paper_broker] CLOSE %s %s side=%s exit=%.4f pnl=%.2f R=%s reason=%s equity=%.2f",
@@ -561,23 +580,7 @@ class PaperBroker:
             self._state.equity,
         )
 
-    # ------------------------------
-    # Price update hook
-    # ------------------------------
-
     def update_price(self, symbol: str, price: float) -> None:
-        """
-        Update the paper engine with a new trade/mark price for `symbol`.
-
-        This will:
-            - Scan all open positions in this account_label for that symbol
-            - If price hits TP or SL, close the position and emit OutcomeRecord
-
-        NOTE:
-            - This does NOT pull prices itself.
-              Callers (WS switchboard, AI Pilot, etc.) must call this method
-              whenever a new price tick is available for that symbol.
-        """
         if price <= 0:
             return
 
@@ -587,12 +590,6 @@ class PaperBroker:
             if pos.symbol != symbol:
                 continue
 
-            # Long:
-            #   - TP hit if price >= take_profit_price
-            #   - SL hit if price <= stop_price
-            # Short:
-            #   - TP hit if price <= take_profit_price
-            #   - SL hit if price >= stop_price
             if pos.side == "long":
                 if price >= pos.take_profit_price:
                     to_close.append((pos, "tp_hit"))
@@ -608,29 +605,10 @@ class PaperBroker:
             self._close_position(pos, exit_price=price, exit_reason=reason)
 
 
-# ---------------------------------------------------------------------------
-# Minimal CLI / heartbeat (optional)
-# ---------------------------------------------------------------------------
-
 def main() -> None:
-    """
-    Minimal placeholder main().
-
-    This broker is intended to be driven by other workers (AI Pilot / Executor)
-    via direct method calls:
-
-        broker = PaperBroker.load_or_create("flashback01", starting_equity=1000.0)
-        # On each approved trade:
-        broker.open_position(...)
-        # On each new price for a symbol:
-        broker.update_price(symbol, price)
-
-    We still emit heartbeats so supervisor_ai_stack can monitor liveness
-    if this is ever run as a worker process.
-    """
     log.info(
         "PaperBroker main() called. This module is intended for import/use by "
-        "AI Pilot / Executor, not as a standalone loop."
+        "Executor, not as a standalone loop."
     )
     while True:
         try:
