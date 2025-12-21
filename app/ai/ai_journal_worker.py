@@ -103,16 +103,28 @@ def _handle_setup_context(ev: Dict[str, Any]) -> None:
     """
     Handle a 'setup_context' event.
 
-    Expected shape (flexible):
-        {
-          "event_type": "setup_context",
-          "ts": <epoch_ms>,
-          "trade_id": "...",
-          "symbol": "...",
-          "account_label": "...",
-          "payload": { ... }
-        }
+    Guardrails:
+    - Drop events where setup_type is 'unknown' (top-level or nested) to prevent
+      taxonomy-unknown rows from polluting training data.
     """
+    # Determine setup_type (flexible shapes)
+    st = (
+        ev.get("setup_type")
+        or ((ev.get("payload") or {}).get("setup_type") if isinstance(ev.get("payload"), dict) else None)
+        or (((ev.get("payload") or {}).get("features") or {}).get("setup_type") if isinstance((ev.get("payload") or {}).get("features"), dict) else None)
+    )
+    st_s = str(st or "").strip().lower()
+
+    if st_s == "unknown":
+        try:
+            tid = ev.get("trade_id")
+            sym = ev.get("symbol")
+            acct = ev.get("account_label")
+            log.warning("journal_drop_unknown_setup: trade_id=%s symbol=%s account=%s", tid, sym, acct)
+        except Exception:
+            pass
+        return
+
     payload = {
         "ts": ev.get("ts") or int(time.time() * 1000),
         "trade_id": ev.get("trade_id"),
@@ -122,8 +134,6 @@ def _handle_setup_context(ev: Dict[str, Any]) -> None:
         "data": ev.get("payload") or ev,
     }
     _write_jsonl(SETUPS_PATH, payload)
-
-
 def _handle_outcome_record(ev: Dict[str, Any]) -> None:
     """
     Handle an 'outcome_record' event.

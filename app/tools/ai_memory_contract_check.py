@@ -12,13 +12,12 @@ Single-command PASS/FAIL check that:
 
 Usage
 -----
-python app/tools/ai_memory_contract_check.py
+python -m app.tools.ai_memory_contract_check
 """
 
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any, Dict
 
 from app.ai.ai_memory_contract import (
     ContractPaths,
@@ -27,8 +26,6 @@ from app.ai.ai_memory_contract import (
     validate_outcome_enriched,
     validate_decision_record,
 )
-
-PATHS = ContractPaths.default()
 
 
 def _exists(p: Path) -> bool:
@@ -49,12 +46,20 @@ def _peek_keys(path: Path, n: int = 2) -> None:
 
 def main() -> None:
     print("=== AI Memory Contract Check v1 ===")
-    print(f"setups   : {PATHS.setups_path}")
-    print(f"outcomes : {PATHS.outcomes_path}")
-    print(f"decisions: {PATHS.decisions_path}")
+
+    try:
+        paths = ContractPaths.default()
+    except Exception as e:
+        print("\nFAIL ❌ ContractPaths.default() crashed:")
+        print("  -", repr(e))
+        return
+
+    print(f"setups   : {paths.setups_path}")
+    print(f"outcomes : {paths.outcomes_path}")
+    print(f"decisions: {paths.decisions_path}")
 
     missing = []
-    for p in (PATHS.setups_path, PATHS.outcomes_path, PATHS.decisions_path):
+    for p in (paths.setups_path, paths.outcomes_path, paths.decisions_path):
         if not _exists(p):
             missing.append(str(p))
     if missing:
@@ -63,19 +68,16 @@ def main() -> None:
             print("  -", m)
         return
 
-    # Validate samples
     sample_n = 200
-    setup_ok = 0
-    setup_bad = 0
-    for ev in iter_jsonl(PATHS.setups_path, max_lines=sample_n):
+
+    setup_ok = setup_bad = 0
+    for ev in iter_jsonl(paths.setups_path, max_lines=sample_n):
         ok, _ = validate_setup_record(ev)
         setup_ok += 1 if ok else 0
         setup_bad += 0 if ok else 1
 
-    out_ok = 0
-    out_bad = 0
-    out_not_enriched = 0
-    for ev in iter_jsonl(PATHS.outcomes_path, max_lines=sample_n):
+    out_ok = out_bad = out_not_enriched = 0
+    for ev in iter_jsonl(paths.outcomes_path, max_lines=sample_n):
         ok, reason = validate_outcome_enriched(ev)
         if ok:
             out_ok += 1
@@ -84,9 +86,8 @@ def main() -> None:
                 out_not_enriched += 1
             out_bad += 1
 
-    dec_ok = 0
-    dec_bad = 0
-    for ev in iter_jsonl(PATHS.decisions_path, max_lines=sample_n):
+    dec_ok = dec_bad = 0
+    for ev in iter_jsonl(paths.decisions_path, max_lines=sample_n):
         ok, _ = validate_decision_record(ev)
         dec_ok += 1 if ok else 0
         dec_bad += 0 if ok else 1
@@ -100,14 +101,9 @@ def main() -> None:
     print(f"decision_sample_ok  : {dec_ok}")
     print(f"decision_sample_bad : {dec_bad}")
 
-    # Keys peek for sanity (helps catch contamination quickly)
-    _peek_keys(PATHS.setups_path, n=2)
-    _peek_keys(PATHS.outcomes_path, n=2)
+    _peek_keys(paths.setups_path, n=2)
+    _peek_keys(paths.outcomes_path, n=2)
 
-    # Verdict rules (Phase 5 foundations):
-    # - Setups sample should mostly validate
-    # - Outcomes should be outcome_enriched for learning substrate
-    # - Decisions sample should mostly validate
     if setup_ok < 10:
         print("\nFAIL ❌ Not enough valid setup_context rows found.")
         return

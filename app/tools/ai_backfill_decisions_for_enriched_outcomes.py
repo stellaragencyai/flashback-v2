@@ -1,27 +1,28 @@
-#!/usr/bin/env python3
+﻿#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Flashback — Decision Backfill for outcome_enriched (Phase 5 unblock) v2
+Flashback — Decision Backfill for outcome_enriched (Phase 5 unblock) v3.1 ✅
+
+ENFORCEMENT:
+- Single-writer law: MUST NOT write directly to state/ai_decisions.jsonl.
+- All writes go through app.core.ai_decision_logger.append_decision.
+- If logger import fails, tool fails closed (no raw append fallback).
 
 What it does
 ------------
 - Scans state/ai_events/outcomes.jsonl for event_type="outcome_enriched"
 - For each trade_id found:
     - If ai_decisions.jsonl has no decision for that trade_id:
-        append a minimal BLOCKED_BY_GATES decision WITH context (account_label/symbol/etc)
-
-Why
----
-Your join pipeline needs decision(trade_id) for each outcome_enriched(trade_id).
-Backfill should complete the contract without corrupting learning.
+        append a minimal BLOCK decision with context.
 
 Usage
 -----
-python app/tools/ai_backfill_decisions_for_enriched_outcomes.py
+python .\app\tools\ai_backfill_decisions_for_enriched_outcomes.py
 """
 
 from __future__ import annotations
 
+import sys
 import time
 from pathlib import Path
 from typing import Any, Dict, Iterator, Optional, Set, Tuple
@@ -46,6 +47,8 @@ def _iter_jsonl(path: Path) -> Iterator[Dict[str, Any]]:
             raw = line.strip()
             if not raw:
                 continue
+            if raw[:1] != b"{":
+                continue
             try:
                 obj = orjson.loads(raw)
             except Exception:
@@ -62,23 +65,17 @@ def _safe_str(x: Any) -> str:
 
 
 def _extract_outcome_context(ev: Dict[str, Any]) -> Tuple[str, str, str, Optional[str]]:
-    """
-    Returns: (account_label, symbol, timeframe, policy_hash)
-    Best-effort across outcome_enriched shapes.
-    """
     account_label = _safe_str(ev.get("account_label"))
     symbol = _safe_str(ev.get("symbol")).upper()
     timeframe = _safe_str(ev.get("timeframe"))
 
-    # outcome_enriched often carries policy in ev["policy"]["policy_hash"]
-    policy_hash = None
+    policy_hash: Optional[str] = None
     pol = ev.get("policy")
     if isinstance(pol, dict):
         ph = _safe_str(pol.get("policy_hash"))
         if ph:
             policy_hash = ph
 
-    # sometimes nested under setup/setup_context
     setup = ev.get("setup")
     if isinstance(setup, dict):
         if not account_label:
@@ -93,6 +90,14 @@ def _extract_outcome_context(ev: Dict[str, Any]) -> Tuple[str, str, str, Optiona
             ph2 = _safe_str(pol2.get("policy_hash"))
             if ph2:
                 policy_hash = ph2
+
+        payload = setup.get("payload")
+        if not timeframe and isinstance(payload, dict):
+            extra = payload.get("extra")
+            if isinstance(extra, dict):
+                tf = _safe_str(extra.get("timeframe"))
+                if tf:
+                    timeframe = tf
 
     setup_ctx = ev.get("setup_context")
     if isinstance(setup_ctx, dict):
@@ -109,20 +114,13 @@ def _extract_outcome_context(ev: Dict[str, Any]) -> Tuple[str, str, str, Optiona
             if ph3:
                 policy_hash = ph3
 
-    # Common: outcome_enriched has setup.payload.extra.timeframe
-    payload = setup.get("payload") if isinstance(setup, dict) else None
-    if not timeframe and isinstance(payload, dict):
-        extra = payload.get("extra")
-        if isinstance(extra, dict):
-            tf = _safe_str(extra.get("timeframe"))
-            if tf:
-                timeframe = tf
-
     return (account_label, symbol, timeframe, policy_hash)
 
 
 def _decisions_trade_ids() -> Set[str]:
     s: Set[str] = set()
+    if not DECISIONS_PATH.exists():
+        return s
     for ev in _iter_jsonl(DECISIONS_PATH):
         tid = _safe_str(ev.get("trade_id"))
         if tid:
@@ -130,17 +128,27 @@ def _decisions_trade_ids() -> Set[str]:
     return s
 
 
-def _append_decision(payload: Dict[str, Any]) -> None:
-    DECISIONS_PATH.parent.mkdir(parents=True, exist_ok=True)
-    with DECISIONS_PATH.open("ab") as f:
-        f.write(orjson.dumps(payload))
-        f.write(b"\n")
+try:
+    from app.core.ai_decision_logger import append_decision as append_decision
+except Exception as e:
+    append_decision = None  # type: ignore
+    _IMPORT_ERR = e
+else:
+    _IMPORT_ERR = None
+
+
+def _require_logger() -> None:
+    if append_decision is not None:
+        return
+    raise RuntimeError(f"FATAL: ai_decision_logger.append_decision unavailable (single-writer law). err={_IMPORT_ERR!r}")
 
 
 def main() -> None:
-    print("=== Decision Backfill v2 (outcome_enriched -> ai_decisions) ===")
+    print("=== Decision Backfill v3.1 (outcome_enriched -> ai_decisions) ===")
     print("outcomes :", OUTCOMES_PATH)
     print("decisions:", DECISIONS_PATH)
+
+    _require_logger()
 
     if not OUTCOMES_PATH.exists():
         print("FAIL: outcomes.jsonl missing")
@@ -149,7 +157,6 @@ def main() -> None:
     existing = _decisions_trade_ids()
     print("existing_decisions_trade_ids:", len(existing))
 
-    # collect needed trade_ids + context
     needed: Dict[str, Tuple[str, str, str, Optional[str]]] = {}
     sample = []
 
@@ -164,7 +171,6 @@ def main() -> None:
 
         ctx = _extract_outcome_context(ev)
         needed[tid] = ctx
-
         if len(sample) < 10:
             sample.append(tid)
 
@@ -174,34 +180,33 @@ def main() -> None:
 
     wrote = 0
     now = _now_ms()
+
     for tid in sorted(needed.keys()):
         account_label, symbol, timeframe, policy_hash = needed[tid]
 
-        # Minimal contract-ish decision. We intentionally BLOCK to be safe.
         payload: Dict[str, Any] = {
-            "schema_version": 1,
-            "ts": now,
             "ts_ms": now,
+            "event_type": "ai_decision",
             "trade_id": tid,
             "client_trade_id": tid,
+            "source_trade_id": None,
             "account_label": account_label,
             "symbol": symbol,
             "timeframe": timeframe,
             "policy_hash": policy_hash,
-            "decision": "BLOCKED_BY_GATES",
-            "tier_used": "NONE",
-            "memory": None,
-            "gates": {"reason": "backfill_for_memory_builder"},
-            "proposed_action": None,
-            "size_multiplier": 1.0,
             "allow": False,
+            "decision_code": "BLOCKED_BY_GATES",
             "reason": "backfill_for_memory_builder",
+            "tier_used": "NONE",
+            "gates": {"reason": "backfill_for_memory_builder"},
+            "memory": None,
+            "size_multiplier": 1.0,
             "mode": "BACKFILL",
+            "extra": {"stage": "backfill", "backfill_source": "outcome_enriched"},
         }
 
-        _append_decision(payload)
+        append_decision(payload)  # type: ignore[misc]
         wrote += 1
-        # bump ts for deterministic ordering if many lines append in same ms
         now += 1
 
     print("backfill_written:", wrote)

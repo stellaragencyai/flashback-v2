@@ -157,13 +157,28 @@ def classify_health(
             reasons["features_trades_empty"] = "features_trades.jsonl exists but has 0 rows"
 
     # Decide status
-    # FAIL conditions:
+    # Detect fresh system (no trades yet)
+    trades_log = features.path.parent / "trades_log.jsonl"
+    is_fresh = (
+        store.exists
+        and store.rows == 0
+        and features.exists
+        and features.rows == 0
+        and not trades_log.exists()
+    )
+
+    # FAIL conditions
     fail_keys_prefixes = (
         "feature_store_missing",
-        "feature_store_too_small",
         "feature_store_corrupt",
     )
+
     is_fail = any(k.startswith(fail_keys_prefixes) for k in reasons.keys())
+
+    # feature_store_too_small is FAIL only if NOT fresh
+    if "feature_store_too_small" in reasons and not is_fresh:
+        is_fail = True
+
 
     # WARN conditions:
     # - stale store

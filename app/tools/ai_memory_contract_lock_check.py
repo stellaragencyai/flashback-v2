@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Flashback — AI Memory Contract LOCK Check v1 (Phase 5.5)
+Flashback — AI Memory Contract LOCK Check v1.1 (Phase 5.5)
 
 Brutal invariants, minimal excuses.
 
@@ -9,6 +9,7 @@ PASS criteria:
 - state/ai_memory/memory_entries.jsonl exists + non-empty
 - state/ai_memory/memory_index.sqlite exists + non-empty
 - SQLite table memory_entries exists with required columns
+- SQLite primary key is entry_id (history-safe identity)
 - JSONL rows are schema-stable:
     - schema_version == 1
     - event_type == "memory_entry"
@@ -16,17 +17,19 @@ PASS criteria:
     - no unknown top-level keys
     - decision/outcome sub-objects present with stable types
     - fingerprints + policy_hash present
-    - trade_id unique within JSONL
-- SQLite row count == JSONL row count
+    - entry_id UNIQUE within JSONL (identity)
+    - trade_id MAY repeat (history is expected)
+- SQLite row count == JSONL ok row count
 """
 
 from __future__ import annotations
 
 import argparse
+import json
 import sqlite3
 import sys
 from pathlib import Path
-from typing import Any, Dict, Iterable, Optional, Set, Tuple
+from typing import Any, Dict, Optional, Set, Tuple
 
 from app.ai.ai_memory_contract import ContractPaths, iter_jsonl, normalize_symbol, normalize_timeframe
 
@@ -52,11 +55,18 @@ def _connect(db_path: Path) -> sqlite3.Connection:
     conn.row_factory = sqlite3.Row
     return conn
 
-def _table_columns(conn: sqlite3.Connection, table: str) -> Set[str]:
+def _table_info(conn: sqlite3.Connection, table: str) -> list[sqlite3.Row]:
     cur = conn.cursor()
     cur.execute(f"PRAGMA table_info({table});")
-    rows = cur.fetchall()
-    return {str(r["name"]) for r in rows}
+    return cur.fetchall()
+
+def _table_columns(conn: sqlite3.Connection, table: str) -> Set[str]:
+    return {str(r["name"]) for r in _table_info(conn, table)}
+
+def _pk_column_names(conn: sqlite3.Connection, table: str) -> Set[str]:
+    # PRAGMA table_info: "pk" is 1-based order for PK columns; 0 means not PK.
+    rows = _table_info(conn, table)
+    return {str(r["name"]) for r in rows if int(r["pk"] or 0) > 0}
 
 def _as_bool(v: Any) -> Optional[bool]:
     if v is None:
@@ -112,6 +122,7 @@ TOP_LEVEL_ALLOWED: Set[str] = {
 TOP_LEVEL_REQUIRED: Set[str] = {
     "schema_version",
     "event_type",
+    "entry_id",
     "ts_ms",
     "trade_id",
     "symbol",
@@ -136,8 +147,8 @@ OUTCOME_REQUIRED: Set[str] = {
 }
 
 SQL_REQUIRED_COLS: Set[str] = {
-    "trade_id",
     "entry_id",
+    "trade_id",
     "ts_ms",
     "symbol",
     "timeframe",
@@ -168,6 +179,11 @@ def _validate_row(ev: Dict[str, Any]) -> Tuple[bool, str]:
         return False, f"bad_schema_version={ev.get('schema_version')}"
     if ev.get("event_type") != "memory_entry":
         return False, f"bad_event_type={ev.get('event_type')}"
+
+    # entry_id
+    eid = str(ev.get("entry_id") or "").strip()
+    if not eid:
+        return False, "missing_entry_id"
 
     # trade_id
     tid = str(ev.get("trade_id") or "").strip()
@@ -239,13 +255,20 @@ def _validate_row(ev: Dict[str, Any]) -> Tuple[bool, str]:
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--max-lines", type=int, default=0, help="Max JSONL lines to scan (0 = no cap)")
+    ap.add_argument("--db-sample", type=int, default=5, help="How many newest DB rows to spot-check (default 5, max 50)")
     args = ap.parse_args()
+
     max_lines = args.max_lines if args.max_lines and args.max_lines > 0 else None
+    db_sample = int(args.db_sample or 5)
+    if db_sample < 1:
+        db_sample = 1
+    if db_sample > 50:
+        db_sample = 50
 
     mem_jsonl = PATHS.memory_entries_path
     mem_db = PATHS.memory_index_path
 
-    print("=== AI Memory Contract LOCK Check v1 ===")
+    print("=== AI Memory Contract LOCK Check v1.1 ===")
     print(f"memory_entries.jsonl : {mem_jsonl}")
     print(f"memory_index.sqlite  : {mem_db}")
 
@@ -254,38 +277,51 @@ def main() -> None:
     if not _exists_nonempty(mem_db):
         _fail("memory_index.sqlite missing or empty. Rebuild memory first.")
 
-    # Validate JSONL
-    seen: Set[str] = set()
+    # ---------------- JSONL validation ----------------
+
+    seen_entry_ids: Set[str] = set()
+    trade_ids: Set[str] = set()
+
     ok_n = 0
     bad_n = 0
+    dup_trade_ids = 0
+
     first_bad: Optional[str] = None
+    last_ok_entry_id: Optional[str] = None
 
     for ev in iter_jsonl(mem_jsonl, max_lines=max_lines):
-        tid = str(ev.get("trade_id") or "").strip()
-        if tid:
-            if tid in seen:
-                _fail(f"duplicate trade_id in memory_entries.jsonl: {tid}")
-            seen.add(tid)
-
         ok, reason = _validate_row(ev)
-        if ok:
-            ok_n += 1
-        else:
+        if not ok:
             bad_n += 1
             if first_bad is None:
                 first_bad = reason
-
-        # hard stop if it’s clearly broken
-        if bad_n >= 1:
-            # We fail on first bad row: this is a LOCK check, not a dashboard.
             _fail(f"memory_entries.jsonl schema violation: {first_bad}")
+
+        # identity
+        eid = str(ev.get("entry_id") or "").strip()
+        if eid in seen_entry_ids:
+            _fail(f"duplicate entry_id in memory_entries.jsonl (identity must be unique): {eid}")
+        seen_entry_ids.add(eid)
+        last_ok_entry_id = eid
+
+        # trade_id is allowed to repeat (history)
+        tid = str(ev.get("trade_id") or "").strip()
+        if tid:
+            if tid in trade_ids:
+                dup_trade_ids += 1
+            trade_ids.add(tid)
+
+        ok_n += 1
 
     if ok_n < 1:
         _fail("No readable memory_entry rows found in memory_entries.jsonl")
 
-    print(f"[JSONL] ok_rows={ok_n} bad_rows={bad_n} unique_trade_ids={len(seen)}")
+    print(f"[JSONL] ok_rows={ok_n} bad_rows={bad_n} unique_entry_ids={len(seen_entry_ids)} unique_trade_ids={len(trade_ids)} dup_trade_id_rows={dup_trade_ids}")
+    if dup_trade_ids > 0:
+        print("[JSONL] note: duplicate trade_id rows detected (expected for history-safe memory).")
 
-    # Validate SQLite schema + counts
+    # ---------------- SQLite validation ----------------
+
     conn = _connect(mem_db)
     try:
         cols = _table_columns(conn, "memory_entries")
@@ -293,28 +329,49 @@ def main() -> None:
         if missing_cols:
             _fail(f"SQLite table memory_entries missing required columns: {missing_cols}")
 
+        pk_cols = _pk_column_names(conn, "memory_entries")
+        if "entry_id" not in pk_cols:
+            _fail(f"SQLite primary key is not entry_id. pk_cols={sorted(list(pk_cols))} (must include entry_id for history-safe identity)")
+
         cur = conn.cursor()
         cur.execute("SELECT COUNT(*) AS n FROM memory_entries;")
         db_n = int(cur.fetchone()["n"])
 
         if db_n != ok_n:
-            _fail(f"Row count mismatch: sqlite={db_n} jsonl={ok_n} (must match exactly)")
+            _fail(f"Row count mismatch: sqlite={db_n} jsonl_ok_rows={ok_n} (must match exactly)")
 
-        # spot-check raw_json decodes for a few rows (cheap corruption detector)
-        cur.execute("SELECT trade_id, raw_json FROM memory_entries ORDER BY ts_ms DESC LIMIT 5;")
-        for r in cur.fetchall():
+        # Cheap corruption detector: raw_json must exist and decode.
+        cur.execute("SELECT entry_id, trade_id, raw_json FROM memory_entries ORDER BY ts_ms DESC LIMIT ?;", (db_sample,))
+        rows = cur.fetchall()
+        for r in rows:
             tj = r["raw_json"]
             if not isinstance(tj, str) or len(tj.strip()) < 10:
-                _fail(f"SQLite raw_json missing/short for trade_id={r['trade_id']}")
+                _fail(f"SQLite raw_json missing/short for entry_id={r['entry_id']} trade_id={r['trade_id']}")
+            try:
+                obj = json.loads(tj)
+            except Exception:
+                _fail(f"SQLite raw_json not valid JSON for entry_id={r['entry_id']} trade_id={r['trade_id']}")
+
+            # Raw JSON must match row identity (hard invariant)
+            if str(obj.get("entry_id") or "").strip() != str(r["entry_id"] or "").strip():
+                _fail(f"SQLite raw_json entry_id mismatch for entry_id={r['entry_id']}")
+            if str(obj.get("trade_id") or "").strip() != str(r["trade_id"] or "").strip():
+                _fail(f"SQLite raw_json trade_id mismatch for entry_id={r['entry_id']}")
+
+        # Spot-check: last OK JSONL entry_id exists in DB (helps catch “JSONL written but DB insert skipped” bugs)
+        if last_ok_entry_id:
+            cur.execute("SELECT COUNT(*) AS n FROM memory_entries WHERE entry_id = ?;", (last_ok_entry_id,))
+            n = int(cur.fetchone()["n"])
+            if n != 1:
+                _fail(f"SQLite missing last JSONL entry_id={last_ok_entry_id} (JSONL/DB drift)")
 
     finally:
         conn.close()
 
-    print(f"[SQL] required_cols_ok=1 row_count={db_n}")
+    print(f"[SQL] required_cols_ok=1 pk_entry_id_ok=1 row_count={db_n}")
 
-    # If we got here, we’re stable.
-    print("\nPASS ✅ MemoryEntry substrate is LOCKED and schema-stable.")
-    print("This means Phase 6+ can consume memory without silent drift poisoning learning.")
+    print("\nPASS ✅ MemoryEntry substrate is LOCKED and schema-stable (history-safe).")
+    print("Phase 6+ can consume memory without silent drift poisoning learning.")
 
 if __name__ == "__main__":
     main()

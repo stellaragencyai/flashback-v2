@@ -1,24 +1,24 @@
 ﻿#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Flashback — AI Memory Store (Rollups Read Path) v2.1 ✅ Phase 6-ready
+Flashback — AI Memory Store (Rollups Read Path) v2.3 ✅ Phase 6-ready
 
-Fix v2.1
-- policy_hash matching is now prefix-tolerant when the incoming hash is short.
-  This prevents strict equality misses when upstream only provides a short prefix
-  (e.g., 12 chars) but rollups store the full hash.
+Fix v2.3
+- Expose top-level memory["size_multiplier"] derived from rollups avg_size_multiplier
+  so AI Pilot (and others) can apply memory sizing.
+- Clamp size_multiplier to safe bounds (0.0..1.0 by default; allow >1.0 only if explicitly desired later).
+
+Fix v2.2
+- Query rollups by memory_fingerprint (stable lookup key), not memory_id.
+- memory_fingerprint matching is prefix-tolerant (like hashes).
+- Keeps policy_hash prefix-tolerant behavior from v2.1.
 
 Behavior
 - Reads aggregated rollups from: state/ai_memory/memory_rollups.sqlite
-- Provides tiered query:
-    Tier A: symbol-scoped (symbol=<SYMBOL>)
+- Tiered query:
+    Tier A: symbol-scoped
     Tier B: ANY fallback
 - Strict policy + timeframe by default
-- Matches by memory_id == setup_event.payload.features.memory_fingerprint
-  (supports prefix match if fingerprint is shorter)
-
-Why
-- Rollups are the production substrate: stable schema + cheap queries
 """
 
 from __future__ import annotations
@@ -81,6 +81,22 @@ def _safe_str(x: Any) -> str:
         return ""
 
 
+def _safe_float(x: Any, default: float = 0.0) -> float:
+    try:
+        if x is None:
+            return float(default)
+        return float(x)
+    except Exception:
+        return float(default)
+
+
+def _clamp(x: float, lo: float, hi: float) -> float:
+    try:
+        return max(lo, min(hi, float(x)))
+    except Exception:
+        return lo
+
+
 def _connect(db_path: Path) -> sqlite3.Connection:
     conn = sqlite3.connect(str(db_path))
     conn.row_factory = sqlite3.Row
@@ -88,14 +104,14 @@ def _connect(db_path: Path) -> sqlite3.Connection:
 
 
 def _looks_like_full_hash(s: str) -> bool:
-    """
-    We store full policy hashes upstream (typically long hex).
-    If caller passes only a prefix (often 12), strict equality will miss.
-    Treat anything "short" as a prefix.
-    """
     s = (s or "").strip()
-    # 64-hex is common, but we accept "long enough" as full.
     return len(s) >= 24
+
+
+def _looks_like_full_fp(s: str) -> bool:
+    # fingerprints are typically sha256 hex (64), but callers might pass shorter prefixes
+    s = (s or "").strip()
+    return len(s) >= 32
 
 
 @dataclass(frozen=True)
@@ -154,8 +170,11 @@ def _get_setup_fields(setup_event: Dict[str, Any]) -> Tuple[str, str, str, str, 
 
 def _row_to_memory(r: sqlite3.Row) -> Dict[str, Any]:
     """
-    Return the memory dict shape expected by ai_gatekeeper:
-      memory["stats"]["n,wins,losses,r_mean,r_sum"] etc.
+    Return the memory dict shape expected by ai_gatekeeper AND AI Pilot sizing.
+
+    IMPORTANT:
+    - ai_pilot reads top-level memory["size_multiplier"] (or "sizeMult"/"multiplier").
+    - rollups store avg_size_multiplier, so we surface it at top-level as size_multiplier.
     """
     n = int(r["n"] or 0)
     wins = int(r["wins"] or 0)
@@ -164,13 +183,28 @@ def _row_to_memory(r: sqlite3.Row) -> Dict[str, Any]:
     avg_r = float(r["avg_r_multiple"] or 0.0)
     r_sum = avg_r * float(n)
 
+    avg_size_mult = _safe_float(r["avg_size_multiplier"], 1.0)
+
+    # Safety clamp: keep memory sizing conservative.
+    # If you later want >1.0 to "press winners", do that upstream with explicit policy.
+    size_mult = _clamp(avg_size_mult, 0.0, 1.0)
+
     out: Dict[str, Any] = {
+        # stable lookup key
+        "memory_fingerprint": r["memory_fingerprint"],
+
+        # optional derived identity
         "memory_id": r["memory_id"],
+
         "symbol": r["symbol"],
         "timeframe": r["timeframe"],
         "setup_type": r["setup_type"],
         "policy_hash": r["policy_hash"],
         "last_ts_ms": int(r["last_ts_ms"] or 0),
+
+        # ✅ surfaced for ai_pilot sizing semantics
+        "size_multiplier": float(size_mult),
+
         "stats": {
             "n": n,
             "wins": wins,
@@ -180,7 +214,7 @@ def _row_to_memory(r: sqlite3.Row) -> Dict[str, Any]:
             "win_rate": r["win_rate"],
             "avg_pnl_usd": r["avg_pnl_usd"],
             "allow_rate": r["allow_rate"],
-            "avg_size_multiplier": r["avg_size_multiplier"],
+            "avg_size_multiplier": float(avg_size_mult),
         },
     }
     return out
@@ -188,7 +222,7 @@ def _row_to_memory(r: sqlite3.Row) -> Dict[str, Any]:
 
 def _query_rollups(
     *,
-    memory_id: str,
+    memory_fingerprint: str,
     symbol: Optional[str],
     timeframe: Optional[str],
     setup_type: Optional[str],
@@ -203,16 +237,13 @@ def _query_rollups(
     max_age_ms = int(max(1, max_age_days) * 24 * 60 * 60 * 1000)
     now = _now_ms()
 
-    clauses = ["memory_id LIKE :mem_like", "n >= :min_n"]
+    clauses = ["memory_fingerprint LIKE :mfp_like", "n >= :min_n", "last_ts_ms >= :age_cutoff"]
     params: Dict[str, Any] = {
-        "mem_like": (memory_id + "%") if len(memory_id) < 64 else memory_id,
+        "mfp_like": (memory_fingerprint + "%") if not _looks_like_full_fp(memory_fingerprint) else memory_fingerprint,
         "min_n": int(min_n),
         "age_cutoff": int(now - max_age_ms),
         "k": int(max(1, k)),
     }
-
-    # age filter
-    clauses.append("last_ts_ms >= :age_cutoff")
 
     if symbol:
         clauses.append("symbol = :symbol")
@@ -226,7 +257,7 @@ def _query_rollups(
         clauses.append("setup_type = :setup_type")
         params["setup_type"] = setup_type
 
-    # ✅ FIX: policy hash can be short prefix from upstream
+    # policy hash can be a short prefix from upstream
     if policy_hash:
         ph = str(policy_hash).strip()
         if _looks_like_full_hash(ph):
@@ -243,7 +274,9 @@ def _query_rollups(
     cur.execute(
         f"""
         SELECT
-            memory_id, symbol, timeframe, setup_type, policy_hash,
+            memory_fingerprint,
+            memory_id,
+            symbol, timeframe, setup_type, policy_hash,
             n, wins, losses,
             win_rate, avg_r_multiple, avg_pnl_usd,
             allow_rate, avg_size_multiplier,
@@ -284,7 +317,7 @@ def query_memories_tiered(setup_event: Dict[str, Any], opts: QueryOptions = Quer
 
     if opts.prefer_symbol_scope and sym:
         mA = _query_rollups(
-            memory_id=mem_fp,
+            memory_fingerprint=mem_fp,
             symbol=sym,
             timeframe=tfn,
             setup_type=st,
@@ -307,7 +340,7 @@ def query_memories_tiered(setup_event: Dict[str, Any], opts: QueryOptions = Quer
 
     if opts.allow_any_fallback:
         mB = _query_rollups(
-            memory_id=mem_fp,
+            memory_fingerprint=mem_fp,
             symbol=None,
             timeframe=tfn,
             setup_type=st,
@@ -349,3 +382,4 @@ def query_memories(setup_event: Dict[str, Any], opts: QueryOptions = QueryOption
     r = query_memories_tiered(setup_event, opts2)
     r["tier_used"] = "B" if r.get("matched") else "NONE"
     return r
+

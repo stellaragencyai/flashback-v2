@@ -92,6 +92,9 @@ _POSITION_BUS_ALLOW_REST_WRITE: bool = (
 # Logical label for "this" account/process (main, flashback10, etc.)
 ACCOUNT_LABEL: str = os.getenv("ACCOUNT_LABEL", "main").strip() or "main"
 
+# Mirror of flashback_common.EXEC_DRY_RUN (avoid importing to keep this module stable)
+EXEC_DRY_RUN: bool = os.getenv("EXEC_DRY_RUN", "false").strip().lower() in ("1","true","yes","y","on")
+
 _CANONICAL_VERSION: int = 2  # normalized schema version
 
 
@@ -322,6 +325,18 @@ def get_positions_for_label(
 
     # Snapshot path
     snap, age = get_snapshot()
+
+    # DRY_RUN: keep positions bus fresh even when empty (no WS/REST dependency)
+    if EXEC_DRY_RUN:
+        # If missing or stale, write a fresh empty snapshot for this label
+        if snap is None or age is None or age > float(max_age_seconds):
+            labels_block = {}
+            if isinstance(snap, dict):
+                labels_block = dict(snap.get("labels") or {})
+            labels_block[label] = {"category": category, "positions": []}
+            _save_snapshot(labels_block)
+            # return empty (paper mode should not invent positions)
+            return []
     if snap is not None and age is not None and age <= max_age_seconds:
         raw_positions = _extract_label_positions_raw(
             snap,

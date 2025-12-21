@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 
 """
-Flashback — AI Decision↔Outcome Inspector (Phase 4) v1.0
+Flashback - AI Decision<->Outcome Inspector (Phase 4) v1.1 (Windows-safe)
 
 Purpose
 -------
@@ -19,20 +19,56 @@ You don't "have Phase 4" until you can measure:
 - decision coverage
 - gate effectiveness
 - outcome distribution by decision
+
+Patch v1.1
+----------
+- Remove unicode banner characters that crash on Windows cp1252 consoles.
+- Best-effort force UTF-8 stdout (works in modern Python/terminals).
+- Fallback safe printing to avoid UnicodeEncodeError.
 """
 
 from __future__ import annotations
 
 import argparse
+import sys
 from collections import Counter, defaultdict
 from pathlib import Path
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List
 
 import orjson
 
 
 ROOT = Path(__file__).resolve().parents[2]
 JOINED_PATH = ROOT / "state" / "ai_decision_outcomes.jsonl"
+
+
+def _configure_stdout_utf8() -> None:
+    """
+    Best-effort: avoid UnicodeEncodeError on Windows consoles.
+    If reconfigure isn't available or fails, we fall back to safe printing.
+    """
+    try:
+        if hasattr(sys.stdout, "reconfigure"):
+            # type: ignore[attr-defined]
+            sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        return
+
+
+def _safe_print(s: str) -> None:
+    """
+    Print that will not crash on weird encodings.
+    """
+    try:
+        print(s)
+    except UnicodeEncodeError:
+        try:
+            b = s.encode("utf-8", errors="replace")
+            sys.stdout.buffer.write(b + b"\n")
+        except Exception:
+            # Last resort: strip non-ascii
+            ascii_s = s.encode("ascii", errors="replace").decode("ascii", errors="replace")
+            print(ascii_s)
 
 
 def _safe_int(x: Any, default: int = 0) -> int:
@@ -80,14 +116,14 @@ def _tail_jsonl(path: Path, n: int) -> List[Dict[str, Any]]:
         return []
     size = path.stat().st_size
     window = min(size, 2 * 1024 * 1024)
-    data = b""
+
     with path.open("rb") as f:
         if size > window:
             f.seek(size - window)
         data = f.read()
 
     lines = [ln for ln in data.splitlines() if ln.strip()]
-    tail = lines[-max(1, n):]
+    tail = lines[-max(1, n) :]
     out: List[Dict[str, Any]] = []
     for ln in tail:
         try:
@@ -122,20 +158,22 @@ def _extract_summary(row: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def main() -> int:
+    _configure_stdout_utf8()
+
     ap = argparse.ArgumentParser()
     ap.add_argument("--min_coverage", type=float, default=0.50, help="Fail if decision coverage < this")
     ap.add_argument("--tail", type=int, default=5, help="Show last N summarized rows")
     args = ap.parse_args()
 
     if not JOINED_PATH.exists():
-        print(f"FAIL: missing {JOINED_PATH}")
+        _safe_print(f"FAIL: missing {JOINED_PATH}")
         return 2
 
     # Read full file (Phase 4 files are small now; later we can optimize)
     rows = _read_jsonl(JOINED_PATH, limit=0)
     total = len(rows)
     if total <= 0:
-        print("FAIL: file exists but no valid JSONL rows parsed.")
+        _safe_print("FAIL: file exists but no valid JSONL rows parsed.")
         return 3
 
     status_ctr = Counter()
@@ -167,34 +205,38 @@ def main() -> int:
 
     coverage = (ok_with_decision / ok_total) if ok_total > 0 else 0.0
 
-    print("\n=== AI DECISION↔OUTCOME INSPECTOR ===")
-    print(f"file: {JOINED_PATH}")
-    print(f"rows_total: {total}")
-    print(f"status_counts: {dict(status_ctr)}")
-    print(f"ok_total: {ok_total}  ok_with_decision: {ok_with_decision}  coverage: {coverage:.3f}")
-    print(f"decision_counts: {dict(decision_ctr)}")
-    print(f"gates_reason_counts: {dict(gates_ctr)}")
+    _safe_print("\n=== AI DECISION<->OUTCOME INSPECTOR ===")
+    _safe_print(f"file: {JOINED_PATH}")
+    _safe_print(f"rows_total: {total}")
+    _safe_print(f"status_counts: {dict(status_ctr)}")
+    _safe_print(f"ok_total: {ok_total}  ok_with_decision: {ok_with_decision}  coverage: {coverage:.3f}")
+    _safe_print(f"decision_counts: {dict(decision_ctr)}")
+    _safe_print(f"gates_reason_counts: {dict(gates_ctr)}")
 
     # PnL means per decision code
-    print("\n--- PnL by decision (mean over pnl_usd) ---")
+    _safe_print("\n--- PnL by decision (mean over pnl_usd) ---")
     for code, arr in sorted(by_decision_pnl.items(), key=lambda kv: kv[0]):
         if not arr:
             continue
         mean = sum(arr) / max(1, len(arr))
-        print(f"{code:18s} n={len(arr):4d} mean_pnl_usd={mean:.4f}")
+        _safe_print(f"{code:18s} n={len(arr):4d} mean_pnl_usd={mean:.4f}")
 
     # Tail summarized
-    print(f"\n--- Tail (last {args.tail}) summarized ---")
+    _safe_print(f"\n--- Tail (last {args.tail}) summarized ---")
     tail = _tail_jsonl(JOINED_PATH, args.tail)
     for row in tail:
-        print(orjson.dumps(_extract_summary(row)).decode("utf-8"))
+        try:
+            _safe_print(orjson.dumps(_extract_summary(row)).decode("utf-8", errors="replace"))
+        except Exception:
+            # ultra defensive: never crash during tail printing
+            _safe_print(str(_extract_summary(row)))
 
     # Hard fail if coverage too low
     if ok_total > 0 and coverage < float(args.min_coverage):
-        print(f"\nFAIL: decision coverage {coverage:.3f} < min_coverage {args.min_coverage:.3f}")
+        _safe_print(f"\nFAIL: decision coverage {coverage:.3f} < min_coverage {args.min_coverage:.3f}")
         return 5
 
-    print("\nPASS ✅")
+    _safe_print("\nPASS OK")
     return 0
 
 

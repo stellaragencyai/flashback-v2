@@ -21,6 +21,7 @@ from app.bots.ai_pilot import pilot_decide
 LINKER = Path("app/ai/ai_decision_outcome_linker.py")
 INSPECTOR = Path("app/ai/ai_decision_outcome_inspector.py")
 
+
 def main() -> int:
     ts = int(time.time())
     tid = f"PHASE4_SMOKE_{ts}"
@@ -33,23 +34,26 @@ def main() -> int:
         strategy="test",
         features={"risk_usd": 10.0, "foo": 1},
         setup_type="test_probe",
-        timeframe="5",
+        timeframe="5m",  # ✅ canonical
     )
     d = pilot_decide(s)
 
     print("\n=== DECISION ===")
     print("trade_id:", d.get("trade_id"))
     print("decision:", d.get("decision"))
+    print("timeframe:", d.get("timeframe"))
 
     # 2) outcome
-    publish_ai_event(build_outcome_record(
-        trade_id=tid,
-        symbol="BTCUSDT",
-        account_label="main",
-        strategy="test",
-        pnl_usd=1.0,
-        exit_reason="phase4_smoke",
-    ))
+    publish_ai_event(
+        build_outcome_record(
+            trade_id=tid,
+            symbol="BTCUSDT",
+            account_label="main",
+            strategy="test",
+            pnl_usd=1.0,
+            exit_reason="phase4_smoke",
+        )
+    )
 
     print("\n=== OUTCOME PUBLISHED ===")
     print("trade_id:", tid)
@@ -60,6 +64,7 @@ def main() -> int:
 
     # 4) run linker
     import subprocess, sys
+
     print("\n=== LINKER RUN ===")
     r = subprocess.run([sys.executable, str(LINKER), "--once"], capture_output=True, text=True)
     print(r.stdout.strip() or r.stderr.strip())
@@ -82,6 +87,7 @@ def main() -> int:
 
     print("\nPASS ✅ Phase 4 join pipeline works end-to-end.")
     return 0
+
 
 if __name__ == "__main__":
     raise SystemExit(main())

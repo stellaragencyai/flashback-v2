@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Flashback — Trade Outcome Recorder v1.3 (WS executions → AI outcomes)
+Flashback — Trade Outcome Recorder v1.4 (WS executions → AI outcomes)
 
 Purpose
 -------
@@ -28,12 +28,12 @@ This is STILL a per-execution (per-fill) logger. The pnl_usd here is a
 cashflow approximation. Useful for learning signals and debugging,
 but not a final "trade PnL engine".
 
-v1.3 Upgrade Summary
---------------------
-- Fixed execId dedupe (deque maxlen auto-evict bug with set).
-- Propagate wrapper fields (account_label, etc.) into yielded rows.
-- Pending setups cache: TTL-first, mtime optional (Windows-safe).
-- Better exec_id fallback key (execId/orderId/ts) to reduce duplicates.
+v1.4 Patch Summary (2025-12-18)
+-------------------------------
+- CRITICAL: normalize trade_id to match setup_context trade_id shape.
+  If orderLinkId/orderId has no "flashbackXX:" prefix but account_label exists,
+  emit trade_id as "<account_label>:<raw_id>".
+  This unblocks pending_setups reconciliation and fixes stale pending explosion.
 """
 
 from __future__ import annotations
@@ -189,9 +189,6 @@ def _load_pending_setups_cached(max_age_ms: int = 1500) -> Dict[str, Any]:
 
     try:
         st = PENDING_SETUPS_PATH.stat()
-        # If we have a cache AND file didn't change, we can keep it,
-        # but TTL already expired so we still allow a reload attempt.
-        # (mtime on Windows can be coarse; don't trust it as the only gate)
         txt = PENDING_SETUPS_PATH.read_text(encoding="utf-8")
         data = json.loads(txt or "{}")
         _PENDING_CACHE = data if isinstance(data, dict) else {}
@@ -383,16 +380,39 @@ def _resolve_symbol(row: Dict[str, Any], trade_id: str) -> Optional[str]:
     return None
 
 
+def _normalize_trade_id_with_account(raw_id: str, account_label: str) -> str:
+    """
+    CRITICAL:
+    Setup trade_ids are often "<account_label>:<client_id>".
+    Bybit executions may emit orderLinkId without the prefix.
+    If raw_id has no ":" but account_label exists, prefix it.
+    """
+    rid = str(raw_id or "").strip()
+    if not rid:
+        return rid
+    if ":" in rid:
+        return rid
+    al = str(account_label or "").strip()
+    if al:
+        return f"{al}:{rid}"
+    return rid
+
+
 def _trade_id_from_row(row: Dict[str, Any]) -> str:
-    trade_id = (
+    account_label = str(row.get("account_label") or row.get("label") or "").strip()
+
+    raw = (
         row.get("orderLinkId")
         or row.get("order_link_id")
         or row.get("orderId")
         or row.get("order_id")
     )
-    if trade_id:
-        return str(trade_id)
-    return f"exec_{row.get('symbol','UNKNOWN')}_{_now_ms()}"
+    if raw:
+        return _normalize_trade_id_with_account(str(raw), account_label)
+
+    # fallback: last resort unique-ish id
+    sym = row.get("symbol", "UNKNOWN")
+    return f"exec_{sym}_{_now_ms()}"
 
 
 def _exec_id_from_row(row: Dict[str, Any]) -> Optional[str]:
@@ -403,7 +423,6 @@ def _exec_id_from_row(row: Dict[str, Any]) -> Optional[str]:
             return str(v)
 
     # Fallback: build a stable-ish composite key
-    # (prevents duplicated processing when execId is missing)
     order_id = row.get("orderId") or row.get("order_id") or ""
     ts = row.get("execTime") or row.get("exec_time") or row.get("T") or row.get("ts") or ""
     sym = row.get("symbol") or ""
@@ -467,43 +486,30 @@ def _build_outcome_from_exec_row(row: Dict[str, Any]) -> Optional[Dict[str, Any]
             symbol=str(symbol),
             account_label=str(account_label),
             strategy=str(strategy_label),
-            # Keep schema compatibility: pnl_usd is still required by your OutcomeRecord
             pnl_usd=float(cashflow),
             r_multiple=None,
             win=None,
             exit_reason=str(exec_type),
             extra={
-    # Schema
-    "schema_version": "outcome_from_exec_v1_4",
-
-    # 🔐 Phase-4 lifecycle contract
-    "lifecycle_stage": "EXECUTION_FILL",
-    "lifecycle_role": "EXECUTION_EVENT",
-    "is_final": False,
-    "final_authority_expected": "trade_close_emitter",
-
-    # Confidence & semantics
-    "outcome_confidence": "LOW",
-    "pnl_kind": "fill_cashflow",
-
-    # Execution details
-    "side": side,
-    "exec_price": float(exec_price),
-    "exec_qty": float(exec_qty),
-    "exec_value": float(exec_value),
-    "exec_fee": float(exec_fee),
-    "cashflow_usd": float(cashflow),
-    "ts_exec_ms": ts_exec_ms,
-
-    # AI hints (non-binding)
-    "setup_type_hint": setup_type,
-    "timeframe_hint": timeframe,
-    "ai_profile_hint": ai_profile,
-
-    # Debug / audit
-    "raw": row,
-},
-
+                "schema_version": "outcome_from_exec_v1_4",
+                "lifecycle_stage": "EXECUTION_FILL",
+                "lifecycle_role": "EXECUTION_EVENT",
+                "is_final": False,
+                "final_authority_expected": "trade_close_emitter",
+                "outcome_confidence": "LOW",
+                "pnl_kind": "fill_cashflow",
+                "side": side,
+                "exec_price": float(exec_price),
+                "exec_qty": float(exec_qty),
+                "exec_value": float(exec_value),
+                "exec_fee": float(exec_fee),
+                "cashflow_usd": float(cashflow),
+                "ts_exec_ms": ts_exec_ms,
+                "setup_type_hint": setup_type,
+                "timeframe_hint": timeframe,
+                "ai_profile_hint": ai_profile,
+                "raw": row,
+            },
         )
     except Exception as e:
         log.warning("failed to build outcome_record for %s: %r", symbol, e)
@@ -516,16 +522,11 @@ def _build_outcome_from_exec_row(row: Dict[str, Any]) -> Optional[Dict[str, Any]
 # Main stream loop
 # ---------------------------------------------------------------------------
 
-# Rolling dedupe for execIds (prevents double-logging on restarts or tail weirdness)
 _DEDUPE_MAX = 5000
 _recent_exec_ids = set()
 _recent_exec_ids_q: deque[str] = deque()  # manual eviction
 
 def _dedupe_exec_id(exec_id: Optional[str]) -> bool:
-    """
-    Returns True if this exec_id is new (ok to process),
-    False if it's a duplicate (skip).
-    """
     if not exec_id:
         return True
     if exec_id in _recent_exec_ids:
@@ -534,7 +535,6 @@ def _dedupe_exec_id(exec_id: Optional[str]) -> bool:
     _recent_exec_ids.add(exec_id)
     _recent_exec_ids_q.append(exec_id)
 
-    # Manual eviction to keep set + deque consistent
     while len(_recent_exec_ids_q) > _DEDUPE_MAX:
         old = _recent_exec_ids_q.popleft()
         _recent_exec_ids.discard(old)
@@ -543,10 +543,6 @@ def _dedupe_exec_id(exec_id: Optional[str]) -> bool:
 
 
 def _process_bus_line(raw: bytes) -> int:
-    """
-    Process a single line from ws_executions.jsonl.
-    Returns number of published events.
-    """
     try:
         line = raw.decode("utf-8", errors="replace").strip()
     except Exception as e:
@@ -584,12 +580,6 @@ def _process_bus_line(raw: bytes) -> int:
 
 
 def loop(poll_seconds: float = 0.25, cursor_flush_every: int = 50) -> None:
-    """
-    Main loop:
-      • Tails state/ws_executions.jsonl using a cursor file.
-      • Converts execution rows into OutcomeRecord events (fill cashflow).
-      • Lets ai_events_spine attempt merge with pending setups.
-    """
     log.info(
         "Trade Outcome Recorder starting (bus=%s, cursor=%s, poll=%.2fs, flush_every=%d)",
         EXEC_BUS_PATH,

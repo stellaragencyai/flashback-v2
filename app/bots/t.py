@@ -1,24 +1,25 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*- 
+﻿#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 
 """
-Flashback — AI Pilot v2.8 ✅ (Canary-gated Memory Gates + Decision Schema Aligned)
+Flashback — AI Pilot v2.9 ✅ (Offline Test Mode + Canary-gated Memory Gates + Decision Schema Aligned)
+
+HARD RULE (Phase 4/5 integrity):
+- This module MUST NOT write directly to state/ai_decisions.jsonl.
+- All decision writes go through app.core.ai_decision_logger.append_decision.
 
 Key points
 - Uses app.ai.ai_memory_store.query_memories_tiered (rollups-backed)
 - Uses app.ai.ai_gatekeeper.evaluate_memory_gates
-- Logs decisions to state/ai_decisions.jsonl with join keys
+- Logs decisions via canonical decision logger (single-writer law)
 - DRY-RUN by default
 
-v2.8 FIX/ADD
-------------
-- Decision schema alignment: writes allow(bool) + size_multiplier(float) at top-level
-  so Phase 5 builders/validators can consume decisions deterministically.
-- Canary gating for memory usage:
-    • If FB_CANARY_ENABLED=false -> memory gates are bypassed (cold-start behavior)
-    • If enabled, only accounts in FB_CANARY_ACCOUNTS get memory gating
-- Adds optional one-shot run mode for testing:
-    python app/ai/ai_pilot.py --once
+v2.9 ADD
+--------
+- Offline test mode (no snapshot, no policy, no Bybit/VPN required):
+    set AI_PILOT_OFFLINE_TEST=true
+    python -m app.bots.t --once
+  Emits exactly one pilot_decision via canonical logger, then exits.
 """
 
 from __future__ import annotations
@@ -26,20 +27,23 @@ from __future__ import annotations
 import argparse
 import os
 import time
-from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
-
-import orjson
 
 from app.core.ai_action_builder import build_trade_action_from_sample
 from app.core.ai_state_bus import build_ai_snapshot, validate_snapshot_v2
 from app.core.flashback_common import send_tg, record_heartbeat, alert_bot_error
 
+# ✅ Canonical decision writer (single-writer law)
+try:
+    from app.core.ai_decision_logger import append_decision as log_decision
+except Exception:  # pragma: no cover
+    def log_decision(_: Dict[str, Any]) -> None:  # type: ignore
+        return
+
 try:
     from app.core.log import get_logger
 except Exception:  # pragma: no cover
     import logging
-
     def get_logger(name: str) -> "logging.Logger":  # type: ignore
         logger_ = logging.getLogger(name)
         if not logger_.handlers:
@@ -111,6 +115,13 @@ def _now_ms() -> int:
     return int(time.time() * 1000)
 
 
+def _safe_str(x: Any) -> str:
+    try:
+        return str(x).strip()
+    except Exception:
+        return ""
+
+
 ACCOUNT_LABEL: str = os.getenv("ACCOUNT_LABEL", "main").strip() or "main"
 
 AI_PILOT_ENABLED: bool = _env_bool("AI_PILOT_ENABLED", "true")
@@ -136,12 +147,12 @@ AI_PILOT_BLOCK_ON_BAD_MEMORY: bool = _env_bool("AI_PILOT_BLOCK_ON_BAD_MEMORY", "
 # If true, memory gates only apply when canary is enabled + account is allowlisted.
 AI_PILOT_MEMORY_CANARY_ONLY: bool = _env_bool("AI_PILOT_MEMORY_CANARY_ONLY", "true")
 
-AI_DECISIONS_PATH: Path = Path(os.getenv("AI_DECISIONS_PATH", "state/ai_decisions.jsonl")).resolve()
-AI_DECISIONS_PATH.parent.mkdir(parents=True, exist_ok=True)
-
-AI_DECISIONS_WARN_MB: float = float(os.getenv("AI_DECISIONS_WARN_MB", "10"))
-AI_DECISIONS_CAP_MB: float = float(os.getenv("AI_DECISIONS_CAP_MB", "50"))
-AI_DECISIONS_KEEP: int = int(os.getenv("AI_DECISIONS_KEEP", "3"))
+# ✅ Offline test mode (no snapshot/policy/bybit)
+AI_PILOT_OFFLINE_TEST: bool = _env_bool("AI_PILOT_OFFLINE_TEST", "false")
+AI_PILOT_OFFLINE_TRADE_ID: str = os.getenv("AI_PILOT_OFFLINE_TRADE_ID", "").strip()
+AI_PILOT_OFFLINE_SYMBOL: str = os.getenv("AI_PILOT_OFFLINE_SYMBOL", "BTCUSDT").strip().upper() or "BTCUSDT"
+AI_PILOT_OFFLINE_TIMEFRAME: str = os.getenv("AI_PILOT_OFFLINE_TIMEFRAME", "5m").strip() or "5m"
+AI_PILOT_OFFLINE_POLICY_HASH: str = os.getenv("AI_PILOT_OFFLINE_POLICY_HASH", "OFFLINE_TEST").strip() or "OFFLINE_TEST"
 
 try:
     from app.core.config import settings  # type: ignore
@@ -151,63 +162,10 @@ except Exception:
 
 env_actions_path = os.getenv("AI_ACTIONS_PATH", "").strip()
 _actions_path_str = env_actions_path or default_actions_path
+
+from pathlib import Path
 AI_ACTIONS_FILE: Path = Path(_actions_path_str).resolve()
 AI_ACTIONS_FILE.parent.mkdir(parents=True, exist_ok=True)
-
-
-def _append_jsonl(path: Path, payload: Dict[str, Any]) -> None:
-    try:
-        with path.open("ab") as f:
-            f.write(orjson.dumps(payload))
-            f.write(b"\n")
-    except Exception as e:
-        try:
-            logger.warning("Failed to append jsonl to %s: %r", pathsze := path, e)
-        except Exception:
-            pass
-
-
-def _rotate_file(path: Path, *, keep: int) -> None:
-    try:
-        if keep <= 0 or not path.exists():
-            return
-        oldest = path.with_suffix(path.suffix + f".{keep}")
-        if oldest.exists():
-            try:
-                oldest.unlink()
-            except Exception:
-                pass
-        for i in range(keep - 1, 0, -1):
-            src = path.with_suffix(path.suffix + f".{i}")
-            dst = path.with_suffix(path.suffix + f".{i+1}")
-            if src.exists():
-                try:
-                    src.replace(dst)
-                except Exception:
-                    pass
-        dst1 = path.with_suffix(path.suffix + ".1")
-        try:
-            path.replace(dst1)
-        except Exception:
-            pass
-    except Exception:
-        return
-
-
-def _maybe_rotate_decisions() -> None:
-    try:
-        if not AI_DECISIONS_PATH.exists():
-            return
-        size_mb = AI_DECISIONS_PATH.stat().st_size / (1024 * 1024)
-        if size_mb >= AI_DECISIONS_CAP_MB:
-            _rotate_file(AI_DECISIONS_PATH, keep=AI_DECISIONS_KEEP)
-        elif size_mb >= AI_DECISIONS_WARN_MB:
-            logger.warning(
-                "ai_decisions.jsonl growing: %.2f MB (warn=%.2f cap=%.2f)",
-                size_mb, AI_DECISIONS_WARN_MB, AI_DECISIONS_CAP_MB
-            )
-    except Exception:
-        pass
 
 
 def _build_ai_state() -> Dict[str, Any]:
@@ -251,11 +209,10 @@ def _safe_first_match(r: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     return None
 
 
-def _decision_base(ts: int) -> PilotDecision:
-    # NOTE: Top-level allow + size_multiplier are REQUIRED for downstream Phase 5 tooling.
+def _decision_base(ts_ms: int) -> PilotDecision:
     return {
         "schema_version": int(DECISION_SCHEMA_VERSION),
-        "ts": ts,
+        "ts_ms": int(ts_ms),
         "decision": "COLD_START",
         "tier_used": "NONE",
         "memory": None,
@@ -263,14 +220,9 @@ def _decision_base(ts: int) -> PilotDecision:
         "proposed_action": None,
         "allow": False,
         "size_multiplier": 1.0,
+        "event_type": "pilot_decision",
+        "meta": {"source": "ai_pilot", "stage": "pilot"},
     }
-
-
-def _safe_str(x: Any) -> str:
-    try:
-        return str(x).strip()
-    except Exception:
-        return ""
 
 
 def _extract_decision_join_keys(setup_event: Dict[str, Any]) -> Dict[str, Any]:
@@ -279,8 +231,7 @@ def _extract_decision_join_keys(setup_event: Dict[str, Any]) -> Dict[str, Any]:
     account_label = _safe_str(setup_event.get("account_label") or setup_event.get("label") or "") or ACCOUNT_LABEL
     timeframe = _safe_str(setup_event.get("timeframe") or "")
 
-    # optional join key (helps outcome linker/builder in mixed pipelines)
-    client_trade_id = _safe_str(setup_event.get("client_trade_id") or setup_event.get("clientTradeId") or "") 
+    client_trade_id = _safe_str(setup_event.get("client_trade_id") or setup_event.get("clientTradeId") or "")
 
     policy_hash = ""
     if isinstance(setup_event.get("policy"), dict):
@@ -302,17 +253,12 @@ def _extract_decision_join_keys(setup_event: Dict[str, Any]) -> Dict[str, Any]:
         "policy_hash": policy_hash,
         "memory_fingerprint": memory_fingerprint,
     }
-    # keep trade_id even if empty (downstream visibility)
     return {k: v for k, v in out.items() if v != "" or k == "trade_id"}
 
 
 def _set_allow_and_size(out: PilotDecision) -> None:
-    """
-    Align decision string -> allow(bool), size_multiplier(float)
-    """
     dec = str(out.get("decision") or "").upper().strip()
 
-    allow = False
     if dec == "ALLOW_TRADE":
         allow = True
     elif dec == "COLD_START":
@@ -322,7 +268,6 @@ def _set_allow_and_size(out: PilotDecision) -> None:
 
     out["allow"] = bool(allow)
 
-    # Default sizing unless memory provides a multiplier
     mult = 1.0
     mem = out.get("memory")
     if isinstance(mem, dict):
@@ -340,21 +285,30 @@ def _set_allow_and_size(out: PilotDecision) -> None:
 
 
 def _memory_gating_active_for_account(account_label: str) -> bool:
-    """
-    Canary policy:
-      - If AI_PILOT_MEMORY_CANARY_ONLY=false: use memory gates when enabled
-      - Else: use memory gates only when FB_CANARY_ENABLED=true AND account allowlisted
-    """
     if not AI_PILOT_USE_MEMORY_GATES:
         return False
-
     if not AI_PILOT_MEMORY_CANARY_ONLY:
         return True
-
     if not canary_enabled():
         return False
-
     return is_canary_account(account_label)
+
+
+def _emit_decision(out: PilotDecision) -> None:
+    """
+    Single-writer law: emit through canonical logger only.
+    Never crash caller.
+    """
+    try:
+        if not str(out.get("event_type") or "").strip():
+            out["event_type"] = "pilot_decision"
+        out.setdefault("meta", {})
+        if isinstance(out["meta"], dict):
+            out["meta"].setdefault("source", "ai_pilot")
+            out["meta"].setdefault("stage", "pilot")
+        log_decision(dict(out))
+    except Exception:
+        return
 
 
 def pilot_decide(setup_event: Dict[str, Any]) -> PilotDecision:
@@ -368,31 +322,27 @@ def pilot_decide(setup_event: Dict[str, Any]) -> PilotDecision:
 
     acct = str(out.get("account_label") or ACCOUNT_LABEL)
 
-    # Canary gating: if not active, behave like cold start (do not block on "bad memory")
     if not _memory_gating_active_for_account(acct):
         out["decision"] = "COLD_START"
         out["tier_used"] = "NONE"
         out["memory"] = None
         out["gates"] = {"reason": "memory_gates_disabled_or_not_canary"}
         _set_allow_and_size(out)
-        _maybe_rotate_decisions()
-        _append_jsonl(AI_DECISIONS_PATH, dict(out))
+        _emit_decision(out)
         return out
 
     if query_memories_tiered is None or QueryOptions is None:
         out["decision"] = "BLOCKED_BY_GATES"
         out["gates"] = {"reason": "ai_memory_store_missing"}
         _set_allow_and_size(out)
-        _maybe_rotate_decisions()
-        _append_jsonl(AI_DECISIONS_PATH, dict(out))
+        _emit_decision(out)
         return out
 
     if evaluate_memory_gates is None:
         out["decision"] = "BLOCKED_BY_GATES"
         out["gates"] = {"reason": "ai_gatekeeper_missing"}
         _set_allow_and_size(out)
-        _maybe_rotate_decisions()
-        _append_jsonl(AI_DECISIONS_PATH, dict(out))
+        _emit_decision(out)
         return out
 
     try:
@@ -418,8 +368,7 @@ def pilot_decide(setup_event: Dict[str, Any]) -> PilotDecision:
                 out["decision"] = "COLD_START" if AI_PILOT_ALLOW_COLD_START else "BLOCKED_BY_GATES"
                 out["gates"] = {"reason": "no_matches"}
             _set_allow_and_size(out)
-            _maybe_rotate_decisions()
-            _append_jsonl(AI_DECISIONS_PATH, dict(out))
+            _emit_decision(out)
             return out
 
         min_n_eff = int(AI_MEM_MIN_N_ANY)
@@ -445,8 +394,7 @@ def pilot_decide(setup_event: Dict[str, Any]) -> PilotDecision:
         out["decision"] = "ALLOW_TRADE" if ok else ("BLOCKED_BY_GATES" if AI_PILOT_BLOCK_ON_BAD_MEMORY else "COLD_START")
 
         _set_allow_and_size(out)
-        _maybe_rotate_decisions()
-        _append_jsonl(AI_DECISIONS_PATH, dict(out))
+        _emit_decision(out)
         return out
 
     except Exception as e:
@@ -455,9 +403,34 @@ def pilot_decide(setup_event: Dict[str, Any]) -> PilotDecision:
         out["memory"] = None
         out["gates"] = {"reason": "error", "error": str(e)}
         _set_allow_and_size(out)
-        _maybe_rotate_decisions()
-        _append_jsonl(AI_DECISIONS_PATH, dict(out))
+        _emit_decision(out)
         return out
+
+
+def _offline_emit_one_decision() -> None:
+    """
+    Offline test: emit exactly one pilot_decision via canonical logger, then exit.
+    No snapshot, no policies, no Bybit, no VPN required.
+    """
+    ts = _now_ms()
+    tid = AI_PILOT_OFFLINE_TRADE_ID or f"OFFLINE_{ts}_{ACCOUNT_LABEL}_{AI_PILOT_OFFLINE_SYMBOL}".replace(" ", "")
+    out: PilotDecision = _decision_base(ts)
+    out.update({
+        "trade_id": tid,
+        "client_trade_id": tid,
+        "symbol": AI_PILOT_OFFLINE_SYMBOL,
+        "account_label": ACCOUNT_LABEL,
+        "timeframe": AI_PILOT_OFFLINE_TIMEFRAME,
+        "policy_hash": AI_PILOT_OFFLINE_POLICY_HASH,
+        "decision": "COLD_START",
+        "tier_used": "NONE",
+        "memory": None,
+        "gates": {"reason": "offline_test"},
+    })
+    _set_allow_and_size(out)
+    _emit_decision(out)
+    logger.info("✅ Offline test emitted pilot_decision trade_id=%s symbol=%s label=%s tf=%s",
+                tid, AI_PILOT_OFFLINE_SYMBOL, ACCOUNT_LABEL, AI_PILOT_OFFLINE_TIMEFRAME)
 
 
 def _extract_setup_from_action(action: Dict[str, Any]) -> Optional[Dict[str, Any]]:
@@ -494,7 +467,7 @@ def _apply_memory_gates(actions: List[Dict[str, Any]]) -> Tuple[List[Dict[str, A
         meta["total_out"] = len(actions)
         return actions, meta
 
-    out: List[Dict[str, Any]] = []
+    out_actions: List[Dict[str, Any]] = []
     for a in actions:
         if not isinstance(a, dict):
             continue
@@ -506,7 +479,7 @@ def _apply_memory_gates(actions: List[Dict[str, Any]]) -> Tuple[List[Dict[str, A
             aa.setdefault("meta", {})
             if isinstance(aa["meta"], dict):
                 aa["meta"]["memory_gate"] = {"decision": "SKIP", "reason": "no_setup_context"}
-            out.append(aa)
+            out_actions.append(aa)
             continue
 
         decision = pilot_decide(setup_ctx)
@@ -519,20 +492,20 @@ def _apply_memory_gates(actions: List[Dict[str, Any]]) -> Tuple[List[Dict[str, A
 
         if dec == "ALLOW_TRADE":
             meta["allowed"] += 1
-            out.append(aa)
+            out_actions.append(aa)
         elif dec == "COLD_START":
             meta["cold_start"] += 1
             if AI_PILOT_ALLOW_COLD_START:
-                out.append(aa)
+                out_actions.append(aa)
             else:
                 meta["blocked"] += 1
         else:
             meta["blocked"] += 1
             if (not AI_PILOT_BLOCK_ON_BAD_MEMORY) and DRY_RUN:
-                out.append(aa)
+                out_actions.append(aa)
 
-    meta["total_out"] = len(out)
-    return out, meta
+    meta["total_out"] = len(out_actions)
+    return out_actions, meta
 
 
 def _run_sample_policy(ai_state: Dict[str, Any]) -> List[Dict[str, Any]]:
@@ -571,7 +544,6 @@ def _run_sample_policy(ai_state: Dict[str, Any]) -> List[Dict[str, Any]]:
                 extra={"legacy_action": raw},
             )
 
-            # ✅ CRITICAL: provide setup_context so memory gates can decide + emit ai_decisions.jsonl
             trade_id = str(raw.get("trade_id") or raw.get("client_trade_id") or raw.get("clientTradeId") or "").strip()
             if not trade_id:
                 trade_id = f"SAMPLE_{_now_ms()}_{sym}_{side_s}".replace(" ", "")
@@ -584,12 +556,7 @@ def _run_sample_policy(ai_state: Dict[str, Any]) -> List[Dict[str, Any]]:
                 "timeframe": str(raw.get("timeframe") or tf_default),
                 "side": "buy" if side_s in ("buy", "long") else ("sell" if side_s in ("sell", "short") else side_s),
                 "policy": {"policy_hash": "SAMPLE_POLICY_V1"},
-                "payload": {
-                    "features": {
-                        "memory_fingerprint": str(raw.get("memory_fingerprint") or ""),
-                        "source": "sample_policy",
-                    }
-                },
+                "payload": {"features": {"memory_fingerprint": str(raw.get("memory_fingerprint") or ""), "source": "sample_policy"}},
             }
 
             ai_action["setup_context"] = setup_ctx
@@ -620,6 +587,7 @@ def _dispatch_actions(actions: List[Dict[str, Any]], *, label: str) -> int:
     now_ms = _now_ms()
     written = 0
     try:
+        import orjson  # local import to avoid module-level dependency issues
         with AI_ACTIONS_FILE.open("ab") as f:
             for raw in actions:
                 if not isinstance(raw, dict):
@@ -640,6 +608,12 @@ def _dispatch_actions(actions: List[Dict[str, Any]], *, label: str) -> int:
 
 def run_once() -> None:
     record_heartbeat("ai_pilot")
+
+    # ✅ Offline test short-circuit
+    if AI_PILOT_OFFLINE_TEST:
+        _offline_emit_one_decision()
+        return
+
     ai_state = _build_ai_state()
     safety = ai_state.get("safety") or {}
     if safety.get("is_safe") is False:
@@ -674,6 +648,8 @@ def loop() -> None:
         mode_bits.append("memory_gates")
     if AI_PILOT_MEMORY_CANARY_ONLY:
         mode_bits.append("canary_only")
+    if AI_PILOT_OFFLINE_TEST:
+        mode_bits.append("OFFLINE_TEST")
     mode_str = ", ".join(mode_bits)
 
     try:

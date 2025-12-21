@@ -1,21 +1,19 @@
-#!/usr/bin/env python3
+﻿#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Flashback — MemoryEntry Build Tool (Phase 5) v1.0
+Flashback — MemoryEntry Build Tool (Phase 5) v1.1
 
 Usage
 -----
-python app/tools/ai_memory_entry_build.py
+python -m app.tools.ai_memory_entry_build
 
 What it does
 ------------
-- Reads canonical streams (setups / outcomes_enriched / decisions)
-- Builds:
+- Reads canonical streams (setups / outcomes / decisions)
+- Builds/updates:
     state/ai_memory/memory_entries.jsonl
     state/ai_memory/memory_index.sqlite
-- Prints a blunt summary and exits 0 even on partial skips.
-
-This is a Phase 5 foundations tool only.
+- Uses builder default mode: incremental ingest (history-safe)
 """
 
 from __future__ import annotations
@@ -32,7 +30,7 @@ def main() -> None:
     out_jsonl = Path("state/ai_memory/memory_entries.jsonl")
     db_path = Path("state/ai_memory/memory_index.sqlite")
 
-    print("=== MemoryEntry Builder v1 ===")
+    print("=== MemoryEntry Build Tool ===")
     print(f"setups   : {paths.setups_path}")
     print(f"outcomes : {paths.outcomes_path}")
     print(f"decisions: {paths.decisions_path}")
@@ -44,6 +42,7 @@ def main() -> None:
         paths=paths,
         out_jsonl=out_jsonl,
         db_path=db_path,
+        mode="ingest",
     )
 
     print("[STATS]")
@@ -56,6 +55,9 @@ def main() -> None:
         "setup_index_bad",
         "decision_index_ok",
         "decision_index_bad",
+        "enriched_from_setup",
+        "skipped_no_decision",
+        "outcomes_skipped_old",
         "elapsed_sec",
     ]:
         print(f"{k:24s}: {stats.get(k)}")

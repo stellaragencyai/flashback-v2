@@ -39,6 +39,9 @@ PATCH (2025-12-14)
 from __future__ import annotations
 
 import os
+
+# Mirror of flashback_common.EXEC_DRY_RUN (avoid import coupling)
+EXEC_DRY_RUN: bool = os.getenv("EXEC_DRY_RUN", "false").strip().lower() in ("1","true","yes","y","on")
 import time
 from decimal import Decimal
 from typing import Any, Dict, List, Optional, Tuple
@@ -279,6 +282,10 @@ def _evaluate_snapshot_safety(
     reasons: List[str] = []
     is_safe = True
 
+    # DRY_RUN: positions may be empty; do not fail safety on positions freshness
+    if EXEC_DRY_RUN:
+        positions_bus_age_sec = None
+
     if positions_bus_age_sec is not None and positions_bus_age_sec > _POS_MAX_AGE_SEC:
         is_safe = False
         reasons.append(
@@ -383,6 +390,12 @@ def build_symbol_state(
     ob_age_sec, tr_age_sec = _market_bus_ages()
     if not include_trades:
         tr_age_sec = None
+    if not include_orderbook:
+        ob_age_sec = None
+
+    # DRY_RUN: positions freshness must not gate safety
+    if EXEC_DRY_RUN:
+        pos_age_sec = None
 
     freshness = {
         "positions_bus_age_sec": pos_age_sec,
@@ -439,6 +452,8 @@ def build_ai_snapshot(
     ob_age_sec, tr_age_sec = _market_bus_ages()
     if not include_trades:
         tr_age_sec = None
+    if not include_orderbook:
+        ob_age_sec = None
 
     # Determine which symbols to include in market view
     symbols_set = set()
@@ -459,6 +474,10 @@ def build_ai_snapshot(
             include_trades=include_trades,
             trades_limit=trades_limit,
         )
+
+    # DRY_RUN: positions freshness must not gate safety
+    if EXEC_DRY_RUN:
+        pos_age_sec = None
 
     freshness = {
         "positions_bus_age_sec": pos_age_sec,

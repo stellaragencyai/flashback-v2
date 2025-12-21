@@ -266,7 +266,7 @@ strategies:
       - "mean_reversion"
       - "midterm"
 
-   - id: "Sub5_HFT_MM"
+  - id: "Sub5_HFT_MM"
     account_label: "flashback05"
     enabled: true
     symbols:
@@ -282,17 +282,17 @@ strategies:
     risk_profile: "hft_mm"
     exit_profile: "standard_5"
     promotion_rules:
-      enabled: true
-      min_trades: 400
-      min_winrate: 0.49
-      min_avg_r: 0.12
-      min_expectancy_r: 0.05
-      max_drawdown_pct: 15.0
+    enabled: true
+    min_trades: 400
+    min_winrate: 0.49
+    min_avg_r: 0.12
+    min_expectancy_r: 0.05
+    max_drawdown_pct: 15.0
     regime:
-      min_adx: 0.0
-      max_atr_pct: 999.0
-      min_vol_z: -999.0
-      max_vol_z: 999.0
+    min_adx: 0.0
+    max_atr_pct: 999.0
+    min_vol_z: -999.0
+    max_vol_z: 999.0
     tags:
       - "hft"
       - "market_maker"

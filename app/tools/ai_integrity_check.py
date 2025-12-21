@@ -1,7 +1,7 @@
-#!/usr/bin/env python3
+
 # -*- coding: utf-8 -*-
 """
-Flashback — AI Integrity Check Tool v1.0 (Phase 3)
+Flashback — AI Integrity Check Tool v1.1 (Phase 3)
 
 Validates:
   ✅ setups == outcomes (or still pending within TTL)
@@ -13,7 +13,7 @@ Validates:
 Inputs:
   - state/ai_events/setups.jsonl
   - state/ai_events/outcomes.jsonl
-  - state/ai_events/pending_setups.json
+  - state/ai_events/pending_setups.json   (OPTIONAL; missing => treated as empty)
 
 Output:
   - prints a report
@@ -24,9 +24,8 @@ from __future__ import annotations
 
 import argparse
 import json
-import sys
 import time
-from collections import Counter, defaultdict
+from collections import Counter
 from pathlib import Path
 from typing import Any, Dict, Optional, Tuple
 
@@ -62,6 +61,10 @@ def _read_jsonl_counts(path: Path, max_lines: int = 200_000) -> Tuple[int, int]:
 
 
 def _load_pending(path: Path) -> Dict[str, Any]:
+    """
+    Pending registry is OPTIONAL.
+    Missing file => empty dict (valid cold-start state).
+    """
     if not path.exists():
         return {}
     try:
@@ -147,14 +150,14 @@ def run_check(
     outcomes_path = ai_dir / "outcomes.jsonl"
     pending_path = ai_dir / "pending_setups.json"
 
-    # Presence checks
-    missing = []
-    for p in (setups_path, outcomes_path, pending_path):
+    # Presence checks (pending is OPTIONAL)
+    missing_required = []
+    for p in (setups_path, outcomes_path):
         if not p.exists():
-            missing.append(str(p))
-    if missing:
+            missing_required.append(str(p))
+    if missing_required:
         print("❌ Missing required files:")
-        for m in missing:
+        for m in missing_required:
             print("  -", m)
         return 2
 
@@ -163,6 +166,7 @@ def run_check(
     outcomes_total, outcomes_ok = _read_jsonl_counts(outcomes_path, max_lines=max_lines)
 
     pending = _load_pending(pending_path)
+    pending_missing = not pending_path.exists()
 
     # Build sets: trade_id in setups/outcomes
     setups_by_trade: Dict[str, Dict[str, Any]] = {}
@@ -260,6 +264,15 @@ def run_check(
         if ts_i and (now - ts_i) > ttl_ms:
             stale_pending.append(tid)
 
+    # Missing outcomes partition:
+    # - ok_missing: the setup is pending and not stale
+    # - bad_missing: not in pending at all (or pending file missing)
+    stale_pending_set = set(stale_pending)
+    pending_keys = set(str(k) for k in pending.keys())
+
+    ok_missing = [tid for tid in missing_outcomes if tid in pending_keys and tid not in stale_pending_set]
+    bad_missing = [tid for tid in missing_outcomes if tid not in pending_keys]
+
     # Outcome fingerprints orphan check: if we have outcome fp but no setup fp, count as orphan
     for tid, out_evt in outcomes_by_trade.items():
         fp = _extract_fp_from_outcome_evt(out_evt)
@@ -278,13 +291,16 @@ def run_check(
     print("================================")
     print(f"• setups.jsonl   : lines={setups_total} parsed_ok={setups_ok}")
     print(f"• outcomes.jsonl : lines={outcomes_total} parsed_ok={outcomes_ok}")
-    print(f"• pending_setups : {len(pending)} entries\n")
+    pend_note = " (MISSING => treated as empty)" if pending_missing else ""
+    print(f"• pending_setups : {len(pending)} entries{pend_note}\n")
 
     print("📌 Linkage")
-    print(f"• setups_count        : {len(setups_by_trade)} (by trade_id)")
-    print(f"• outcomes_count      : {len(outcomes_by_trade)} (by trade_id)")
-    print(f"• missing_outcomes    : {len(missing_outcomes)}")
-    print(f"• orphan_outcomes     : {len(orphan_outcomes)}")
+    print(f"• setups_count             : {len(setups_by_trade)} (by trade_id)")
+    print(f"• outcomes_count           : {len(outcomes_by_trade)} (by trade_id)")
+    print(f"• missing_outcomes_total   : {len(missing_outcomes)}")
+    print(f"• missing_outcomes_ok      : {len(ok_missing)} (pending & within TTL)")
+    print(f"• missing_outcomes_bad     : {len(bad_missing)} (NOT pending)")
+    print(f"• orphan_outcomes          : {len(orphan_outcomes)}")
     print(f"• stale_pending(>{pending_ttl_minutes}m): {len(stale_pending)}\n")
 
     print("📌 Data quality")
@@ -299,9 +315,9 @@ def run_check(
             print("  -", tid)
         print()
 
-    if missing_outcomes:
-        print("🕳️ Setups without outcomes (sample up to 20):")
-        for tid in missing_outcomes[:20]:
+    if bad_missing:
+        print("🕳️ Setups missing outcomes AND not pending (sample up to 20):")
+        for tid in bad_missing[:20]:
             print("  -", tid)
         print()
 
@@ -336,7 +352,6 @@ def run_check(
     if outcomes_ok < max(0, outcomes_total - 5):
         fail_reasons.append("Too many invalid JSON lines in outcomes.jsonl")
 
-    # If strict, missing outcomes is a failure (unless pending not stale)
     if strict:
         if missing_outcomes:
             fail_reasons.append("Strict: setups missing outcomes")
@@ -345,16 +360,18 @@ def run_check(
         if orphan_outcomes:
             fail_reasons.append("Strict: outcomes without setups exist")
     else:
-        # non-strict: stale pending is the real problem
+        # Non-strict: missing outcomes are ONLY acceptable if they're pending and within TTL.
         if stale_pending:
             fail_reasons.append("Stale pending setups exist (reconciler needed or stuck pipeline)")
+        if bad_missing:
+            fail_reasons.append("Setups missing outcomes and NOT pending (lost outcomes or pending registry broken)")
 
     # missing fp is bad (learning will be garbage)
     if outcomes_missing_fp > 0:
         fail_reasons.append("Some outcomes are missing setup_fingerprint")
 
     # R missing isn't always fatal yet (fills), but if it's too much it's a problem
-    if outcomes_total > 0:
+    if len(outcomes_by_trade) > 0:
         frac_missing_r = outcomes_missing_r / max(1, len(outcomes_by_trade))
         if frac_missing_r > 0.60:
             fail_reasons.append(f"Too many outcomes missing R (missing_frac={frac_missing_r:.2f})")
@@ -390,3 +407,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+

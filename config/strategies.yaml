@@ -467,3 +467,5 @@ subaccounts:
       Manual trading on MAIN. Entries are discretionary.
       Executor/AI must not place live orders here.
       Exit profile is standard_10 so TP/SL manager can attach a 10-TP ladder.
+
+# POLICY_HASH_BUMP 1766275903759

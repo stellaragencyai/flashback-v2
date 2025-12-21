@@ -424,7 +424,7 @@ def alert_bot_error(bot_name: str, error: Any, severity: str = "WARN") -> None:
       - deduplicates identical (bot_name, severity, error) for 60s
       - still subject to global TG rate limiting
     """
-    
+
     try:
         msg_text = str(error)
         key = f"{bot_name}:{severity}"
@@ -752,7 +752,18 @@ def get_equity_usdt() -> Decimal:
 
 
 def get_mmr_pct() -> Decimal:
-    res = bybit_get("/v5/account/wallet-balance", {"accountType": "UNIFIED"})
+    """
+    Robust MMR% fetcher.
+
+    IMPORTANT:
+      - Must NOT crash the stack if Bybit private endpoints 403.
+      - In EXEC_DRY_RUN, returns 0 on any failure (paper must keep running).
+    """
+    try:
+        res = bybit_get("/v5/account/wallet-balance", {"accountType": "UNIFIED"})
+    except Exception:
+        return Decimal("0")
+
     lst = res.get("result", {}).get("list", []) or []
     if not lst:
         return Decimal("0")
@@ -879,15 +890,24 @@ def get_ticks(symbol: str) -> Tuple[Decimal, Decimal, Decimal]:
 
 
 def last_price(symbol: str) -> Decimal:
-    r = bybit_get(
-        "/v5/market/tickers",
-        {"category": "linear", "symbol": symbol},
-        auth=False,
-    )
-    lst = (r.get("result", {}) or {}).get("list", []) or []
-    if not lst:
+    """Best-effort public last price.
+    DRY_RUN must not depend on Bybit REST.
+    """
+    if EXEC_DRY_RUN:
         return Decimal("0")
-    return Decimal(str(lst[0].get("lastPrice", "0")))
+    try:
+        r = bybit_get(
+            "/v5/market/tickers",
+            {"category": "linear", "symbol": symbol},
+            auth=False,
+        )
+        lst = (r.get("result", {}) or {}).get("list", []) or []
+        if not lst:
+            return Decimal("0")
+        return Decimal(str(lst[0].get("lastPrice", "0")))
+    except Exception:
+        return Decimal("0")
+
 
 
 def best_bid_ask_ws_first(symbol: str) -> Tuple[Optional[Decimal], Optional[Decimal]]:
@@ -923,10 +943,78 @@ def spread_bps_ws(symbol: str) -> Optional[Decimal]:
 
 
 def last_price_ws_first(symbol: str) -> Decimal:
+    """WS-first last price.
+    In EXEC_DRY_RUN, never fall back to REST.
+    """
     ws_mid = mid_price_ws_first(symbol)
     if ws_mid is not None and ws_mid > 0:
         return ws_mid
+    if EXEC_DRY_RUN:
+        return Decimal("0")
     return last_price(symbol)
+
+
+def qty_from_pct(symbol: str, equity_usdt: Decimal, pct_notional: Decimal) -> Decimal:
+    """
+    Compute order qty from a notional % of equity.
+
+    - Uses WS-first price if available.
+    - Quantizes down to qty step.
+    - Enforces a minimal notional check (best-effort).
+    - Returns Decimal("0") if sizing cannot be computed safely.
+    """
+    sym = str(symbol or "").strip().upper()
+    if not sym:
+        raise ValueError("symbol required")
+
+    try:
+        eq = Decimal(str(equity_usdt))
+    except Exception:
+        raise ValueError("equity_usdt must be Decimal-like")
+    if eq <= 0:
+        return Decimal("0")
+
+    try:
+        pct = Decimal(str(pct_notional))
+    except Exception:
+        raise ValueError("pct_notional must be Decimal-like")
+    if pct <= 0:
+        return Decimal("0")
+
+    notional = (eq * pct) / Decimal("100")
+    if notional <= 0:
+        return Decimal("0")
+
+    px = Decimal("0")
+    try:
+        px = last_price_ws_first(sym)
+    except Exception:
+        px = Decimal("0")
+
+    if px <= 0:
+        try:
+            px = last_price(sym)
+        except Exception:
+            px = Decimal("0")
+
+    if px <= 0:
+        return Decimal("0")
+
+    tick, step, min_notional = get_ticks(sym)
+
+    raw_qty = notional / px
+    qty = qdown(raw_qty, step)
+
+    try:
+        if qty * px < min_notional:
+            return Decimal("0")
+    except Exception:
+        pass
+
+    if qty <= 0:
+        return Decimal("0")
+    return qty
+
 
 
 def _kline(symbol: str, interval: str, limit: int) -> List[List[str]]:
@@ -1115,139 +1203,3 @@ def calc_tp_prices(symbol: str, side: str, entry_px: Decimal) -> List[Decimal]:
         gaps = [base_gap] * 5
     else:
         gaps = []
-        g = base_gap
-        f = max(TP_SPACING_FACTOR, Decimal("1.0"))
-        for _ in range(5):
-            gaps.append(g)
-            g = g * f
-
-    atr_1h = atr14(symbol, interval="60", limit=120)
-    cap_by_atr = atr_1h * TP5_MAX_ATR_MULT if atr_1h > 0 else None
-    cap_by_pct = entry_px * TP5_MAX_PCT / Decimal(100)
-
-    def _cap_delta(d: Decimal) -> Decimal:
-        caps = [cap_by_pct]
-        if cap_by_atr is not None:
-            caps.append(cap_by_atr)
-        return min([c for c in caps if c is not None])
-
-    prices: List[Decimal] = []
-    run = entry_px
-    for gap in gaps:
-        d = _cap_delta(gap)
-        if side.upper() == "LONG":
-            run = run + d
-        else:
-            run = run - d
-        prices.append(psnap(run, tick))
-
-    min_step = tick * TP_MIN_TICKS
-    fixed: List[Decimal] = []
-    for i, p in enumerate(prices):
-        if i == 0:
-            fixed.append(p)
-        else:
-            if side.upper() == "LONG":
-                p = max(p, fixed[-1] + min_step)
-            else:
-                p = min(p, fixed[-1] - min_step)
-            fixed.append(psnap(p, tick))
-    return fixed
-
-
-def split_qty_even(total_qty: Decimal, symbol: str, parts: int = 5) -> List[Decimal]:
-    _, step, _ = get_ticks(symbol)
-    if parts <= 1:
-        return [qdown(total_qty, step)]
-    leg = qdown(total_qty / Decimal(parts), step)
-    out = [leg] * (parts - 1)
-    used = leg * (parts - 1)
-    out.append(qdown(total_qty - used, step))
-    return out
-
-
-def ensure_tp_ladder_stable(
-    symbol: str,
-    side_now: str,
-    entry_px: Decimal,
-    total_qty: Decimal,
-) -> None:
-    prices = calc_tp_prices(
-        symbol,
-        "LONG" if side_now.lower() == "buy" else "SHORT",
-        entry_px,
-    )
-    qtys = split_qty_even(total_qty, symbol, parts=5)
-    desired = {f"{TP_TAG_PREFIX}{i+1}": (qtys[i], prices[i]) for i in range(5)}
-
-    existing = list_symbol_tp_orders(
-        symbol, "buy" if side_now.lower() == "sell" else "sell"
-    )
-    existing_by_link: Dict[str, dict] = {}
-    for o in existing:
-        link = o.get("orderLinkId") or ""
-        if link.startswith(TP_TAG_PREFIX):
-            existing_by_link[link] = o
-
-    for i in range(1, 6):
-        lid = f"{TP_TAG_PREFIX}{i}"
-        if lid not in existing_by_link:
-            qty, px = desired[lid]
-            try:
-                place_reduce_tp(symbol, side_now, qty, px, link_id=lid)
-            except Exception as e:
-                send_tg(f"[TP/Ladder] place {symbol} leg {i} failed: {e}")
-
-
-def inter_transfer_usdt_to_sub(uid: str, amount: Decimal) -> Dict[str, Any]:
-    body = {
-        "transferId": _ts(),
-        "coin": "USDT",
-        "amount": str(amount),
-        "fromAccountType": "UNIFIED",
-        "toAccountType": "UNIFIED",
-        "toMemberId": str(uid),
-    }
-    res = bybit_post(
-        "/v5/asset/transfer/inter-transfer", body, key=KEY_XFER, secret=SEC_XFER
-    )
-
-    try:
-        subs = load_subs()
-        sub = next((s for s in subs if str(s.get("uid")) == str(uid)), None)
-        label = (sub or {}).get("label", f"uid={uid}")
-        channel = (sub or {}).get("channel", label)
-
-        main_tg = get_notifier("main")
-        main_tg.info(f"🏦 Internal transfer → {label} ({uid}): {amount} USDT")
-
-        if channel:
-            sub_tg = get_notifier(channel)
-            sub_tg.info(f"📥 Deposit received from MAIN: {amount} USDT")
-    except Exception:
-        pass
-
-    return res
-
-
-def qty_from_pct(symbol: str, equity: Decimal, pct_notional: Decimal) -> Decimal:
-    price = last_price_ws_first(symbol)
-    if price <= 0:
-        return Decimal("0")
-    _tick, step, _ = get_ticks(symbol)
-    notional = equity * pct_notional / Decimal(100)
-    raw_qty = notional / price
-    return qdown(raw_qty, step)
-
-
-def list_linear_usdt_symbols() -> List[str]:
-    r = bybit_get(
-        "/v5/market/instruments-info",
-        {"category": "linear", "limit": "1000"},
-        auth=False,
-    )
-    return [
-        x["symbol"]
-        for x in (r.get("result", {}) or {}).get("list", []) or []
-        if x.get("quoteCoin") == "USDT" and x.get("status") == "Trading"
-    ]

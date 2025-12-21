@@ -1,18 +1,19 @@
-#!/usr/bin/env python3
+﻿#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Flashback — MemoryEntry Builder v1.2 (Phase 5)
+Flashback — MemoryEntry Builder v1.5.0 (Phase 5)
 
-Fixes vs v1.1:
-- Decisions map indexes BOTH:
-    - trade_id
-    - client_trade_id / clientTradeId
-  so we can join outcomes even if upstream used different IDs.
+Fixes:
+- Provides build_memory_entries(...) public entrypoint (tool expects it)
+- Indexes setups + decisions deterministically
+- Accepts BOTH:
+    • outcome_enriched
+    • outcome_record (auto-enrich via setups.jsonl by trade_id)
+- In ingest mode: SQLite insert first, JSONL append only if insert succeeded
+- Incremental ingest default:
+    • if since_ts_ms not provided, auto-derives from SQLite MAX(ts_ms) + 1
 
-Keeps:
-- Decision schema alignment
-- SQLite identity = trade_id
-- Fail-soft
+History-safe. Deterministic. Fail-soft.
 """
 
 from __future__ import annotations
@@ -21,8 +22,28 @@ import argparse
 import hashlib
 import json
 import sqlite3
+import time
+
+def _debug_bad_row_once(raw):
+    try:
+        if globals().get('_FB_BADROW_PRINTED', False):
+            return
+        globals()['_FB_BADROW_PRINTED'] = True
+        if isinstance(raw, dict):
+            import json
+            et = str(raw.get('event_type') or '')
+            tid = str(raw.get('trade_id') or '')
+            preview = json.dumps(raw)[:500]
+        else:
+            et = ''
+            tid = ''
+            preview = str(raw)[:500]
+        print('BAD_ROW_DEBUG:', {'event_type': et, 'trade_id': tid, 'preview': preview})
+    except Exception:
+        pass
+
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Tuple
 
 from app.ai.ai_memory_contract import (
     ContractPaths,
@@ -34,9 +55,10 @@ from app.ai.ai_memory_contract import (
     normalize_timeframe,
     validate_decision_record,
     validate_outcome_enriched,
+    validate_setup_record,
 )
 
-PATHS = ContractPaths.default()
+# ----------------------------- SQLITE --------------------------------------
 
 
 def _connect(db_path: Path) -> sqlite3.Connection:
@@ -52,8 +74,8 @@ def _init_db(conn: sqlite3.Connection) -> None:
     conn.execute(
         """
         CREATE TABLE IF NOT EXISTS memory_entries (
-            trade_id TEXT PRIMARY KEY,
-            entry_id TEXT NOT NULL,
+            entry_id TEXT PRIMARY KEY,
+            trade_id TEXT NOT NULL,
             ts_ms INTEGER NOT NULL,
 
             account_label TEXT,
@@ -83,10 +105,31 @@ def _init_db(conn: sqlite3.Connection) -> None:
         );
         """
     )
-    conn.execute("CREATE INDEX IF NOT EXISTS idx_mem_symbol_tf ON memory_entries(symbol, timeframe);")
+
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_mem_trade_ts ON memory_entries(trade_id, ts_ms DESC);")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_mem_symbol_tf_ts ON memory_entries(symbol, timeframe, ts_ms DESC);")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_mem_policy ON memory_entries(policy_hash);")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_mem_memory_id ON memory_entries(memory_id);")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_mem_mfp ON memory_entries(memory_fingerprint);")
+
     conn.commit()
+
+
+def _get_latest_ts_ms(conn: sqlite3.Connection) -> Optional[int]:
+    try:
+        cur = conn.execute("SELECT MAX(ts_ms) FROM memory_entries;")
+        row = cur.fetchone()
+        if not row:
+            return None
+        v = row[0]
+        if v is None:
+            return None
+        return int(v)
+    except Exception:
+        return None
+
+
+# ----------------------------- HASHING / IDS -------------------------------
 
 
 def _sha256_hex(obj: Any) -> str:
@@ -101,6 +144,15 @@ def _sha256_hex(obj: Any) -> str:
 
 def _entry_id(trade_id: str, ts_ms: int) -> str:
     return f"{trade_id}::{ts_ms}"
+
+
+def _policy_hash_from(ev: Dict[str, Any]) -> Optional[str]:
+    pol = ev.get("policy") if isinstance(ev.get("policy"), dict) else {}
+    v = pol.get("policy_hash")
+    if v is None:
+        return None
+    s = str(v).strip()
+    return s or None
 
 
 def _decision_allow(decision: Dict[str, Any]) -> bool:
@@ -125,15 +177,6 @@ def _gates_reason(decision: Dict[str, Any]) -> Optional[str]:
     return s or None
 
 
-def _policy_hash_from(ev: Dict[str, Any]) -> Optional[str]:
-    pol = ev.get("policy") if isinstance(ev.get("policy"), dict) else {}
-    v = pol.get("policy_hash")
-    if v is None:
-        return None
-    s = str(v).strip()
-    return s or None
-
-
 def _memory_id_from(
     *,
     memory_fingerprint: str,
@@ -153,16 +196,40 @@ def _memory_id_from(
     )
 
 
-def _load_decisions_map(*, max_lines: Optional[int] = None) -> Dict[str, Dict[str, Any]]:
-    """
-    Loads the last valid decision per key.
-    IMPORTANT: We index decisions by multiple keys because upstream
-    may use trade_id OR client_trade_id as the "join id".
-    """
+# ----------------------------- INDEX BUILD ---------------------------------
+
+
+def _load_setups_index(paths: ContractPaths, *, max_lines: Optional[int] = None) -> Tuple[Dict[str, Dict[str, Any]], int, int]:
+    idx: Dict[str, Dict[str, Any]] = {}
+    ok_n = 0
+    bad_n = 0
+
+    for ev in iter_jsonl(paths.setups_path, max_lines=max_lines):
+        ok, _ = validate_setup_record(ev)
+        if not ok:
+            bad_n += 1
+            continue
+        tid = str(ev.get("trade_id") or "").strip()
+        if not tid:
+            bad_n += 1
+            continue
+        # Deterministic: first-win (file order). If duplicates exist, we keep earliest.
+        if tid not in idx:
+            idx[tid] = ev
+        ok_n += 1
+
+    return idx, ok_n, bad_n
+
+
+def _load_decisions_map(paths: ContractPaths, *, max_lines: Optional[int] = None) -> Tuple[Dict[str, Dict[str, Any]], int, int]:
     out: Dict[str, Dict[str, Any]] = {}
-    for ev in iter_jsonl(PATHS.decisions_path, max_lines=max_lines):
+    ok_n = 0
+    bad_n = 0
+
+    for ev in iter_jsonl(paths.decisions_path, max_lines=max_lines):
         ok, _ = validate_decision_record(ev)
         if not ok:
+            bad_n += 1
             continue
 
         tid = str(ev.get("trade_id") or "").strip()
@@ -173,7 +240,61 @@ def _load_decisions_map(*, max_lines: Optional[int] = None) -> Dict[str, Dict[st
         if cid:
             out[cid] = ev
 
-    return out
+        ok_n += 1
+
+    return out, ok_n, bad_n
+
+
+def _try_enrich_outcome_record(raw: Dict[str, Any], setups_idx: Dict[str, Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    """
+    Convert outcome_record-like rows into an outcome_enriched envelope using setups.jsonl by trade_id.
+    This prevents silently dropping historical outcomes.
+    """
+    tid = str(raw.get("trade_id") or "").strip()
+    if not tid:
+        return None
+
+    setup = setups_idx.get(tid)
+    if not isinstance(setup, dict):
+        return None
+
+    # outcome_record legacy rows may store data under "payload" instead of "outcome"
+    outcome: Dict[str, Any]
+    if isinstance(raw.get("outcome"), dict):
+        outcome = raw.get("outcome") or {}
+    elif isinstance(raw.get("payload"), dict):
+        outcome = {"payload": raw.get("payload")}
+    else:
+        outcome = {}
+    # Build an enriched-like envelope (schema-tolerant)
+    enriched: Dict[str, Any] = {
+        "event_type": "outcome_enriched",
+        "trade_id": tid,
+        "ts": raw.get("ts", setup.get("ts")),
+        "ts_ms": (raw.get("ts_ms") or raw.get("ts") or setup.get("ts_ms") or setup.get("ts")),
+        "account_label": raw.get("account_label", setup.get("account_label")),
+        "ai_profile": raw.get("ai_profile", setup.get("ai_profile")),
+        "symbol": raw.get("symbol", setup.get("symbol")),
+        "timeframe": (
+            raw.get("timeframe")
+            or setup.get("timeframe")
+            or (raw.get("payload") if isinstance(raw.get("payload"), dict) else {}).get("timeframe")
+            or (setup.get("payload") if isinstance(setup.get("payload"), dict) else {}).get("timeframe")
+            or "unknown"
+        ),
+        "strategy": raw.get("strategy", setup.get("strategy")),
+        "setup_type": raw.get("setup_type", setup.get("setup_type")),
+        "policy": raw.get("policy", setup.get("policy")),
+        "setup": setup,
+        "outcome": outcome,
+        "stats": raw.get("stats", {}),
+        "extra": raw.get("extra", {}),
+    }
+    ok, _ = validate_outcome_enriched(enriched)
+    return enriched if ok else None
+
+
+# ----------------------------- ENTRY BUILD ---------------------------------
 
 
 def _extract_exit_reason(enriched: Dict[str, Any]) -> Optional[str]:
@@ -214,7 +335,12 @@ def _build_memory_entry(enriched: Dict[str, Any], decision: Dict[str, Any]) -> O
     strategy = str(enriched.get("strategy") or setup.get("strategy") or "").strip() or "unknown"
     setup_type = enriched.get("setup_type") or setup.get("setup_type")
 
-    policy_hash = _policy_hash_from(enriched) or _policy_hash_from(setup) or str(decision.get("policy_hash") or "").strip() or None
+    policy_hash = (
+        _policy_hash_from(enriched)
+        or _policy_hash_from(setup)
+        or str(decision.get("policy_hash") or "").strip()
+        or None
+    )
     if not policy_hash:
         return None
 
@@ -294,8 +420,8 @@ def _insert_entry(conn: sqlite3.Connection, entry: Dict[str, Any]) -> None:
 
     conn.execute(
         """
-        INSERT OR REPLACE INTO memory_entries (
-            trade_id, entry_id, ts_ms,
+        INSERT OR IGNORE INTO memory_entries (
+            entry_id, trade_id, ts_ms,
             account_label, symbol, timeframe, strategy, setup_type, policy_hash,
             allow, size_multiplier, decision, tier_used, gates_reason,
             memory_id, setup_fingerprint, memory_fingerprint,
@@ -304,8 +430,8 @@ def _insert_entry(conn: sqlite3.Connection, entry: Dict[str, Any]) -> None:
         ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?);
         """,
         (
-            entry.get("trade_id"),
             entry.get("entry_id"),
+            entry.get("trade_id"),
             int(entry.get("ts_ms") or 0),
             entry.get("account_label"),
             entry.get("symbol"),
@@ -331,78 +457,204 @@ def _insert_entry(conn: sqlite3.Connection, entry: Dict[str, Any]) -> None:
     )
 
 
-def rebuild(*, max_decision_lines: Optional[int] = None, max_outcome_lines: Optional[int] = None) -> Dict[str, Any]:
-    PATHS.memory_entries_path.parent.mkdir(parents=True, exist_ok=True)
+# ----------------------------- PUBLIC API ----------------------------------
 
-    if PATHS.memory_entries_path.exists():
-        PATHS.memory_entries_path.unlink()
-    if PATHS.memory_index_path.exists():
-        PATHS.memory_index_path.unlink()
 
-    decisions = _load_decisions_map(max_lines=max_decision_lines)
+def build_memory_entries(
+    *,
+    paths: ContractPaths,
+    out_jsonl: Path,
+    db_path: Path,
+    mode: str = "ingest",
+    since_ts_ms: Optional[int] = None,
+    max_decision_lines: Optional[int] = None,
+    max_outcome_lines: Optional[int] = None,
+    max_setup_lines: Optional[int] = None,
+) -> Dict[str, Any]:
+    """
+    Public entrypoint expected by app.tools.ai_memory_entry_build.
 
-    conn = _connect(PATHS.memory_index_path)
+    mode:
+      - "ingest" (default): incremental, history-safe, appends only on new DB insert
+      - "rebuild": wipes JSONL + SQLite and rebuilds from scratch
+    """
+    t0 = time.time()
+
+    # Make derived paths consistent with args
+    local_paths = ContractPaths(
+        setups_path=paths.setups_path,
+        outcomes_path=paths.outcomes_path,
+        decisions_path=paths.decisions_path,
+        memory_entries_path=out_jsonl,
+        memory_index_path=db_path,
+    )
+
+    setups_idx, setup_ok, setup_bad = _load_setups_index(local_paths, max_lines=max_setup_lines)
+    decisions_map, decision_ok, decision_bad = _load_decisions_map(local_paths, max_lines=max_decision_lines)
+
+    conn = _connect(local_paths.memory_index_path)
     _init_db(conn)
 
-    stats = {
-        "decisions_indexed_keys": len(decisions),
-        "outcomes_scanned": 0,
-        "entries_written": 0,
-        "skipped_no_decision": 0,
-        "skipped_bad_outcome": 0,
-        "skipped_bad_policy_or_fp": 0,
-    }
+    if mode.lower() == "rebuild":
+        if local_paths.memory_entries_path.exists():
+            local_paths.memory_entries_path.unlink()
+        if local_paths.memory_index_path.exists():
+            conn.close()
+            local_paths.memory_index_path.unlink()
+            conn = _connect(local_paths.memory_index_path)
+            _init_db(conn)
 
-    for enriched in iter_jsonl(PATHS.outcomes_path, max_lines=max_outcome_lines):
-        stats["outcomes_scanned"] += 1
+    # In ingest mode: auto since_ts_ms from DB max(ts_ms) + 1 if not provided
+    if mode.lower() != "rebuild":
+        if since_ts_ms is None:
+            latest = _get_latest_ts_ms(conn)
+            since_ts_ms = (latest + 1) if latest is not None else None
 
-        ok, _ = validate_outcome_enriched(enriched)
-        if not ok:
-            stats["skipped_bad_outcome"] += 1
+    # ✅ Phase 5 backfill mode (one-time history build)
+    # If AI_MEMORY_BACKFILL=true, do NOT skip historical outcomes by ts_ms.
+    # Optional cap: AI_MEMORY_BACKFILL_MAX_OUTCOMES (only applied when max_outcome_lines is not provided)
+    try:
+        backfill = os.getenv("AI_MEMORY_BACKFILL", "false").strip().lower() in ("1","true","yes","y","on")
+    except Exception:
+        backfill = False
+
+    if mode.lower() != "rebuild" and backfill:
+        since_ts_ms = None
+        try:
+            cap = int(os.getenv("AI_MEMORY_BACKFILL_MAX_OUTCOMES", "0").strip() or "0")
+        except Exception:
+            cap = 0
+        if (max_outcome_lines is None) and cap > 0:
+            max_outcome_lines = cap
+
+    processed = 0
+    inserted = 0
+    skipped_existing = 0
+    bad_rows = 0
+    skipped_no_decision = 0
+    skipped_old = 0
+    enriched_from_setup = 0
+
+    for raw in iter_jsonl(local_paths.outcomes_path, max_lines=max_outcome_lines):
+        processed += 1
+
+        # Filter by time (ingest only)
+        ts_ms = get_ts_ms(raw)
+        if mode.lower() != "rebuild" and since_ts_ms is not None and ts_ms < int(since_ts_ms):
+            skipped_old += 1
+            continue
+
+        ev_type = str(raw.get("event_type") or "").strip()
+        enriched: Optional[Dict[str, Any]] = None
+
+        if ev_type == "outcome_enriched":
+            ok, _ = validate_outcome_enriched(raw)
+            enriched = raw if ok else None
+        else:
+            enriched = _try_enrich_outcome_record(raw, setups_idx)
+            if enriched is not None:
+                enriched_from_setup += 1
+
+        if enriched is None:
+            _debug_bad_row_once(raw)
+            bad_rows += 1
             continue
 
         tid = str(enriched.get("trade_id") or "").strip()
         if not tid:
-            stats["skipped_bad_outcome"] += 1
+            bad_rows += 1
             continue
 
-        decision = decisions.get(tid)
+        decision = decisions_map.get(tid)
         if not decision:
-            stats["skipped_no_decision"] += 1
+            skipped_no_decision += 1
             continue
 
         entry = _build_memory_entry(enriched, decision)
         if not entry:
-            stats["skipped_bad_policy_or_fp"] += 1
+            bad_rows += 1
             continue
 
-        append_jsonl(PATHS.memory_entries_path, entry)
+        before = conn.total_changes
         _insert_entry(conn, entry)
-        stats["entries_written"] += 1
+        after = conn.total_changes
 
-        if stats["entries_written"] % 250 == 0:
+        if after == before:
+            skipped_existing += 1
+        else:
+            inserted += 1
+            append_jsonl(local_paths.memory_entries_path, entry)
+
+        if (inserted + skipped_existing) % 250 == 0:
             conn.commit()
 
     conn.commit()
     conn.close()
-    return stats
+
+    elapsed = round(time.time() - t0, 3)
+
+    return {
+        # Tool-friendly keys (legacy expectations)
+        "processed_outcome_rows": processed,
+        "inserted": inserted,
+        "skipped_existing": skipped_existing,
+        "bad_rows": bad_rows,
+        "setup_index_ok": setup_ok,
+        "setup_index_bad": setup_bad,
+        "decision_index_ok": decision_ok,
+        "decision_index_bad": decision_bad,
+        "elapsed_sec": elapsed,
+        # Extra useful debug
+        "mode": mode.lower(),
+        "since_ts_ms": since_ts_ms,
+        "outcomes_skipped_old": skipped_old,
+        "skipped_no_decision": skipped_no_decision,
+        "enriched_from_setup": enriched_from_setup,
+        "decisions_index_keys": len(decisions_map),
+        "setups_index_keys": len(setups_idx),
+        "out_jsonl": str(out_jsonl),
+        "db_path": str(db_path),
+    }
+
+
+# ----------------------------- CLI -----------------------------------------
 
 
 def main() -> None:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--rebuild", action="store_true", help="Rebuild entries + index from scratch (default).")
+    ap.add_argument("--rebuild", action="store_true", help="Wipe + rebuild entries + index from scratch.")
+    ap.add_argument("--ingest", action="store_true", help="Incremental ingest into SQLite + JSONL (default).")
     ap.add_argument("--max-decisions", type=int, default=0, help="Max decision lines to scan (0 = no cap).")
     ap.add_argument("--max-outcomes", type=int, default=0, help="Max outcomes lines to scan (0 = no cap).")
+    ap.add_argument("--max-setups", type=int, default=0, help="Max setup lines to scan (0 = no cap).")
+    ap.add_argument("--since-ts-ms", type=int, default=0, help="Only ingest outcomes with ts_ms >= this (0 = disabled).")
     args = ap.parse_args()
+
+    paths = ContractPaths.default()
+    out_jsonl = paths.memory_entries_path
+    db_path = paths.memory_index_path
+
+    mode = "ingest"
+    if args.rebuild:
+        mode = "rebuild"
 
     max_dec = args.max_decisions if args.max_decisions and args.max_decisions > 0 else None
     max_out = args.max_outcomes if args.max_outcomes and args.max_outcomes > 0 else None
+    max_set = args.max_setups if args.max_setups and args.max_setups > 0 else None
+    since = args.since_ts_ms if args.since_ts_ms and args.since_ts_ms > 0 else None
 
-    stats = rebuild(max_decision_lines=max_dec, max_outcome_lines=max_out)
+    stats = build_memory_entries(
+        paths=paths,
+        out_jsonl=out_jsonl,
+        db_path=db_path,
+        mode=mode,
+        since_ts_ms=since,
+        max_decision_lines=max_dec,
+        max_outcome_lines=max_out,
+        max_setup_lines=max_set,
+    )
 
-    print("=== MemoryEntry Builder v1.2 ===")
-    print(f"memory_entries_path : {PATHS.memory_entries_path}")
-    print(f"memory_index_path   : {PATHS.memory_index_path}")
+    print("=== MemoryEntry Builder v1.5.0 ===")
     for k, v in stats.items():
         print(f"{k}: {v}")
     print("DONE")

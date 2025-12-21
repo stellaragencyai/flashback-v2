@@ -1,24 +1,22 @@
 ﻿#!/usr/bin/env python3
-# -*- coding: utf-8 -*- 
+# -*- coding: utf-8 -*-
 
 """
-Flashback — AI Pilot v2.8 ✅ (Canary-gated Memory Gates + Decision Schema Aligned)
+Flashback — AI Pilot v2.9 ✅ (Truth Canon + Action Bus enforced)
 
-Key points
-- Uses app.ai.ai_memory_store.query_memories_tiered (rollups-backed)
-- Uses app.ai.ai_gatekeeper.evaluate_memory_gates
-- Logs decisions to state/ai_decisions.jsonl with join keys
-- DRY-RUN by default
+PATCH v2.9.4 (THIS PATCH):
+- Decisions: FAIL CLOSED if ai_decision_logger is unavailable (single-writer law).
+- Actions: FAIL CLOSED if ai_action_bus is unavailable (single choke-point law).
+- Decision row shape hardened:
+    • event_type="pilot_decision"
+    • ts_ms always present (ts kept for backward compatibility)
+    • meta.source/meta.stage always present
 
-v2.8 FIX/ADD
-------------
-- Decision schema alignment: writes allow(bool) + size_multiplier(float) at top-level
-  so Phase 5 builders/validators can consume decisions deterministically.
-- Canary gating for memory usage:
-    • If FB_CANARY_ENABLED=false -> memory gates are bypassed (cold-start behavior)
-    • If enabled, only accounts in FB_CANARY_ACCOUNTS get memory gating
-- Adds optional one-shot run mode for testing:
-    python app/ai/ai_pilot.py --once
+PATCH v2.9.5 (THIS PATCH):
+- Timeframe normalization hardened:
+    • Always emit timeframe in canonical form (e.g., "5m", "15m", "1h")
+    • Default timeframe is "5m" (NOT "5")
+    • Normalize join keys to prevent Phase 6 bucket mismatches
 """
 
 from __future__ import annotations
@@ -28,8 +26,6 @@ import os
 import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
-
-import orjson
 
 from app.core.ai_action_builder import build_trade_action_from_sample
 from app.core.ai_state_bus import build_ai_snapshot, validate_snapshot_v2
@@ -48,6 +44,7 @@ except Exception:  # pragma: no cover
             handler.setFormatter(fmt)
             logger_.addHandler(handler)
         return logger_
+
 
 logger = get_logger("ai_pilot")
 
@@ -87,6 +84,24 @@ except Exception:  # pragma: no cover
     def is_canary_account(_: Optional[str]) -> bool:  # type: ignore
         return False
 
+# ✅ hardened decision writer (single-writer law)
+try:
+    from app.core.ai_decision_logger import append_decision as append_decision
+except Exception as e:  # pragma: no cover
+    append_decision = None  # type: ignore[assignment]
+    _DECISION_LOGGER_IMPORT_ERROR = e
+else:
+    _DECISION_LOGGER_IMPORT_ERROR = None
+
+# ✅ AI actions bus (single choke-point)
+try:
+    from app.core.ai_action_bus import append_actions as bus_append_actions
+except Exception as e:  # pragma: no cover
+    bus_append_actions = None  # type: ignore[assignment]
+    _ACTION_BUS_IMPORT_ERROR = e
+else:
+    _ACTION_BUS_IMPORT_ERROR = None
+
 
 def _env_bool(name: str, default: str = "false") -> bool:
     raw = os.getenv(name, default).strip().lower()
@@ -111,6 +126,35 @@ def _now_ms() -> int:
     return int(time.time() * 1000)
 
 
+def _normalize_timeframe(tf: Any, default: str = "5m") -> str:
+    """
+    Normalize timeframe to canonical string form:
+    - "5" -> "5m"
+    - "5m" -> "5m"
+    - "1h" -> "1h"
+    - None/"" -> default
+    This prevents Phase 6 bucket mismatches (Phase 6 uses "5m", not "5").
+    """
+    s = ""
+    try:
+        s = str(tf).strip().lower()
+    except Exception:
+        s = ""
+    if not s:
+        return default
+
+    # Already canonical-like
+    if s.endswith(("m", "h", "d", "w")):
+        return s
+
+    # Pure digits => minutes
+    if s.isdigit():
+        return f"{s}m"
+
+    # Very defensive fallback: keep as-is but do not emit empty
+    return s or default
+
+
 ACCOUNT_LABEL: str = os.getenv("ACCOUNT_LABEL", "main").strip() or "main"
 
 AI_PILOT_ENABLED: bool = _env_bool("AI_PILOT_ENABLED", "true")
@@ -133,81 +177,36 @@ AI_MEM_MAX_LOSS_RATE: float = _env_float("AI_MEM_MAX_LOSS_RATE", "0.60")
 AI_MEM_MIN_ABS_R_SUM: float = _env_float("AI_MEM_MIN_ABS_R_SUM", "0.0")
 AI_PILOT_BLOCK_ON_BAD_MEMORY: bool = _env_bool("AI_PILOT_BLOCK_ON_BAD_MEMORY", "true")
 
-# If true, memory gates only apply when canary is enabled + account is allowlisted.
 AI_PILOT_MEMORY_CANARY_ONLY: bool = _env_bool("AI_PILOT_MEMORY_CANARY_ONLY", "true")
 
-AI_DECISIONS_PATH: Path = Path(os.getenv("AI_DECISIONS_PATH", "state/ai_decisions.jsonl")).resolve()
-AI_DECISIONS_PATH.parent.mkdir(parents=True, exist_ok=True)
-
-AI_DECISIONS_WARN_MB: float = float(os.getenv("AI_DECISIONS_WARN_MB", "10"))
-AI_DECISIONS_CAP_MB: float = float(os.getenv("AI_DECISIONS_CAP_MB", "50"))
-AI_DECISIONS_KEEP: int = int(os.getenv("AI_DECISIONS_KEEP", "3"))
-
-try:
-    from app.core.config import settings  # type: ignore
-    default_actions_path = getattr(settings, "AI_ACTIONS_PATH", "state/ai_actions.jsonl")
-except Exception:
-    default_actions_path = "state/ai_actions.jsonl"
-
-env_actions_path = os.getenv("AI_ACTIONS_PATH", "").strip()
-_actions_path_str = env_actions_path or default_actions_path
-AI_ACTIONS_FILE: Path = Path(_actions_path_str).resolve()
-AI_ACTIONS_FILE.parent.mkdir(parents=True, exist_ok=True)
+# ✅ cold start sizing default (matches enforcer behavior)
+AI_PILOT_COLD_START_SIZE_MULT: float = _env_float("AI_PILOT_COLD_START_SIZE_MULT", "0.25")
 
 
-def _append_jsonl(path: Path, payload: Dict[str, Any]) -> None:
-    try:
-        with path.open("ab") as f:
-            f.write(orjson.dumps(payload))
-            f.write(b"\n")
-    except Exception as e:
-        try:
-            logger.warning("Failed to append jsonl to %s: %r", pathsze := path, e)
-        except Exception:
-            pass
-
-
-def _rotate_file(path: Path, *, keep: int) -> None:
-    try:
-        if keep <= 0 or not path.exists():
-            return
-        oldest = path.with_suffix(path.suffix + f".{keep}")
-        if oldest.exists():
-            try:
-                oldest.unlink()
-            except Exception:
-                pass
-        for i in range(keep - 1, 0, -1):
-            src = path.with_suffix(path.suffix + f".{i}")
-            dst = path.with_suffix(path.suffix + f".{i+1}")
-            if src.exists():
-                try:
-                    src.replace(dst)
-                except Exception:
-                    pass
-        dst1 = path.with_suffix(path.suffix + ".1")
-        try:
-            path.replace(dst1)
-        except Exception:
-            pass
-    except Exception:
+def _require_decision_logger() -> None:
+    if append_decision is not None:
         return
+    err = _DECISION_LOGGER_IMPORT_ERROR
+    msg = f"FATAL: ai_decision_logger.append_decision unavailable (single-writer law). err={err!r}"
+    logger.error(msg)
+    raise RuntimeError(msg)
 
 
-def _maybe_rotate_decisions() -> None:
+def _require_action_bus() -> None:
+    if bus_append_actions is not None:
+        return
+    err = _ACTION_BUS_IMPORT_ERROR
+    msg = f"FATAL: ai_action_bus.append_actions unavailable (single choke-point). err={err!r}"
+    logger.error(msg)
+    raise RuntimeError(msg)
+
+
+def _write_decision(payload: Dict[str, Any]) -> None:
+    _require_decision_logger()
     try:
-        if not AI_DECISIONS_PATH.exists():
-            return
-        size_mb = AI_DECISIONS_PATH.stat().st_size / (1024 * 1024)
-        if size_mb >= AI_DECISIONS_CAP_MB:
-            _rotate_file(AI_DECISIONS_PATH, keep=AI_DECISIONS_KEEP)
-        elif size_mb >= AI_DECISIONS_WARN_MB:
-            logger.warning(
-                "ai_decisions.jsonl growing: %.2f MB (warn=%.2f cap=%.2f)",
-                size_mb, AI_DECISIONS_WARN_MB, AI_DECISIONS_CAP_MB
-            )
-    except Exception:
-        pass
+        append_decision(payload)  # type: ignore[misc]
+    except Exception as e:
+        raise RuntimeError(f"decision_logger_failed: {e}") from e
 
 
 def _build_ai_state() -> Dict[str, Any]:
@@ -251,11 +250,14 @@ def _safe_first_match(r: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     return None
 
 
-def _decision_base(ts: int) -> PilotDecision:
-    # NOTE: Top-level allow + size_multiplier are REQUIRED for downstream Phase 5 tooling.
+def _decision_base(ts_ms: int) -> PilotDecision:
+    # Canonical-ish pilot decision row (logger can normalize further, but we don’t rely on it)
     return {
         "schema_version": int(DECISION_SCHEMA_VERSION),
-        "ts": ts,
+        "ts_ms": int(ts_ms),
+        "ts": int(ts_ms),  # keep legacy key for older readers
+        "event_type": "pilot_decision",
+        "meta": {"source": "ai_pilot", "stage": "pilot"},
         "decision": "COLD_START",
         "tier_used": "NONE",
         "memory": None,
@@ -277,10 +279,11 @@ def _extract_decision_join_keys(setup_event: Dict[str, Any]) -> Dict[str, Any]:
     trade_id = _safe_str(setup_event.get("trade_id") or "")
     symbol = _safe_str(setup_event.get("symbol") or "").upper()
     account_label = _safe_str(setup_event.get("account_label") or setup_event.get("label") or "") or ACCOUNT_LABEL
-    timeframe = _safe_str(setup_event.get("timeframe") or "")
 
-    # optional join key (helps outcome linker/builder in mixed pipelines)
-    client_trade_id = _safe_str(setup_event.get("client_trade_id") or setup_event.get("clientTradeId") or "") 
+    timeframe_raw = _safe_str(setup_event.get("timeframe") or "")
+    timeframe = _normalize_timeframe(timeframe_raw, default="5m")
+
+    client_trade_id = _safe_str(setup_event.get("client_trade_id") or setup_event.get("clientTradeId") or "")
 
     policy_hash = ""
     if isinstance(setup_event.get("policy"), dict):
@@ -302,17 +305,12 @@ def _extract_decision_join_keys(setup_event: Dict[str, Any]) -> Dict[str, Any]:
         "policy_hash": policy_hash,
         "memory_fingerprint": memory_fingerprint,
     }
-    # keep trade_id even if empty (downstream visibility)
     return {k: v for k, v in out.items() if v != "" or k == "trade_id"}
 
 
 def _set_allow_and_size(out: PilotDecision) -> None:
-    """
-    Align decision string -> allow(bool), size_multiplier(float)
-    """
     dec = str(out.get("decision") or "").upper().strip()
 
-    allow = False
     if dec == "ALLOW_TRADE":
         allow = True
     elif dec == "COLD_START":
@@ -322,7 +320,6 @@ def _set_allow_and_size(out: PilotDecision) -> None:
 
     out["allow"] = bool(allow)
 
-    # Default sizing unless memory provides a multiplier
     mult = 1.0
     mem = out.get("memory")
     if isinstance(mem, dict):
@@ -333,6 +330,21 @@ def _set_allow_and_size(out: PilotDecision) -> None:
                     break
                 except Exception:
                     pass
+
+    if dec == "COLD_START":
+        try:
+            cold = float(AI_PILOT_COLD_START_SIZE_MULT)
+        except Exception:
+            cold = 0.25
+        try:
+            mult = min(float(mult), cold)
+        except Exception:
+            mult = cold
+        g = out.get("gates")
+        if isinstance(g, dict):
+            g.setdefault("cold_start_size_mult", cold)
+            out["gates"] = g
+
     try:
         out["size_multiplier"] = float(mult)
     except Exception:
@@ -340,26 +352,18 @@ def _set_allow_and_size(out: PilotDecision) -> None:
 
 
 def _memory_gating_active_for_account(account_label: str) -> bool:
-    """
-    Canary policy:
-      - If AI_PILOT_MEMORY_CANARY_ONLY=false: use memory gates when enabled
-      - Else: use memory gates only when FB_CANARY_ENABLED=true AND account allowlisted
-    """
     if not AI_PILOT_USE_MEMORY_GATES:
         return False
-
     if not AI_PILOT_MEMORY_CANARY_ONLY:
         return True
-
     if not canary_enabled():
         return False
-
     return is_canary_account(account_label)
 
 
 def pilot_decide(setup_event: Dict[str, Any]) -> PilotDecision:
-    ts = _now_ms()
-    out: PilotDecision = _decision_base(ts)
+    ts_ms = _now_ms()
+    out: PilotDecision = _decision_base(ts_ms)
 
     try:
         out.update(_extract_decision_join_keys(setup_event))
@@ -368,31 +372,27 @@ def pilot_decide(setup_event: Dict[str, Any]) -> PilotDecision:
 
     acct = str(out.get("account_label") or ACCOUNT_LABEL)
 
-    # Canary gating: if not active, behave like cold start (do not block on "bad memory")
     if not _memory_gating_active_for_account(acct):
         out["decision"] = "COLD_START"
         out["tier_used"] = "NONE"
         out["memory"] = None
         out["gates"] = {"reason": "memory_gates_disabled_or_not_canary"}
         _set_allow_and_size(out)
-        _maybe_rotate_decisions()
-        _append_jsonl(AI_DECISIONS_PATH, dict(out))
+        _write_decision(dict(out))
         return out
 
     if query_memories_tiered is None or QueryOptions is None:
         out["decision"] = "BLOCKED_BY_GATES"
         out["gates"] = {"reason": "ai_memory_store_missing"}
         _set_allow_and_size(out)
-        _maybe_rotate_decisions()
-        _append_jsonl(AI_DECISIONS_PATH, dict(out))
+        _write_decision(dict(out))
         return out
 
     if evaluate_memory_gates is None:
         out["decision"] = "BLOCKED_BY_GATES"
         out["gates"] = {"reason": "ai_gatekeeper_missing"}
         _set_allow_and_size(out)
-        _maybe_rotate_decisions()
-        _append_jsonl(AI_DECISIONS_PATH, dict(out))
+        _write_decision(dict(out))
         return out
 
     try:
@@ -418,8 +418,7 @@ def pilot_decide(setup_event: Dict[str, Any]) -> PilotDecision:
                 out["decision"] = "COLD_START" if AI_PILOT_ALLOW_COLD_START else "BLOCKED_BY_GATES"
                 out["gates"] = {"reason": "no_matches"}
             _set_allow_and_size(out)
-            _maybe_rotate_decisions()
-            _append_jsonl(AI_DECISIONS_PATH, dict(out))
+            _write_decision(dict(out))
             return out
 
         min_n_eff = int(AI_MEM_MIN_N_ANY)
@@ -445,8 +444,7 @@ def pilot_decide(setup_event: Dict[str, Any]) -> PilotDecision:
         out["decision"] = "ALLOW_TRADE" if ok else ("BLOCKED_BY_GATES" if AI_PILOT_BLOCK_ON_BAD_MEMORY else "COLD_START")
 
         _set_allow_and_size(out)
-        _maybe_rotate_decisions()
-        _append_jsonl(AI_DECISIONS_PATH, dict(out))
+        _write_decision(dict(out))
         return out
 
     except Exception as e:
@@ -455,8 +453,7 @@ def pilot_decide(setup_event: Dict[str, Any]) -> PilotDecision:
         out["memory"] = None
         out["gates"] = {"reason": "error", "error": str(e)}
         _set_allow_and_size(out)
-        _maybe_rotate_decisions()
-        _append_jsonl(AI_DECISIONS_PATH, dict(out))
+        _write_decision(dict(out))
         return out
 
 
@@ -543,7 +540,8 @@ def _run_sample_policy(ai_state: Dict[str, Any]) -> List[Dict[str, Any]]:
         if not isinstance(raw_actions, list):
             return []
 
-        tf_default = os.getenv("AI_PILOT_DEFAULT_TIMEFRAME", "5").strip() or "5"
+        tf_default_raw = os.getenv("AI_PILOT_DEFAULT_TIMEFRAME", "5m").strip() or "5m"
+        tf_default = _normalize_timeframe(tf_default_raw, default="5m")
 
         ai_actions: List[Dict[str, Any]] = []
         for raw in raw_actions:
@@ -571,25 +569,21 @@ def _run_sample_policy(ai_state: Dict[str, Any]) -> List[Dict[str, Any]]:
                 extra={"legacy_action": raw},
             )
 
-            # ✅ CRITICAL: provide setup_context so memory gates can decide + emit ai_decisions.jsonl
             trade_id = str(raw.get("trade_id") or raw.get("client_trade_id") or raw.get("clientTradeId") or "").strip()
             if not trade_id:
                 trade_id = f"SAMPLE_{_now_ms()}_{sym}_{side_s}".replace(" ", "")
+
+            tf = _normalize_timeframe(raw.get("timeframe") or tf_default, default="5m")
 
             setup_ctx = {
                 "trade_id": trade_id,
                 "client_trade_id": trade_id,
                 "symbol": sym,
                 "account_label": ACCOUNT_LABEL,
-                "timeframe": str(raw.get("timeframe") or tf_default),
+                "timeframe": tf,
                 "side": "buy" if side_s in ("buy", "long") else ("sell" if side_s in ("sell", "short") else side_s),
                 "policy": {"policy_hash": "SAMPLE_POLICY_V1"},
-                "payload": {
-                    "features": {
-                        "memory_fingerprint": str(raw.get("memory_fingerprint") or ""),
-                        "source": "sample_policy",
-                    }
-                },
+                "payload": {"features": {"memory_fingerprint": str(raw.get("memory_fingerprint") or ""), "source": "sample_policy"}},
             }
 
             ai_action["setup_context"] = setup_ctx
@@ -615,27 +609,31 @@ def _run_core_policy(ai_state: Dict[str, Any]) -> List[Dict[str, Any]]:
 
 
 def _dispatch_actions(actions: List[Dict[str, Any]], *, label: str) -> int:
+    """
+    Writes actions to the AI Action Bus ONLY.
+
+    No legacy fallback. If the bus is missing, we fail closed.
+    """
     if not actions or not WRITE_ACTIONS:
         return 0
-    now_ms = _now_ms()
-    written = 0
+
+    _require_action_bus()
+
     try:
-        with AI_ACTIONS_FILE.open("ab") as f:
-            for raw in actions:
-                if not isinstance(raw, dict):
-                    continue
-                a = dict(raw)
-                a.setdefault("ts_ms", now_ms)
-                a.setdefault("account_label", label)
-                a["source"] = "ai_pilot"
-                a["dry_run"] = DRY_RUN
-                f.write(orjson.dumps(a))
-                f.write(b"\n")
-                written += 1
+        # Keep call signature stable with defensive fallback for older bus variants
+        try:
+            written = bus_append_actions(  # type: ignore[misc]
+                actions,
+                source="ai_pilot",
+                label=label,
+                dry_run=DRY_RUN,
+            )
+        except TypeError:
+            # If older signature exists, try minimal call
+            written = bus_append_actions(actions)  # type: ignore[misc]
+        return int(written or 0)
     except Exception as e:
-        alert_bot_error("ai_pilot", f"dispatch_actions error: {e}", "ERROR")
-        return 0
-    return written
+        raise RuntimeError(f"action_bus_failed: {e}") from e
 
 
 def run_once() -> None:

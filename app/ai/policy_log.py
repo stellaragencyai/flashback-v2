@@ -1,31 +1,23 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Flashback — AI Policy Decision Log
+Flashback — AI Policy Decision Log (legacy adapter)
 
-Purpose
--------
-Append every AI gate decision to a JSONL file so you can later:
+Reality check:
+-------------
+You already have a canonical policy audit log in:
+    state/ai_policy_log.jsonl
 
-    - Inspect how often each strategy is being blocked/allowed.
-    - See score distributions by strategy / symbol / mode.
-    - Correlate policy behavior with later trade outcomes.
+This module exists because older code (like executor_v2) may still import:
+    from app.ai.policy_log import record_policy_decision
 
-Output:
-    state/ai_policy_decisions.jsonl
+So we keep it stable, best-effort, never-fail, and we write to the SAME
+canonical log file to avoid forks in observability.
 
-Each row:
-    {
-      "ts_ms": 1733640000123,
-      "strategy_id": "Sub1_Trend (sub 524630315)",
-      "allow": true,
-      "score": 0.73,
-      "reason": "passes_simple_policy",
-      "symbol": "BTCUSDT",
-      "timeframe": "5",
-      "mode": "UNKNOWN" | "PAPER" | "LIVE_CANARY" | "LIVE_FULL",
-      "raw_signal": {...}   # optional
-    }
+Row format:
+-----------
+This module logs a compact row that is compatible with analysis tools, and
+it does NOT block trading if logging fails.
 """
 
 from __future__ import annotations
@@ -58,7 +50,8 @@ except Exception:
 STATE_DIR = ROOT / "state"
 STATE_DIR.mkdir(parents=True, exist_ok=True)
 
-POLICY_LOG_PATH = STATE_DIR / "ai_policy_decisions.jsonl"
+# Canonical log path (matches ai_executor_gate.py)
+POLICY_LOG_PATH = STATE_DIR / "ai_policy_log.jsonl"
 
 
 def _normalize_mode(signal: Dict[str, Any]) -> str:
@@ -66,6 +59,21 @@ def _normalize_mode(signal: Dict[str, Any]) -> str:
     if mode in ("PAPER", "LIVE_CANARY", "LIVE_FULL"):
         return mode
     return "UNKNOWN"
+
+
+def _normalize_timeframe(tf: Any, default: str = "5m") -> str:
+    s = ""
+    try:
+        s = str(tf).strip().lower()
+    except Exception:
+        s = ""
+    if not s:
+        return default
+    if s.endswith(("m", "h", "d", "w")):
+        return s
+    if s.isdigit():
+        return f"{s}m"
+    return s or default
 
 
 def record_policy_decision(
@@ -76,37 +84,47 @@ def record_policy_decision(
     signal: Optional[Dict[str, Any]] = None,
 ) -> None:
     """
-    Append a single policy decision row to state/ai_policy_decisions.jsonl.
+    Append a single policy decision row to state/ai_policy_log.jsonl.
     Best-effort; failures are swallowed so trading is never blocked by logging.
     """
     try:
         ts_ms = int(time.time() * 1000)
 
         sym = None
-        tf = None
+        tf_raw = None
         mode = "UNKNOWN"
+        raw_signal_out: Optional[Dict[str, Any]] = None
 
         if isinstance(signal, dict):
             sym = signal.get("symbol")
-            tf = signal.get("timeframe") or signal.get("tf")
+            tf_raw = signal.get("timeframe") or signal.get("tf")
             mode = _normalize_mode(signal)
+
+            raw_signal_out = dict(signal)
+            if "timeframe" in raw_signal_out or "tf" in raw_signal_out:
+                raw_signal_out["timeframe"] = _normalize_timeframe(
+                    raw_signal_out.get("timeframe") or raw_signal_out.get("tf"),
+                    default="5m",
+                )
+
+        tf = _normalize_timeframe(tf_raw, default="5m") if tf_raw is not None else None
 
         row: Dict[str, Any] = {
             "ts_ms": ts_ms,
-            "strategy_id": strategy_id,
+            "strategy_name": str(strategy_id),
             "allow": bool(allow),
             "score": float(score) if score is not None else None,
             "reason": str(reason),
             "symbol": str(sym or "").upper() or None,
-            "timeframe": str(tf) if tf is not None else None,
+            "timeframe": tf,
             "mode": mode,
+            "source": "policy_log.record_policy_decision",
         }
 
-        if isinstance(signal, dict):
-            row["raw_signal"] = signal
+        if raw_signal_out is not None:
+            row["raw_signal"] = raw_signal_out
 
         with POLICY_LOG_PATH.open("ab") as f:
             f.write(_dumps(row) + b"\n")
     except Exception:
-        # Never crash caller due to logging issues.
         return

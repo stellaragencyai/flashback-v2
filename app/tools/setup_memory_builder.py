@@ -123,7 +123,7 @@ def _join_key(d: Dict[str, Any]) -> Optional[str]:
     if k:
         return k
 
-    # Support payload nesting (your schema uses payload heavily)
+    # Support payload nesting
     payload = d.get("payload")
     if isinstance(payload, dict):
         k2 = _first_str(payload, JOIN_FIELDS)
@@ -142,13 +142,38 @@ def _join_key(d: Dict[str, Any]) -> Optional[str]:
         if k4:
             return k4
 
-    # As a last resort, build a synthetic key from symbol+ts if present
+    # outcome_enriched wraps canonical record
+    out = d.get("outcome")
+    if isinstance(out, dict):
+        k_out = _first_str(out, JOIN_FIELDS)
+        if k_out:
+            return k_out
+
+        payload_out = out.get("payload")
+        if isinstance(payload_out, dict):
+            k_out2 = _first_str(payload_out, JOIN_FIELDS)
+            if k_out2:
+                return k_out2
+            meta_out = payload_out.get("meta")
+            if isinstance(meta_out, dict):
+                k_out3 = _first_str(meta_out, JOIN_FIELDS)
+                if k_out3:
+                    return k_out3
+
+        meta_out2 = out.get("meta")
+        if isinstance(meta_out2, dict):
+            k_out4 = _first_str(meta_out2, JOIN_FIELDS)
+            if k_out4:
+                return k_out4
+
+    # Last-resort synthetic key
     sym = d.get("symbol")
     ts = d.get("ts_ms") or d.get("ts") or d.get("timestamp_ms")
     if isinstance(sym, str) and sym and isinstance(ts, int):
         return f"SYN::{sym}::{ts}"
 
     return None
+
 
 
 def _pick(d: Dict[str, Any], key: str, default: Any = None) -> Any:

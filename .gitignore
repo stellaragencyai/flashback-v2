@@ -72,3 +72,8 @@ signals/*.jsonl
 *.log
 *.jsonl
 
+
+# Local audit outputs
+tree.txt
+filesizes.txt
+

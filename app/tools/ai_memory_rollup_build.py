@@ -1,14 +1,12 @@
-#!/usr/bin/env python3
+﻿#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Flashback — AI Memory Rollup Builder v1 (Phase 5.5)
+Flashback — AI Memory Rollup Builder v1.1 (Phase 6 substrate)
 
-Purpose
--------
-Build aggregated "rollups" from MemoryEntry substrate so Phase 6+ can consume:
-- per memory_id stats
-- bounded aggregates
-- sample-size aware metrics
+v1.1 FIX
+- Rollups now include memory_fingerprint explicitly.
+- Rollup grouping keys include memory_fingerprint so Phase 6 queries remain stable even if memory_id semantics evolve.
+- Adds index on memory_fingerprint.
 
 Reads:
 - state/ai_memory/memory_index.sqlite (table: memory_entries)
@@ -18,8 +16,7 @@ Writes:
 
 Usage
 -----
-python app/tools/ai_memory_rollup_build.py --rebuild
-python app/tools/ai_memory_rollup_build.py --append   (currently same as rebuild; reserved)
+python -m app.tools.ai_memory_rollup_build --rebuild
 """
 
 from __future__ import annotations
@@ -64,7 +61,12 @@ def _init_rollups_db(conn: sqlite3.Connection) -> None:
         CREATE TABLE IF NOT EXISTS memory_rollups (
             rollup_id TEXT PRIMARY KEY,
 
-            memory_id TEXT NOT NULL,
+            -- stable lookup key used by Phase 6+: memory_fingerprint
+            memory_fingerprint TEXT NOT NULL,
+
+            -- optional/derived identity (can evolve), kept for auditing + future scoping
+            memory_id TEXT,
+
             symbol TEXT,
             timeframe TEXT,
             setup_type TEXT,
@@ -86,6 +88,8 @@ def _init_rollups_db(conn: sqlite3.Connection) -> None:
         );
         """
     )
+
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_roll_mfp ON memory_rollups(memory_fingerprint);")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_roll_mem ON memory_rollups(memory_id);")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_roll_sym_tf ON memory_rollups(symbol, timeframe);")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_roll_policy ON memory_rollups(policy_hash);")
@@ -93,17 +97,16 @@ def _init_rollups_db(conn: sqlite3.Connection) -> None:
 
 
 def _rollup_id(
-    memory_id: str,
+    memory_fingerprint: str,
     symbol: Optional[str],
     timeframe: Optional[str],
     setup_type: Optional[str],
     policy_hash: Optional[str],
 ) -> str:
-    # Deterministic string key is fine for v1.
-    # (We can sha256 later if we ever worry about length.)
+    # Deterministic string key is fine for v1.1.
     return "||".join(
         [
-            str(memory_id or "").strip(),
+            str(memory_fingerprint or "").strip(),
             str(symbol or "").strip(),
             str(timeframe or "").strip(),
             str(setup_type or "").strip(),
@@ -132,15 +135,12 @@ def rebuild() -> dict[str, Any]:
 
     built_ts_ms = int(time.time() * 1000)
 
-    # Build rollups directly from SQL (fast, deterministic).
-    # Notes:
-    # - win, allow stored as 0/1/NULL
-    # - avg(win) = win rate for non-null
-    # - losses = n - wins when win is non-null; but we compute wins/losses explicitly.
     cur = src.cursor()
     cur.execute(
         """
         SELECT
+            memory_fingerprint,
+            -- memory_id may be NULL for some legacy/backfilled rows; keep it if present
             memory_id,
             symbol,
             timeframe,
@@ -161,8 +161,8 @@ def rebuild() -> dict[str, Any]:
 
             MAX(ts_ms) AS last_ts_ms
         FROM memory_entries
-        WHERE memory_id IS NOT NULL AND TRIM(memory_id) <> ''
-        GROUP BY memory_id, symbol, timeframe, setup_type, policy_hash
+        WHERE memory_fingerprint IS NOT NULL AND TRIM(memory_fingerprint) <> ''
+        GROUP BY memory_fingerprint, memory_id, symbol, timeframe, setup_type, policy_hash
         ORDER BY last_ts_ms DESC;
         """
     )
@@ -172,7 +172,7 @@ def rebuild() -> dict[str, Any]:
     inserted = 0
     for r in rows:
         rid = _rollup_id(
-            str(r["memory_id"]),
+            str(r["memory_fingerprint"]),
             r["symbol"],
             r["timeframe"],
             r["setup_type"],
@@ -182,15 +182,18 @@ def rebuild() -> dict[str, Any]:
             """
             INSERT OR REPLACE INTO memory_rollups (
                 rollup_id,
-                memory_id, symbol, timeframe, setup_type, policy_hash,
+                memory_fingerprint,
+                memory_id,
+                symbol, timeframe, setup_type, policy_hash,
                 n, wins, losses,
                 win_rate, avg_r_multiple, avg_pnl_usd,
                 allow_rate, avg_size_multiplier,
                 last_ts_ms, built_ts_ms
-            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?);
+            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?);
             """,
             (
                 rid,
+                r["memory_fingerprint"],
                 r["memory_id"],
                 r["symbol"],
                 r["timeframe"],
@@ -227,11 +230,11 @@ def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--rebuild", action="store_true", help="Rebuild rollups from scratch (default).")
     ap.add_argument("--append", action="store_true", help="Reserved. Currently behaves like rebuild.")
-    args = ap.parse_args()
+    _ = ap.parse_args()
 
     stats = rebuild()
 
-    print("=== AI Memory Rollup Build v1 ===")
+    print("=== AI Memory Rollup Build v1.1 ===")
     if not stats.get("ok"):
         print("FAIL ❌", stats.get("reason"))
         return

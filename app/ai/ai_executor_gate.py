@@ -15,7 +15,7 @@ Responsibilities:
 
 Typical usage from executor_v2:
 
-    from app.ai.executor_ai_gate import ai_gate_decide, load_setup_policy
+    from app.ai.ai_executor_gate import ai_gate_decide, load_setup_policy
 
     policy = load_setup_policy()
     policy_cfg = policy.get(strategy_name, policy.get("__default__", {}))
@@ -32,53 +32,7 @@ Typical usage from executor_v2:
     )
 
     if not decision["allow"]:
-        # skip trade, maybe log decision["reason"]
         return
-
-Config
-------
-We expect setup_policy.json to look roughly like:
-
-  {
-    "__default__": {
-      "min_score": 0.0,
-      "min_score_live": 0.6,
-      "min_score_canary": 0.5,
-      "enabled_modes": ["PAPER", "LIVE_CANARY", "LIVE_FULL"]
-    },
-    "Sub1_Trend": {
-      "min_score_live": 0.65,
-      "min_score_canary": 0.55
-    },
-    ...
-  }
-
-Any missing keys fall back to __default__ values.
-
-Outputs
--------
-ai_gate_decide(...) returns a dict:
-
-  {
-    "allow": bool,
-    "reason": "ok" | "<policy_block_reason>",
-    "strategy_name": str,
-    "symbol": str,
-    "account_label": str,
-    "mode": str,
-    "trade_id": str | None,
-
-    "score": float | None,
-    "min_score": float | None,
-    "min_score_live": float | None,
-    "min_score_canary": float | None,
-
-    "policy_flags": {...},   # raw policy cfg for this strategy
-    "ts_ms": int,            # decision timestamp (ms)
-  }
-
-Every decision is appended to: state/ai_policy_log.jsonl
-You can later analyze this via a separate stats script.
 """
 
 from __future__ import annotations
@@ -138,6 +92,7 @@ def load_setup_policy() -> Dict[str, Any]:
                 "min_score_live": 0.6,
                 "min_score_canary": 0.5,
                 "enabled_modes": ["PAPER", "LIVE_CANARY", "LIVE_FULL"],
+                "missing_score_allow_modes": ["PAPER"],
             }
         }
 
@@ -155,6 +110,7 @@ def load_setup_policy() -> Dict[str, Any]:
                 "min_score_live": 0.6,
                 "min_score_canary": 0.5,
                 "enabled_modes": ["PAPER", "LIVE_CANARY", "LIVE_FULL"],
+                "missing_score_allow_modes": ["PAPER"],
             }
         }
 
@@ -228,39 +184,19 @@ def ai_gate_decide(
     trade_id: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
-    Core AI gate function.
-
-    Parameters
-    ----------
-    strategy_name : str
-        Logical strategy identifier (e.g. "Sub1_Trend").
-    symbol : str
-        Trading symbol (e.g. "BTCUSDT").
-    account_label : str
-        Account label (e.g. "main", "flashback07").
-    mode : str
-        Execution mode: PAPER / LIVE_CANARY / LIVE_FULL (or garbage).
-    features : dict
-        Feature dict at setup time (not deeply inspected here, but logged).
-    raw_score : float | None
-        Model score in [0, 1], or None if no model or prediction failed.
-    policy_cfg : dict
-        Policy config for this strategy (merged with __default__).
-    trade_id : str | None
-        Optional trade_id for traceability.
-
-    Returns
-    -------
-    dict
-        A structured decision payload with .allow and .reason fields.
+    Core AI gate function. Returns a structured decision payload.
     """
     ts_ms = int(time.time() * 1000)
     mode_norm = _normalize_mode(mode)
     symbol_norm = str(symbol or "").upper()
 
     min_score, min_score_live, min_score_canary = _extract_min_scores(policy_cfg)
+
     enabled_modes = policy_cfg.get("enabled_modes") or policy_cfg.get("modes") or ["PAPER", "LIVE_CANARY", "LIVE_FULL"]
     enabled_modes = [str(m).upper() for m in enabled_modes if isinstance(m, (str, bytes))]
+
+    missing_ok_modes = policy_cfg.get("missing_score_allow_modes", ["PAPER"])
+    missing_ok_modes = [str(m).upper() for m in missing_ok_modes if isinstance(m, (str, bytes))]
 
     score: Optional[float]
     try:
@@ -268,9 +204,6 @@ def ai_gate_decide(
     except Exception:
         score = None
 
-    # ------------------------------------------------------------------
-    # Start with optimistic allow; block as rules fail.
-    # ------------------------------------------------------------------
     allow = True
     reason = "ok"
 
@@ -280,18 +213,13 @@ def ai_gate_decide(
         reason = "mode_not_enabled"
 
     # 2) Missing score handling
-    if allow:
-        if score is None:
-            # configurable behavior via policy; default: block live, allow paper
-            missing_ok_modes = policy_cfg.get("missing_score_allow_modes", ["PAPER"])
-            missing_ok_modes = [str(m).upper() for m in missing_ok_modes if isinstance(m, (str, bytes))]
-            if mode_norm not in missing_ok_modes:
-                allow = False
-                reason = "missing_score_blocked"
+    if allow and score is None:
+        if mode_norm not in missing_ok_modes:
+            allow = False
+            reason = "missing_score_blocked"
 
     # 3) Threshold check
     if allow and score is not None:
-        # choose threshold based on mode
         effective_min: Optional[float] = min_score
         if mode_norm == "LIVE_FULL" and min_score_live is not None:
             effective_min = min_score_live
@@ -305,9 +233,9 @@ def ai_gate_decide(
     decision: Dict[str, Any] = {
         "allow": allow,
         "reason": reason,
-        "strategy_name": strategy_name,
+        "strategy_name": str(strategy_name),
         "symbol": symbol_norm,
-        "account_label": account_label,
+        "account_label": str(account_label),
         "mode": mode_norm,
         "trade_id": trade_id,
         "score": score,
@@ -316,16 +244,17 @@ def ai_gate_decide(
         "min_score_canary": min_score_canary,
         "policy_flags": {
             "enabled_modes": enabled_modes,
-            "missing_score_allow_modes": policy_cfg.get("missing_score_allow_modes", ["PAPER"]),
+            "missing_score_allow_modes": missing_ok_modes,
         },
         "ts_ms": ts_ms,
+        # keep features for audit/debug; can be pruned later if too large
+        "features": features if isinstance(features, dict) else {},
     }
 
     _append_policy_log(decision)
     return decision
 
 
-# Convenience alias for older code that might use a shorter name.
 def should_allow_trade(
     *,
     strategy_name: str,
@@ -339,8 +268,6 @@ def should_allow_trade(
 ) -> bool:
     """
     Thin wrapper that runs ai_gate_decide and returns decision["allow"].
-
-    Use ai_gate_decide if you need the full decision payload.
     """
     decision = ai_gate_decide(
         strategy_name=strategy_name,
@@ -352,4 +279,29 @@ def should_allow_trade(
         policy_cfg=policy_cfg,
         trade_id=trade_id,
     )
-    return decision["allow"]
+    return bool(decision.get("allow", False))
+# ---------------------------------------------------------------------------
+# Public policy resolver (compat shim)
+# ---------------------------------------------------------------------------
+def resolve_policy_cfg_for_strategy(policy: dict, strategy_name: str) -> dict:
+    try:
+        fn = globals().get('_resolve_policy_for_strategy')
+        if callable(fn):
+            return fn(policy, strategy_name)
+        if not isinstance(policy, dict):
+            return {}
+        default_cfg = policy.get('__default__', {})
+        strat_cfg = policy.get(strategy_name, {})
+        if not isinstance(default_cfg, dict):
+            default_cfg = {}
+        if not isinstance(strat_cfg, dict):
+            strat_cfg = {}
+        merged = dict(default_cfg)
+        merged.update(strat_cfg)
+        return merged
+    except Exception:
+        if isinstance(policy, dict) and isinstance(policy.get('__default__'), dict):
+            return dict(policy.get('__default__'))
+        return {}
+
+resolve_policy_cfg = resolve_policy_cfg_for_strategy

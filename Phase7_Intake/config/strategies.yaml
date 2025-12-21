@@ -1,0 +1,469 @@
+# config/strategies.yaml
+#
+# Flashback — Strategy Registry (v6, exit profiles + risk_pct + promotion_rules)
+#
+# This drives HOW each subaccount trades:
+#   - symbol universe
+#   - timeframes
+#   - risk per trade
+#   - AI profile
+#   - automation mode (OFF / LEARN_DRY / LIVE_CANARY / LIVE_FULL)
+#   - exit_profile for TP/SL manager (standard_5 vs standard_10, etc.)
+#   - promotion_rules for graduating strategies from LEARN_DRY → LIVE_CANARY
+#
+# IMPORTANT (validator expectations):
+#   - Must include `strategy_name` on every strategy entry.
+#   - `risk_pct` must be in (0, 5] even for OFF/manual strategies.
+#   - `exit_profile` must exist in exit_profiles.yaml (no placeholder names).
+
+version: 6
+notes: |
+  v6:
+    - Added promotion_rules per strategy so AI paper reports can decide
+      if a strategy is READY_FOR_CANARY based on numbers.
+    - Validator-aligned fields:
+        * strategy_name is required (not "name")
+        * risk_pct must be > 0
+        * exit_profile must be a real profile name
+  v5:
+    - Main manual strategy uses standard_10 exit profile (10-TP ladder).
+  v4:
+    - Added explicit risk_pct fields (mirror of risk_per_trade_pct).
+
+subaccounts:
+  # --------------------------------------------------------
+  # Sub 1 — Trend-follow (primary clean trend follower)
+  # --------------------------------------------------------
+  - sub_uid: 524630315
+    account_label: flashback01
+    strategy_name: Sub1_Trend
+    role: trend_follow
+    enabled: true
+    symbols:
+      - BTCUSDT
+      - ETHUSDT
+      - SOLUSDT
+      - XRPUSDT
+      - ADAUSDT
+      - LINKUSDT
+      - INJUSDT
+      - OPUSDT
+      - AVAXUSDT
+      - DOGEUSDT
+    timeframes:
+      - "15"
+      - "60"
+    setup_types:
+      - trend_pullback
+      - trend_breakout_retest
+      - ema_trend_follow
+    risk_per_trade_pct: 0.10
+    risk_pct: 0.10
+    max_concurrent_positions: 2
+    ai_profile: trend_v1
+    automation_mode: LEARN_DRY
+    exit_profile: standard_5
+    promotion_rules:
+      enabled: true
+      min_trades: 150
+      min_winrate: 0.52
+      min_avg_r: 0.30
+      min_expectancy_r: 0.15
+      max_drawdown_pct: 18.0
+    notes: |
+      Primary clean trend follower. Broad liquid universe.
+      Stays LEARN_DRY for now (no live orders).
+
+  # --------------------------------------------------------
+  # Sub 2 — Breakout / Momentum
+  # --------------------------------------------------------
+  - sub_uid: 524633243
+    account_label: flashback02
+    strategy_name: Sub2_Breakout
+    role: breakout_momentum
+    enabled: true
+    symbols:
+      - BTCUSDT
+      - ETHUSDT
+      - SOLUSDT
+      - XRPUSDT
+      - ADAUSDT
+      - LINKUSDT
+      - INJUSDT
+      - OPUSDT
+      - AVAXUSDT
+      - DOGEUSDT
+      - MATICUSDT
+      - NEARUSDT
+      - ARBUSDT
+      - HBARUSDT
+      - FARTCOINUSDT
+      - PUMPFUNUSDT
+    timeframes:
+      - "5"
+      - "15"
+    setup_types:
+      - breakout_high
+      - breakout_range
+      - squeeze_release
+    risk_per_trade_pct: 0.10
+    risk_pct: 0.10
+    max_concurrent_positions: 2
+    ai_profile: breakout_v1
+    automation_mode: LEARN_DRY
+    exit_profile: standard_5
+    promotion_rules:
+      enabled: true
+      min_trades: 200
+      min_winrate: 0.50
+      min_avg_r: 0.35
+      min_expectancy_r: 0.20
+      max_drawdown_pct: 20.0
+    notes: |
+      Aggressive breakout / momentum hunter.
+      TEMP: LEARN_DRY while executor is validated.
+
+  # --------------------------------------------------------
+  # Sub 3 — Intraday scalp (majors + most liquid alts)
+  # --------------------------------------------------------
+  - sub_uid: 524634622
+    account_label: flashback03
+    strategy_name: Sub3_ScalpMajors
+    role: scalp_intraday
+    enabled: true
+    symbols:
+      - BTCUSDT
+      - ETHUSDT
+      - SOLUSDT
+      - XRPUSDT
+      - ADAUSDT
+      - LINKUSDT
+      - DOGEUSDT
+    timeframes:
+      - "1"
+      - "3"
+      - "5"
+    setup_types:
+      - scalp_liquidity_sweep
+      - scalp_trend_continuation
+      - scalp_reversal_snapback
+    risk_per_trade_pct: 0.10
+    risk_pct: 0.10
+    max_concurrent_positions: 2
+    ai_profile: scalp_v1
+    automation_mode: LEARN_DRY
+    exit_profile: standard_5
+    promotion_rules:
+      enabled: true
+      min_trades: 250
+      min_winrate: 0.50
+      min_avg_r: 0.20
+      min_expectancy_r: 0.10
+      max_drawdown_pct: 22.0
+    notes: |
+      Intraday scalps on the most liquid names only.
+
+  # --------------------------------------------------------
+  # Sub 4 — Swing Reversion / Mean Reversion
+  # --------------------------------------------------------
+  - sub_uid: 524636309
+    account_label: flashback04
+    strategy_name: Sub4_SwingRevert
+    role: swing_reversion
+    enabled: true
+    symbols:
+      - BTCUSDT
+      - ETHUSDT
+      - XRPUSDT
+      - ADAUSDT
+      - LINKUSDT
+      - AVAXUSDT
+      - MATICUSDT
+    timeframes:
+      - "15"
+      - "60"
+      - "240"
+    setup_types:
+      - swing_reversion_extreme
+      - swing_reversion_channel
+    risk_per_trade_pct: 0.10
+    risk_pct: 0.10
+    max_concurrent_positions: 2
+    ai_profile: reversion_v1
+    automation_mode: LEARN_DRY
+    exit_profile: standard_5
+    promotion_rules:
+      enabled: true
+      min_trades: 120
+      min_winrate: 0.52
+      min_avg_r: 0.35
+      min_expectancy_r: 0.20
+      max_drawdown_pct: 18.0
+    notes: |
+      Fades stretched moves on liquid pairs across 1h/4h.
+      Exit profile temporarily uses standard_5 until custom profiles exist.
+
+  # --------------------------------------------------------
+  # Sub 5 — HFT / Market-Maker (flashback05)
+  # --------------------------------------------------------
+  - sub_uid: 524637467
+    account_label: flashback05
+    strategy_name: Sub5_HFT_MM
+    role: hft_market_maker
+    enabled: true
+    symbols:
+      - BTCUSDT
+      - ETHUSDT
+    timeframes:
+      - "1"
+    setup_types:
+      - mm_spread_capture
+      - mm_reversion_micro
+    risk_per_trade_pct: 0.05
+    risk_pct: 0.05
+    max_concurrent_positions: 3
+    ai_profile: hft_mm_v1
+    automation_mode: LEARN_DRY
+    exit_profile: standard_5
+    promotion_rules:
+      enabled: true
+      min_trades: 400
+      min_winrate: 0.49
+      min_avg_r: 0.12
+      min_expectancy_r: 0.05
+      max_drawdown_pct: 15.0
+    notes: |
+      Dedicated HFT / microstructure market-making subaccount.
+      Exit profile temporarily uses standard_5 until custom profiles exist.
+
+  # --------------------------------------------------------
+  # Sub 6 — Microcap / Speculative
+  # --------------------------------------------------------
+  - sub_uid: 524638768
+    account_label: flashback06
+    strategy_name: Sub6_Speculative
+    role: microcap_spec
+    enabled: true
+    symbols:
+      - FARTCOINUSDT
+      - PUMPFUNUSDT
+      - HBARUSDT
+    timeframes:
+      - "1"
+      - "5"
+    setup_types:
+      - pump_chase_momo
+      - dump_fade_reversion
+    risk_per_trade_pct: 0.10
+    risk_pct: 0.10
+    max_concurrent_positions: 1
+    ai_profile: spec_v1
+    automation_mode: LEARN_DRY
+    exit_profile: standard_5
+    promotion_rules:
+      enabled: true
+      min_trades: 200
+      min_winrate: 0.48
+      min_avg_r: 0.35
+      min_expectancy_r: 0.18
+      max_drawdown_pct: 25.0
+    notes: |
+      Chaos pen canary. Exit profile temporarily uses standard_5.
+
+  # --------------------------------------------------------
+  # Sub 7 — Canary / Experimental
+  # --------------------------------------------------------
+  - sub_uid: 524649709
+    account_label: flashback07
+    strategy_name: Sub7_Canary
+    role: canary_experimental
+    enabled: true
+    symbols:
+      - BTCUSDT
+      - ETHUSDT
+      - SOLUSDT
+      - LINKUSDT
+      - INJUSDT
+      - AVAXUSDT
+      - OPUSDT
+    timeframes:
+      - "5"
+      - "15"
+    setup_types:
+      - trend_pullback
+      - breakout_high
+      - swing_trend_continuation
+    risk_per_trade_pct: 0.10
+    risk_pct: 0.10
+    max_concurrent_positions: 1
+    ai_profile: canary_v1
+    automation_mode: LEARN_DRY
+    exit_profile: standard_5
+    promotion_rules:
+      enabled: true
+      min_trades: 150
+      min_winrate: 0.52
+      min_avg_r: 0.30
+      min_expectancy_r: 0.18
+      max_drawdown_pct: 18.0
+    notes: |
+      Experimental canary. LEARN_DRY until re-enabled for LIVE_CANARY.
+
+  # --------------------------------------------------------
+  # Sub 8 — Swing Multi-Asset
+  # --------------------------------------------------------
+  - sub_uid: 524650929
+    account_label: flashback08
+    strategy_name: Sub8_SwingMulti
+    role: swing_multi
+    enabled: true
+    symbols:
+      - BTCUSDT
+      - ETHUSDT
+      - SOLUSDT
+      - XRPUSDT
+      - ADAUSDT
+      - LINKUSDT
+      - INJUSDT
+      - OPUSDT
+      - AVAXUSDT
+      - MATICUSDT
+      - NEARUSDT
+      - ARBUSDT
+      - HBARUSDT
+    timeframes:
+      - "30"
+      - "240"
+    setup_types:
+      - swing_trend_follow
+      - swing_reversion_extreme
+    risk_per_trade_pct: 0.10
+    risk_pct: 0.10
+    max_concurrent_positions: 3
+    ai_profile: swing_v1
+    automation_mode: LEARN_DRY
+    exit_profile: standard_5
+    promotion_rules:
+      enabled: true
+      min_trades: 150
+      min_winrate: 0.50
+      min_avg_r: 0.30
+      min_expectancy_r: 0.15
+      max_drawdown_pct: 20.0
+    notes: |
+      Wide multi-asset swing universe. Exit profile temporarily uses standard_5.
+
+  # --------------------------------------------------------
+  # Sub 9 — Range / Mean-Reversion Intraday
+  # --------------------------------------------------------
+  - sub_uid: 524693375
+    account_label: flashback09
+    strategy_name: Sub9_Range
+    role: range_intraday
+    enabled: true
+    symbols:
+      - BTCUSDT
+      - ETHUSDT
+      - XRPUSDT
+      - ADAUSDT
+      - LINKUSDT
+      - DOGEUSDT
+    timeframes:
+      - "5"
+      - "15"
+    setup_types:
+      - intraday_range_fade
+      - failed_breakout_fade
+    risk_per_trade_pct: 0.10
+    risk_pct: 0.10
+    max_concurrent_positions: 2
+    ai_profile: range_v1
+    automation_mode: LEARN_DRY
+    exit_profile: standard_5
+    promotion_rules:
+      enabled: true
+      min_trades: 180
+      min_winrate: 0.50
+      min_avg_r: 0.25
+      min_expectancy_r: 0.12
+      max_drawdown_pct: 20.0
+    notes: |
+      Intraday range-fade lab. Uses standard_5 for clean comparative stats.
+
+  # --------------------------------------------------------
+  # Sub 10 — Manual / No automation
+  # --------------------------------------------------------
+  - sub_uid: 524700541
+    account_label: flashback10
+    strategy_name: Sub10_ManualOnly
+    role: manual_discretionary
+    enabled: false
+    symbols:
+      - BTCUSDT
+      - ETHUSDT
+      - SOLUSDT
+      - XRPUSDT
+      - ADAUSDT
+      - LINKUSDT
+      - INJUSDT
+      - OPUSDT
+      - AVAXUSDT
+      - DOGEUSDT
+      - MATICUSDT
+      - NEARUSDT
+      - ARBUSDT
+      - HBARUSDT
+      - FARTCOINUSDT
+      - PUMPFUNUSDT
+    timeframes:
+      - "5"
+      - "15"
+    setup_types: []
+    # Validator requires risk_pct > 0 even if OFF.
+    # Placeholder value to satisfy schema (executor must still refuse OFF).
+    risk_per_trade_pct: 0.01
+    risk_pct: 0.01
+    max_concurrent_positions: 0
+    ai_profile: manual_only
+    automation_mode: "OFF"
+    exit_profile: standard_5
+    promotion_rules:
+      enabled: false
+    notes: |
+      Reserved for full discretionary control. No auto executor should trade here.
+      Exit profile kept valid to satisfy schema.
+
+  # --------------------------------------------------------
+  # MAIN — Manual entries, auto exits (standard_10)
+  # --------------------------------------------------------
+  - sub_uid: null
+    account_label: main
+    strategy_name: main_manual
+    role: main
+    enabled: true
+    symbols:
+      - BTCUSDT
+      - ETHUSDT
+      - SOLUSDT
+      - XRPUSDT
+      - ADAUSDT
+      - LINKUSDT
+      - AVAXUSDT
+    timeframes:
+      - "5"
+      - "15"
+    setup_types: []
+    # Validator requires risk_pct > 0 even if OFF.
+    # Placeholder value to satisfy schema (executor must still refuse OFF).
+    risk_per_trade_pct: 0.01
+    risk_pct: 0.01
+    max_concurrent_positions: 1
+    ai_profile: manual_v1
+    automation_mode: "OFF"
+    exit_profile: standard_10
+    promotion_rules:
+      enabled: false
+    notes: |
+      Manual trading on MAIN. Entries are discretionary.
+      Executor/AI must not place live orders here.
+      Exit profile is standard_10 so TP/SL manager can attach a 10-TP ladder.

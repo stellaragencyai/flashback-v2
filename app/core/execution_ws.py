@@ -22,6 +22,11 @@ to be:
 
 This module intentionally does NOT manage TP/SL; that is the job of
 tp_sl_manager, which reacts to positions via position_bus.
+
+CRITICAL SAFETY RULE
+--------------------
+If EXEC_DRY_RUN=true, this module MUST NOT place live orders,
+even if called directly (bypassing routers/adapters).
 """
 
 from __future__ import annotations
@@ -42,6 +47,7 @@ from app.core.flashback_common import (
     place_market_entry,
     reduce_only_market,
     cancel_all,
+    EXEC_DRY_RUN,
 )
 
 
@@ -78,6 +84,8 @@ def _log(msg: str) -> None:
 def list_open_symbols() -> List[str]:
     """
     Return a sorted list of symbols with non-zero linear positions.
+
+    In EXEC_DRY_RUN, list_open_positions() returns [] by design.
     """
     try:
         rows = list_open_positions(category=CATEGORY, settle_coin=QUOTE)
@@ -114,25 +122,9 @@ def open_position_ws_first(
     """
     Open a position sized by % of equity (notional-based).
 
-    Args:
-        symbol              : e.g. "BTCUSDT"
-        side                : "LONG" | "SHORT"
-        risk_pct_notional   : Decimal percent of equity, e.g. Decimal("15")
-        max_spread_bps      : optional cap on bid/ask spread in basis points.
-                              If spread exceeds this, no trade is placed.
-        leverage_override   : optional leverage to set before entry
-        notify              : if True, send Telegram message
-
-    Returns a dict with:
-        {
-          "ok": bool,
-          "error": str or None,
-          "symbol": str,
-          "side": "LONG"/"SHORT",
-          "qty": str or None,
-          "px_ref": str or None,
-          "spread_bps": str or None,
-        }
+    DRY-RUN:
+      - If EXEC_DRY_RUN=true, this function returns ok=True with dry_run=True
+        and does NOT place any orders (defense-in-depth).
     """
     record_heartbeat("execution_ws")
 
@@ -140,6 +132,22 @@ def open_position_ws_first(
     side_norm = str(side or "").strip().upper()
     if side_norm not in ("LONG", "SHORT"):
         raise ValueError("side must be 'LONG' or 'SHORT'")
+
+    # HARD GATE: never place orders in dry-run, even if called directly.
+    if EXEC_DRY_RUN:
+        if notify:
+            _log(f"🧪 DRY_RUN OPEN blocked at execution layer: {sym} {side_norm} | risk={risk_pct_notional}%")
+        return {
+            "ok": True,
+            "error": None,
+            "dry_run": True,
+            "symbol": sym,
+            "side": side_norm,
+            "qty": None,
+            "px_ref": None,
+            "spread_bps": None,
+            "skipped": "EXEC_DRY_RUN",
+        }
 
     # 1) Optionally check spread from WS orderbook
     spread_val: Optional[Decimal] = None
@@ -290,17 +298,25 @@ def flatten_symbol_ws_first(
     """
     Flatten all linear positions for a given symbol via reduce-only market.
 
-    Returns:
-      {
-        "ok": bool,
-        "error": str or None,
-        "symbol": str,
-        "flattened_qty": str,
-      }
+    DRY-RUN:
+      - If EXEC_DRY_RUN=true, returns ok=True dry_run=True and does not place orders.
     """
     record_heartbeat("execution_ws")
 
     sym = _normalize_symbol(symbol)
+
+    # HARD GATE: never place orders in dry-run, even if called directly.
+    if EXEC_DRY_RUN:
+        if notify:
+            _log(f"🧪 DRY_RUN FLATTEN blocked at execution layer: {sym}")
+        return {
+            "ok": True,
+            "error": None,
+            "dry_run": True,
+            "symbol": sym,
+            "flattened_qty": "0",
+            "skipped": "EXEC_DRY_RUN",
+        }
 
     try:
         rows = list_open_positions(category=CATEGORY, settle_coin=QUOTE)
@@ -332,7 +348,7 @@ def flatten_symbol_ws_first(
         side = str(p.get("side") or "").strip()
         try:
             res = reduce_only_market(sym, side, size)
-            _ = res  # silence linters; trade result is for journal/Bybit
+            _ = res  # trade result is for journal/Bybit
             total_flattened += size
         except Exception as e:
             msg = f"{sym} reduce_only_market error: {e}"
@@ -374,7 +390,21 @@ def flatten_symbol_ws_first(
 def flatten_all_ws_first(notify: bool = True) -> Dict[str, Any]:
     """
     Flatten all linear symbols with open positions.
+
+    DRY-RUN:
+      - If EXEC_DRY_RUN=true, returns ok=True dry_run=True and does not place orders.
     """
+    # HARD GATE: never place orders in dry-run, even if called directly.
+    if EXEC_DRY_RUN:
+        if notify:
+            _log("🧪 DRY_RUN FLATTEN_ALL blocked at execution layer")
+        return {
+            "ok": True,
+            "dry_run": True,
+            "results": {},
+            "skipped": "EXEC_DRY_RUN",
+        }
+
     syms = list_open_symbols()
     results: Dict[str, Any] = {}
 

@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+﻿#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
 """
@@ -27,6 +27,16 @@ Optional strictness:
 - AI_DECISIONS_REJECT_MISSING_CONTEXT=true/false (default false)
   If true, decisions that still lack account_label/symbol after inference are
   written to state/ai_decisions.rejected.jsonl (append-only) and NOT to canonical.
+
+Determinism upgrades (duplicate suppression across formats):
+- Canonical dedupe key is stage-aware:
+    (trade_id, stage, account_label, symbol, timeframe)
+
+IMPORTANT FIX (2025-12-19 -> hardened further 2025-12-19b):
+- Pilot rows MUST be tagged with event_type="pilot_decision".
+- Pilot dedupe is ONE per (trade_id, account_label, symbol, timeframe) regardless of reason/memory_fp.
+- ai_decision rows missing BOTH decision_code and decision are rejected/dropped.
+- ts_ms is stamped if missing OR None OR invalid.
 """
 
 from __future__ import annotations
@@ -150,28 +160,30 @@ def _safe_upper(x: Any) -> str:
     return _safe_str(x).upper()
 
 
+def _safe_int(x: Any, default: int = 0) -> int:
+    try:
+        if x is None:
+            return default
+        return int(x)
+    except Exception:
+        return default
+
+
 def _infer_account_label(d: Dict[str, Any]) -> str:
-    # canonical
     acct = _safe_str(d.get("account_label"))
     if acct:
         return acct
-
-    # alt fields seen in some modules
     acct = _safe_str(d.get("label"))
     if acct:
         return acct
-
     acct = _safe_str(d.get("account"))
     if acct:
         return acct
-
-    # sometimes nested
     extra = d.get("extra")
     if isinstance(extra, dict):
         acct = _safe_str(extra.get("account_label"))
         if acct:
             return acct
-
     return ""
 
 
@@ -179,12 +191,9 @@ def _infer_symbol(d: Dict[str, Any]) -> str:
     sym = _safe_upper(d.get("symbol"))
     if sym:
         return sym
-
     sym = _safe_upper(d.get("sym"))
     if sym:
         return sym
-
-    # sometimes nested
     extra = d.get("extra")
     if isinstance(extra, dict):
         sym = _safe_upper(extra.get("symbol"))
@@ -195,7 +204,6 @@ def _infer_symbol(d: Dict[str, Any]) -> str:
             sym = _safe_upper(legacy.get("symbol"))
             if sym:
                 return sym
-
     return ""
 
 
@@ -203,34 +211,24 @@ def _infer_timeframe(d: Dict[str, Any]) -> str:
     tf = _safe_str(d.get("timeframe"))
     if tf:
         return tf
-
-    # some schemas use "tf"
     tf = _safe_str(d.get("tf"))
     if tf:
         return tf
-
-    # sometimes nested setup/policy/extra
     extra = d.get("extra")
     if isinstance(extra, dict):
         tf = _safe_str(extra.get("timeframe"))
         if tf:
             return tf
-
     return ""
 
 
 def _normalize_decision_context(payload: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Ensure account_label/symbol/timeframe are present when possible.
-    Does not throw. Returns a new dict.
-    """
     out = dict(payload)
 
     acct = _infer_account_label(out)
     sym = _infer_symbol(out)
     tf = _infer_timeframe(out)
 
-    # apply if missing
     if not _safe_str(out.get("account_label")) and acct:
         out["account_label"] = acct
     if not _safe_str(out.get("symbol")) and sym:
@@ -238,28 +236,97 @@ def _normalize_decision_context(payload: Dict[str, Any]) -> Dict[str, Any]:
     if not _safe_str(out.get("timeframe")) and tf:
         out["timeframe"] = tf
 
-    # normalize symbol uppercase if present
     if _safe_str(out.get("symbol")):
         out["symbol"] = _safe_upper(out.get("symbol"))
 
     return out
 
 
-def _dedupe_key(d: Dict[str, Any]) -> str:
-    """
-    Stable-ish key across both formats you currently have:
-      - Pilot decision rows: schema_version=1 + 'decision'
-      - Executor audit rows: event_type='ai_decision' + decision_code/allow/size_multiplier
+def _infer_stage(d: Dict[str, Any]) -> str:
+    try:
+        extra = d.get("extra")
+        if isinstance(extra, dict):
+            st = _safe_str(extra.get("stage"))
+            if st:
+                return st
+        meta = d.get("meta")
+        if isinstance(meta, dict):
+            st = _safe_str(meta.get("stage"))
+            if st:
+                return st
+        if _safe_str(d.get("event_type")) == "ai_decision":
+            return "pre_entry"
+        gates = d.get("gates")
+        if isinstance(gates, dict) and _safe_str(gates.get("enforced")):
+            return "post_enforce"
+        return "unknown"
+    except Exception:
+        return "unknown"
 
-    We DO NOT include timestamp in the key, because duplicates often differ only by ts.
+
+def _is_pilot_row(d: Dict[str, Any]) -> bool:
+    try:
+        # canonical pilot shape: schema_version=1 and decision present
+        return d.get("schema_version") == 1 and ("decision" in d)
+    except Exception:
+        return False
+
+
+def _is_legacy_pilot_spam(d: Dict[str, Any]) -> bool:
     """
+    Legacy spam definition:
+    - schema_version=1
+    - has decision
+    - has NO event_type
+    - has NO meta.source
+    These are the rows that historically flooded the store.
+    """
+    try:
+        if not _is_pilot_row(d):
+            return False
+        if _safe_str(d.get("event_type")):
+            return False
+        meta = d.get("meta")
+        if isinstance(meta, dict) and _safe_str(meta.get("source")):
+            return False
+        return True
+    except Exception:
+        return False
+
+
+def _pilot_dedupe_key(d: Dict[str, Any]) -> str:
+    """
+    HARD pilot dedupe: ONE row per (trade_id, account_label, symbol, timeframe).
+    Ignore decision/reason/memory_fp because those are exactly what caused drift.
+    """
+    tid = _safe_str(d.get("trade_id"))
+    acct = _safe_str(d.get("account_label"))
+    sym = _safe_upper(d.get("symbol"))
+    tf = _safe_str(d.get("timeframe"))
+    return f"PILOT_CANON|{tid}|{acct}|{sym}|{tf}"
+
+
+def _canonical_dedupe_key(d: Dict[str, Any]) -> str:
+    # For pilot rows, use the hard key.
+    if _is_pilot_row(d) or _safe_str(d.get("event_type")) == "pilot_decision":
+        return _pilot_dedupe_key(d)
+
+    trade_id = _safe_str(d.get("trade_id"))
+    acct = _safe_str(d.get("account_label"))
+    sym = _safe_upper(d.get("symbol"))
+    tf = _safe_str(d.get("timeframe"))
+    stage = _infer_stage(d)
+    return f"CANON|{trade_id}|{stage}|{acct}|{sym}|{tf}"
+
+
+def _dedupe_key(d: Dict[str, Any]) -> str:
     trade_id = _safe_str(d.get("trade_id"))
     acct = _safe_str(d.get("account_label"))
     sym = _safe_upper(d.get("symbol"))
     tf = _safe_str(d.get("timeframe"))
 
-    # Pilot-style
-    if d.get("schema_version") == 1 and ("decision" in d):
+    # pilot rows: keep legacy key too, but canonical is PILOT_CANON above.
+    if _is_pilot_row(d) or _safe_str(d.get("event_type")) == "pilot_decision":
         decision = _safe_str(d.get("decision"))
         gates = d.get("gates") or {}
         reason = ""
@@ -267,25 +334,18 @@ def _dedupe_key(d: Dict[str, Any]) -> str:
             reason = _safe_str(gates.get("reason"))
         return f"PILOT|{trade_id}|{acct}|{sym}|{tf}|{decision}|{reason}"
 
-    # Executor-audit style
     if _safe_str(d.get("event_type")) == "ai_decision":
         decision_code = _safe_str(d.get("decision_code") or d.get("decision") or "")
         allow = _safe_str(d.get("allow") if "allow" in d else "")
         sm = _safe_str(d.get("size_multiplier") if "size_multiplier" in d else "")
         return f"EXEC|{trade_id}|{acct}|{sym}|{tf}|{decision_code}|{allow}|{sm}"
 
-    # Unknown writer style: still dedupe by core identity + full payload hash
     core = f"UNK|{trade_id}|{acct}|{sym}|{tf}"
     h = hashlib.md5(orjson.dumps(d, option=orjson.OPT_SORT_KEYS, default=str)).hexdigest()
     return core + "|" + h
 
 
 def _tail_recent_keys(path: Path, tail_lines: int) -> Tuple[set, int]:
-    """
-    Read last N JSONL objects and return:
-      - set of dedupe keys
-      - count of bad JSON lines encountered in tail
-    """
     keys = set()
     bad = 0
     if tail_lines <= 0 or not path.exists():
@@ -303,6 +363,7 @@ def _tail_recent_keys(path: Path, tail_lines: int) -> Tuple[set, int]:
             try:
                 d = orjson.loads(s)
                 if isinstance(d, dict):
+                    keys.add(_canonical_dedupe_key(d))
                     keys.add(_dedupe_key(d))
             except Exception:
                 bad += 1
@@ -313,9 +374,6 @@ def _tail_recent_keys(path: Path, tail_lines: int) -> Tuple[set, int]:
 
 
 def _append_bytes_atomic(path: Path, line_bytes: bytes) -> None:
-    """
-    Append bytes in ONE write call. Best-effort atomic append.
-    """
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
         with path.open("ab") as f:
@@ -325,10 +383,6 @@ def _append_bytes_atomic(path: Path, line_bytes: bytes) -> None:
 
 
 class _FileLock:
-    """
-    Tiny cross-process lock via a lock file.
-    Uses msvcrt on Windows; falls back to no-op elsewhere.
-    """
     def __init__(self, lock_path: Path, timeout_sec: float = 2.5) -> None:
         self.lock_path = lock_path
         self.timeout_sec = timeout_sec
@@ -339,7 +393,7 @@ class _FileLock:
             self.lock_path.parent.mkdir(parents=True, exist_ok=True)
             self._fh = open(self.lock_path, "a+b")
             try:
-                import msvcrt  # Windows only
+                import msvcrt
                 start = time.time()
                 while True:
                     try:
@@ -380,10 +434,6 @@ class _FileLock:
 # decision existence + coverage guard
 # -------------------------
 def decision_exists(*, trade_id: str, account_label: str = "", symbol: str = "", tail_lines: Optional[int] = None) -> bool:
-    """
-    Best-effort existence check using a tail scan (fast, no full-file read).
-    If account_label/symbol provided, it checks those too.
-    """
     try:
         tid = _safe_str(trade_id)
         if not tid:
@@ -417,13 +467,10 @@ def decision_exists(*, trade_id: str, account_label: str = "", symbol: str = "",
                 continue
             if _safe_str(d.get("trade_id")) != tid:
                 continue
-
-            # if filters provided, enforce them
             if acct and _safe_str(d.get("account_label")) != acct:
                 continue
             if sym and _safe_upper(d.get("symbol")) != sym:
                 continue
-
             return True
 
         return False
@@ -441,12 +488,8 @@ def ensure_decision_exists(
     mode: str = "COVERAGE",
     allow: bool = False,
     size_multiplier: float = 1.0,
+    stage: str = "coverage_guard",
 ) -> None:
-    """
-    Coverage guard:
-    - If a decision for (trade_id, account_label, symbol) does not exist, append one.
-    - Default is BLOCK (allow=False). Safer than silently letting trades/outcomes float.
-    """
     try:
         tid = _safe_str(trade_id)
         acct = _safe_str(account_label)
@@ -454,7 +497,6 @@ def ensure_decision_exists(
         tf = _safe_str(timeframe)
 
         if not tid or not acct or not sym:
-            # Can't meaningfully cover. Do nothing. Caller bug.
             return
 
         if decision_exists(trade_id=tid, account_label=acct, symbol=sym):
@@ -462,10 +504,10 @@ def ensure_decision_exists(
 
         payload: Dict[str, Any] = {
             "schema_version": 1,
-            "ts": _now_ms(),
+            "ts_ms": _now_ms(),
             "trade_id": tid,
             "decision": "ALLOW_COVERAGE" if allow else "BLOCKED_BY_GATES",
-            "tier_used": "NONE" if not allow else "COVERAGE",
+            "tier_used": "COVERAGE" if allow else "NONE",
             "memory": None,
             "gates": {"reason": reason},
             "proposed_action": None,
@@ -475,9 +517,11 @@ def ensure_decision_exists(
             "mode": mode,
             "account_label": acct,
             "symbol": sym,
+            "timeframe": tf or "",
+            "meta": {"source": "coverage_guard", "stage": stage},
+            "event_type": "pilot_decision",
+            "extra": {"stage": stage},
         }
-        if tf:
-            payload["timeframe"] = tf
 
         append_decision(payload)
     except Exception:
@@ -488,12 +532,6 @@ def ensure_decision_exists(
 # main writer
 # -------------------------
 def append_decision(decision: Dict[str, Any]) -> None:
-    """
-    Append one decision as JSONL. Never throws.
-    - Rotates on cap.
-    - Locks + tail-dedupes to prevent duplicate spam and corruption.
-    - Normalizes context fields to reduce ambiguous joins.
-    """
     try:
         path = _path()
 
@@ -504,15 +542,120 @@ def append_decision(decision: Dict[str, Any]) -> None:
         lock_timeout = _env_float("AI_DECISIONS_LOCK_TIMEOUT_SEC", "2.5")
 
         reject_missing_context = _env_bool("AI_DECISIONS_REJECT_MISSING_CONTEXT", "false")
+        allow_legacy_pilot = _env_bool("AI_DECISIONS_ALLOW_LEGACY_PILOT", "false")
         rejected_path = _rejected_path()
 
         payload = _normalize_decision_context(dict(decision))
+        # ------------------------------------------------------------------
+        # ✅ Canonical Decision Store Contract (Phase 4 determinism)
+        # ------------------------------------------------------------------
+        # Goal: one stable shape per (trade_id, account_label, stage, event_type)
+        # - pilot_decision: schema_version=1
+        # - ai_decision:    schema_version=2
+        # Drop placeholder/junk rows before they hit the store.
 
-        # Ensure a timestamp exists (useful for audit)
-        if "ts_ms" not in payload and "ts" not in payload:
+        # Normalize / infer event_type if missing
+        et = _safe_str(payload.get("event_type"))
+        if not et:
+            if _safe_str(payload.get("decision_code")) or _safe_str(payload.get("decision")):
+                # Prefer ai_decision for decision_code-bearing rows; pilot rows are schema_version==1 with "decision"
+                et = "ai_decision"
+            payload["event_type"] = et
+
+        # Ensure schema_version exists and is stable
+        sv_raw = payload.get("schema_version", None)
+        sv = _safe_int(sv_raw, default=0)
+        et = _safe_str(payload.get("event_type"))
+
+        if sv <= 0:
+            if et == "pilot_decision":
+                payload["schema_version"] = 1
+            elif et == "ai_decision":
+                payload["schema_version"] = 2
+            else:
+                # default to v2 unless explicitly pilot-tagged
+                payload["schema_version"] = 2
+
+        # Normalize decision_code from decision/payload
+        dc = _safe_str(payload.get("decision_code"))
+        d = _safe_str(payload.get("decision"))
+        pl = payload.get("payload") if isinstance(payload.get("payload"), dict) else {}
+        if not dc and isinstance(pl, dict):
+            dc = _safe_str(pl.get("decision_code"))
+        if not d and isinstance(pl, dict):
+            d = _safe_str(pl.get("decision"))
+
+        # If decision_code missing but decision present, copy it
+        if not dc and d:
+            payload["decision_code"] = d
+            dc = d
+
+        # Drop junk placeholders early
+        if _safe_str(dc).upper() in ("NO_DECISION",):
+            return
+
+        # Force stage tag for stable dedupe behavior
+        try:
+            payload.setdefault("extra", {})
+            if isinstance(payload["extra"], dict):
+                stage = _safe_str(payload["extra"].get("stage"))
+                if not stage:
+                    # default stage by event type
+                    payload["extra"]["stage"] = "pilot" if _safe_str(payload.get("event_type")) == "pilot_decision" else "enforced"
+        except Exception:
+            pass
+
+
+        # --- pilot tagging: normalize legacy pilot input rows ---
+        try:
+            if payload.get("schema_version") == 1 and ("decision" in payload) and (not _safe_str(payload.get("event_type"))):
+                payload["event_type"] = "pilot_decision"
+        except Exception:
+            pass
+
+        # --- ts_ms stamping: missing OR None OR invalid ---
+        try:
+            ts_ms_raw = payload.get("ts_ms", None)
+            ts_raw = payload.get("ts", None)
+            ts_ms_i = _safe_int(ts_ms_raw, default=0)
+            ts_i = _safe_int(ts_raw, default=0)
+
+            if ts_ms_i <= 0 and ts_i <= 0:
+                payload["ts_ms"] = _now_ms()
+            elif ts_ms_i <= 0 and ts_i > 0:
+                payload["ts_ms"] = ts_i
+            elif ts_ms_i > 0:
+                payload["ts_ms"] = ts_ms_i
+        except Exception:
             payload["ts_ms"] = _now_ms()
 
-        # If still missing context, optionally reject into a separate file
+        # Ensure pilot rows are always tagged
+        if (_is_pilot_row(payload) or _safe_str(payload.get("event_type")) == "pilot_decision") and _safe_str(payload.get("event_type")) != "pilot_decision":
+            payload["event_type"] = "pilot_decision"
+
+        # Drop legacy spam pilot rows unless explicitly allowed
+        if _is_legacy_pilot_spam(payload) and not allow_legacy_pilot:
+            return
+
+        # Reject/drop junk ai_decision rows missing both decision_code and decision
+        et = _safe_str(payload.get("event_type"))
+        if et == "ai_decision":
+            dc = _safe_str(payload.get("decision_code"))
+            d = _safe_str(payload.get("decision"))
+            if not dc and not d:
+                # Route to rejected if strict, otherwise drop silently.
+                try:
+                    payload.setdefault("extra", {})
+                    if isinstance(payload["extra"], dict):
+                        payload["extra"]["reject_reason"] = "ai_decision_missing_decision_code_and_decision"
+                    line_rej = orjson.dumps(payload, option=orjson.OPT_SORT_KEYS, default=str) + b"\n"
+                    _append_bytes_atomic(rejected_path, line_rej)
+                except Exception:
+                    pass
+                return
+            if not dc and d:
+                payload["decision_code"] = d
+
         acct = _safe_str(payload.get("account_label"))
         sym = _safe_upper(payload.get("symbol"))
         if reject_missing_context and (not acct or not sym):
@@ -527,12 +670,13 @@ def append_decision(decision: Dict[str, Any]) -> None:
             return
 
         line = orjson.dumps(payload, option=orjson.OPT_SORT_KEYS, default=str) + b"\n"
-        key = _dedupe_key(payload)
+
+        canon_key = _canonical_dedupe_key(payload)
+        legacy_key = _dedupe_key(payload)
 
         lockp = _lock_path(path)
 
         with _FileLock(lockp, timeout_sec=lock_timeout):
-            # Rotate if over cap
             try:
                 if path.exists():
                     size_mb = path.stat().st_size / (1024 * 1024)
@@ -541,17 +685,15 @@ def append_decision(decision: Dict[str, Any]) -> None:
             except Exception:
                 pass
 
-            # Dedupe against recent tail
             try:
                 recent_keys, _bad_tail = _tail_recent_keys(path, tail_lines=tail)
-                if key in recent_keys:
+                if canon_key in recent_keys or legacy_key in recent_keys:
                     return
             except Exception:
                 pass
 
             _append_bytes_atomic(path, line)
 
-            # warn only (no logging dependency here)
             try:
                 if path.exists():
                     size_mb = path.stat().st_size / (1024 * 1024)
