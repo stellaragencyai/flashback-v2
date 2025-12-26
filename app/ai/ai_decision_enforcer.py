@@ -9,6 +9,73 @@ import time
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
+try:
+    from app.core.spine_api import (
+        AI_DECISIONS_PATH,
+        read_jsonl_tail,
+        safe_str,
+        safe_upper,
+        normalize_timeframe,
+    )
+except Exception:  # pragma: no cover
+    AI_DECISIONS_PATH = AI_DECISIONS_PATH
+
+def _tail_recent_rows_fast(path: Path, tail_bytes: int, max_lines: int = 2000) -> Tuple[List[Dict[str, Any]], int]:
+    """Prefer centralized tail reader if available."""
+    try:
+        if callable(read_jsonl_tail):  # type: ignore[arg-type]
+            return read_jsonl_tail(path, tail_bytes=tail_bytes, max_lines=max_lines)  # type: ignore[misc]
+    except Exception:
+        pass
+
+    # Fallback: local best-effort
+    rows: List[Dict[str, Any]] = []
+    bad = 0
+    try:
+        if not path.exists():
+            return [], 0
+        size = path.stat().st_size
+        start = max(0, size - int(max(1024, tail_bytes)))
+        with path.open("rb") as f:
+            f.seek(start)
+            blob = f.read()
+        if start > 0:
+            nl = blob.find(b"\n")
+            if nl >= 0:
+                blob = blob[nl + 1 :]
+        for raw in blob.splitlines()[-max_lines:]:
+            r = raw.strip()
+            if not r:
+                continue
+            try:
+                rows.append(json.loads(r.decode("utf-8", errors="ignore")))
+            except Exception:
+                bad += 1
+        return rows, bad
+    except Exception:
+        return [], bad
+
+read_jsonl_tail = None  # type: ignore
+def safe_str(x: Any) -> str:  # type: ignore
+    try:
+        return ('' if x is None else str(x)).strip()
+    except Exception:
+        return ''
+def safe_upper(x: Any) -> str:  # type: ignore
+    return safe_str(x).upper()
+def normalize_timeframe(tf: Any) -> str:  # type: ignore
+    s = safe_str(tf).lower()
+    if not s:
+        return ''
+    if s.endswith(('m','h','d','w')):
+        return s
+    try:
+        n = int(float(s))
+        return f"{n}m" if n > 0 else ''
+    except Exception:
+        return ''
+
+
 DECISIONS_PATH = Path("state/ai_decisions.jsonl")
 
 # Coverage modes:

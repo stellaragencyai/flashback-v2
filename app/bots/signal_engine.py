@@ -48,7 +48,7 @@ import os
 import time
 import json as _jsonlib
 from pathlib import Path
-from typing import Dict, List, Tuple, Any, Optional
+from typing import Dict, List, Tuple, Any, Optional, Iterable
 
 # ---------- HTTP client ----------
 
@@ -70,9 +70,9 @@ from dotenv import load_dotenv
 # Strategy Setup Logic Dispatch
 # -------------------------------
 
-from typing import Callable, List
-
+from typing import Callable
 from statistics import mean, stdev
+
 
 def compute_regime_indicators(candles: List[Dict[str, Any]]) -> dict:
     """
@@ -82,21 +82,19 @@ def compute_regime_indicators(candles: List[Dict[str, Any]]) -> dict:
       - Volume z-score (relative volume)
     """
 
-    # Helper for ATR
     trs = []
     closes = [c["close"] for c in candles]
     highs = [c["high"] for c in candles]
-    lows  = [c["low"] for c in candles]
+    lows = [c["low"] for c in candles]
 
     for i in range(1, len(candles)):
         tr = max(
             highs[i] - lows[i],
-            abs(highs[i] - closes[i-1]),
-            abs(lows[i] - closes[i-1]),
+            abs(highs[i] - closes[i - 1]),
+            abs(lows[i] - closes[i - 1]),
         )
         trs.append(tr)
 
-    # ATR % = last ATR / last close * 100
     if trs:
         atr = mean(trs[-14:])  # approx 14-period ATR
     else:
@@ -105,7 +103,6 @@ def compute_regime_indicators(candles: List[Dict[str, Any]]) -> dict:
     last_close = closes[-1]
     atr_pct = (atr / last_close * 100) if last_close else 0.0
 
-    # Rough volume z-score (over last 50)
     vols = [c["volume"] for c in candles]
     if len(vols) >= 10:
         mu = mean(vols)
@@ -114,9 +111,8 @@ def compute_regime_indicators(candles: List[Dict[str, Any]]) -> dict:
     else:
         vol_z = 0.0
 
-    # Rough ADX proxy: absolute slope of close over last N
     if len(closes) >= 2:
-        diffs = [abs(closes[i] - closes[i-1]) for i in range(1, len(closes))]
+        diffs = [abs(closes[i] - closes[i - 1]) for i in range(1, len(closes))]
         adx = mean(diffs[-14:]) / last_close * 100 if last_close else 0.0
     else:
         adx = 0.0
@@ -127,26 +123,84 @@ def compute_regime_indicators(candles: List[Dict[str, Any]]) -> dict:
         "vol_z": vol_z,
     }
 
-def passes_regime_filters(strategy_raw: dict, regime_ind: dict) -> bool:
+
+def _get_strat_attr(obj, key: str, default=None):
+    """
+    Robust attribute extractor for strategy config.
+    Supports:
+      - dict objects
+      - pydantic/dataclass-style objects via getattr
+      - Strategy objects that store the real payload in obj.raw (dict)
+      - model_dump()/dict() fallbacks
+    """
+    # REPLACED_GET_STRAT_ATTR_V2
+    if obj is None:
+        return default
+
+    # 1) dict
+    if isinstance(obj, dict):
+        v = obj.get(key, default)
+        return default if v is None else v
+
+    # 2) direct attribute
+    try:
+        if hasattr(obj, key):
+            v = getattr(obj, key)
+            if v is not None:
+                return v
+    except Exception:
+        pass
+
+    # 3) unwrap obj.raw dict (your Strategy case)
+    try:
+        raw = getattr(obj, "raw", None)
+        if isinstance(raw, dict):
+            v = raw.get(key, None)
+            if v is not None:
+                return v
+    except Exception:
+        pass
+
+    # 4) model_dump()/dict() fallback
+    try:
+        if hasattr(obj, "model_dump"):
+            d = obj.model_dump()
+            if isinstance(d, dict):
+                v = d.get(key, None)
+                if v is not None:
+                    return v
+        if hasattr(obj, "dict"):
+            d = obj.dict()
+            if isinstance(d, dict):
+                v = d.get(key, None)
+                if v is not None:
+                    return v
+    except Exception:
+        pass
+
+    return default
+
+
+def passes_regime_filters(strategy_raw: Any, regime_ind: dict) -> bool:
     """
     Checks the regime_ind values against the strategy's regime filters
-    if they are defined in the strategy raw dict from YAML.
+    if they are defined in the strategy raw (dict OR object).
     """
-    # Try reading the regime block from the raw strategy config
-    regime_cfg = strategy_raw.get("regime") or {}
 
-    # Default permissive if no regime specified
-    min_adx = regime_cfg.get("min_adx", 0.0)
-    max_atr = regime_cfg.get("max_atr_pct", float("inf"))
-    min_vol_z = regime_cfg.get("min_vol_z", -float("inf"))
-    max_vol_z = regime_cfg.get("max_vol_z", float("inf"))
+    regime_cfg = _get_strat_attr(strategy_raw, "regime", None) or {}
+    if not isinstance(regime_cfg, dict):
+        # if someone made it an object, we ignore rather than crash
+        regime_cfg = {}
 
-    # Extract computed indicators
-    adx_val = regime_ind.get("adx", 0.0)
-    atr_val = regime_ind.get("atr_pct", 0.0)
-    vol_val = regime_ind.get("vol_z", 0.0)
+    min_adx = float(regime_cfg.get("min_adx", 0.0) or 0.0)
+    max_atr = float(regime_cfg.get("max_atr_pct", float("inf")) or float("inf"))
+    min_vol_z = float(regime_cfg.get("min_vol_z", -float("inf")) or -float("inf"))
+    max_vol_z = float(regime_cfg.get("max_vol_z", float("inf")) or float("inf"))
 
-    # Check all conditions
+    adx_val = float(regime_ind.get("adx", 0.0) or 0.0)
+    atr_val = float(regime_ind.get("atr_pct", 0.0) or 0.0)
+    vol_val = float(regime_ind.get("vol_z", 0.0) or 0.0)
+
     if adx_val < min_adx:
         return False
     if atr_val > max_atr:
@@ -161,13 +215,7 @@ def passes_regime_filters(strategy_raw: dict, regime_ind: dict) -> bool:
 
 # Each function returns (side: "LONG"/"SHORT"/None, reason: str)
 
-# Simple helpers for common patterns
 def signal_ma_trend(candles: List[dict]) -> Tuple[Optional[str], str]:
-    """
-    Simple trend-follow logic:
-      - LONG if price closes above recent MA
-      - SHORT if price closes below recent MA
-    """
     closes = [c["close"] for c in candles]
     ma = sum(closes[-8:]) / min(len(closes[-8:]), 8)
     last = candles[-1]["close"]
@@ -180,68 +228,52 @@ def signal_ma_trend(candles: List[dict]) -> Tuple[Optional[str], str]:
 
 
 def signal_breakout(candles: List[dict]) -> Tuple[Optional[str], str]:
-    """
-    Simple breakout logic:
-      - LONG if latest close is higher than last X highs
-      - SHORT if lower than last X lows
-    """
     highs = [c["high"] for c in candles[:-1]]
-    lows  = [c["low"]  for c in candles[:-1]]
+    lows = [c["low"] for c in candles[:-1]]
     last_close = candles[-1]["close"]
-    if last_close > max(highs):
+    if highs and last_close > max(highs):
         return "LONG", "breakout_high"
-    if last_close < min(lows):
+    if lows and last_close < min(lows):
         return "SHORT", "breakout_low"
     return None, "breakout_none"
 
 
-# Dispatch mapping
 SETUP_LOGIC: Dict[str, Callable[[List[dict]], Tuple[Optional[str], str]]] = {
-    # Trend setups
     "trend_pullback": signal_ma_trend,
     "trend_breakout_retest": signal_breakout,
     "ema_trend_follow": signal_ma_trend,
 
-    # Breakout setups
     "breakout_high": signal_breakout,
     "breakout_range": signal_breakout,
     "squeeze_release": signal_breakout,
 
-    # Scalp setups
     "scalp_liquidity_sweep": signal_ma_trend,
     "scalp_trend_continuation": signal_ma_trend,
     "scalp_reversal_snapback": signal_breakout,
 
-    # Swing reversion
     "swing_reversion_extreme": signal_breakout,
     "swing_reversion_channel": signal_breakout,
 
-    # HFT / micro
     "mm_spread_capture": signal_ma_trend,
     "mm_reversion_micro": signal_ma_trend,
 
-    # Microcap speculative
     "pump_chase_momo": signal_ma_trend,
     "dump_fade_reversion": signal_ma_trend,
 
-    # Range intraday
     "intraday_range_fade": signal_breakout,
     "failed_breakout_fade": signal_breakout,
 }
 
-
 # ---------- Telegram notifier ----------
-
 from app.core.notifier_bot import get_notifier
 
 # ---------- AI logging (optional) ----------
-
 try:
     from app.core.ai_hooks import log_signal_from_engine as _real_log_signal_from_engine  # type: ignore
     _HAS_AI_HOOKS = True
 except Exception:
     _HAS_AI_HOOKS = False
-    # Stub if ai_hooks / ai_store not wired yet
+
     def _real_log_signal_from_engine(
         *,
         symbol: str,
@@ -262,11 +294,9 @@ except Exception:
         )
         return None
 
-# Unified alias
 log_signal_from_engine = _real_log_signal_from_engine
 
 # ---------- Strategy registry ----------
-
 try:
     from app.core import strategies as stratreg
     _HAS_STRATEGY_REGISTRY = True
@@ -275,13 +305,11 @@ except Exception:
     _HAS_STRATEGY_REGISTRY = False
 
 # ---------- Paths & env ----------
-
 THIS_FILE = Path(__file__).resolve()
 BOTS_DIR = THIS_FILE.parent
 APP_DIR = BOTS_DIR.parent
 ROOT_DIR = APP_DIR.parent
 
-# Force project root
 os.chdir(ROOT_DIR)
 
 ENV_PATH = ROOT_DIR / ".env"
@@ -304,6 +332,8 @@ def _parse_bool(val: Optional[str], default: bool) -> bool:
 SIG_ENABLED = _parse_bool(os.getenv("SIG_ENABLED"), True)
 SIG_DRY_RUN = _parse_bool(os.getenv("SIG_DRY_RUN"), True)
 SIG_USE_STRATEGIES = _parse_bool(os.getenv("SIG_USE_STRATEGIES"), True)
+SIG_ALLOW_FALLBACK = _parse_bool(os.getenv("SIG_ALLOW_FALLBACK"), False)
+SIG_FALLBACK_FANOUT = _parse_bool(os.getenv("SIG_FALLBACK_FANOUT"), False)
 
 _raw_symbols = os.getenv("SIG_SYMBOLS", "BTCUSDT,ETHUSDT")
 SIG_SYMBOLS: List[str] = [s.strip().upper() for s in _raw_symbols.split(",") if s.strip()]
@@ -314,15 +344,12 @@ SIG_TIMEFRAMES: List[str] = [tf.strip() for tf in _raw_tfs.split(",") if tf.stri
 SIG_POLL_SEC = int(os.getenv("SIG_POLL_SEC", "15"))
 SIG_HEARTBEAT_SEC = int(os.getenv("SIG_HEARTBEAT_SEC", "300"))
 
-# Simple MA lookback
 MA_LOOKBACK = 8
 
-# Where we write executor-friendly signals
 SIGNALS_DIR = ROOT_DIR / "signals"
 SIGNALS_DIR.mkdir(parents=True, exist_ok=True)
 SIGNALS_PATH = SIGNALS_DIR / "observed.jsonl"
 
-# Telegram main notifier
 tg = get_notifier("main")
 
 
@@ -340,19 +367,7 @@ def tg_error(msg: str) -> None:
         print(f"[signal_engine][TG error fallback] {msg}")
 
 
-# ---------- Bybit Kline Fetcher ----------
-
-def fetch_recent_klines(
-    symbol: str,
-    interval: str,
-    limit: int = 20,
-) -> List[Dict[str, Any]]:
-    """
-    Fetch recent kline data from Bybit v5 public endpoint.
-
-    Returns a list of dicts, newest LAST, with fields:
-        ts_ms, open, high, low, close, volume
-    """
+def fetch_recent_klines(symbol: str, interval: str, limit: int = 20) -> List[Dict[str, Any]]:
     url = f"{BYBIT_BASE}/v5/market/kline"
     params = {
         "category": "linear",
@@ -362,11 +377,10 @@ def fetch_recent_klines(
     }
 
     if _HAS_REQUESTS:
-        resp = requests.get(url, params=params, timeout=10)
+        resp = requests.get(url, params=params, headers={'User-Agent':'Mozilla/5.0'}, timeout=10)
         resp.raise_for_status()
         data = resp.json()
     else:
-        # stdlib fallback
         query = _urllib_parse.urlencode(params)  # type: ignore[name-defined]
         full_url = f"{url}?{query}"
         with _urllib_request.urlopen(full_url, timeout=10) as fh:  # type: ignore[name-defined]
@@ -382,9 +396,13 @@ def fetch_recent_klines(
 
     raw_list = data.get("result", {}).get("list", []) or []
 
+    if not raw_list:
+        # Empty list usually means symbol/category mismatch or delisted instrument
+        raise RuntimeError(
+            f"Empty kline list for symbol={symbol} interval={interval} category={params.get('category')} retMsg={data.get('retMsg')}"
+        )
+
     klines: List[Dict[str, Any]] = []
-    # Bybit returns list of lists; we map them to dicts.
-    # Format: [startTime, open, high, low, close, volume, turnover]
     for row in raw_list:
         ts_ms = int(row[0])
         o = float(row[1])
@@ -392,31 +410,13 @@ def fetch_recent_klines(
         low = float(row[3])
         c = float(row[4])
         v = float(row[5])
-        klines.append(
-            {
-                "ts_ms": ts_ms,
-                "open": o,
-                "high": h,
-                "low": low,
-                "close": c,
-                "volume": v,
-            }
-        )
+        klines.append({"ts_ms": ts_ms, "open": o, "high": h, "low": low, "close": c, "volume": v})
 
-    # Ensure sorted oldest -> newest
     klines.sort(key=lambda x: x["ts_ms"])
     return klines
 
 
-# ---------- Simple Signal Logic ----------
-
 def compute_simple_signal(candles: List[Dict[str, Any]]) -> Tuple[Optional[str], Dict[str, Any]]:
-    """
-    Given a list of candles (oldest -> newest), return:
-        (side, debug_info)
-
-    side: "LONG" / "SHORT" / None
-    """
     debug: Dict[str, Any] = {}
 
     if len(candles) < 3:
@@ -429,13 +429,7 @@ def compute_simple_signal(candles: List[Dict[str, Any]]) -> Tuple[Optional[str],
     closes = [c["close"] for c in candles[-MA_LOOKBACK:]]
     ma = sum(closes) / len(closes)
 
-    debug.update(
-        {
-            "last_close": last["close"],
-            "prev_close": prev["close"],
-            "ma": ma,
-        }
-    )
+    debug.update({"last_close": last["close"], "prev_close": prev["close"], "ma": ma})
 
     side: Optional[str] = None
     if last["close"] > prev["close"] and last["close"] > ma:
@@ -450,17 +444,69 @@ def compute_simple_signal(candles: List[Dict[str, Any]]) -> Tuple[Optional[str],
     return side, debug
 
 
+# FORCE_DEBUG_CALLSITE_V1: ensure observed.jsonl debug always has real numbers when candles are available
+def _ensure_debug(candles, dbg):
+    """
+    Ensure we always have last_close/prev_close/ma,
+    but DO NOT drop existing keys like 'regime', 'setup', 'signal_origin'.
+    """
+    base = dbg if isinstance(dbg, dict) else {}
+    try:
+        lc = base.get('last_close')
+        pc = base.get('prev_close')
+        ma = base.get('ma')
+        if (lc is not None) and (pc is not None) and (ma is not None):
+            return base
+
+        _side, computed = compute_simple_signal(candles)
+        if isinstance(computed, dict) and computed:
+            merged = dict(base)
+            for k in ('last_close','prev_close','ma'):
+                if merged.get(k) is None and computed.get(k) is not None:
+                    merged[k] = computed.get(k)
+            if not merged.get('reason') and computed.get('reason'):
+                merged['reason'] = computed.get('reason')
+            return merged
+    except Exception:
+        pass
+    return base
+
+def _setup_from_simple(setup_name: str):
+    def _fn(candles):
+        side, dbg = compute_simple_signal(candles)
+        if not side:
+            return None, ""
+        return side, str(dbg.get("reason", setup_name))
+    return _fn
+
+SETUP_LOGIC = {
+    "breakout_high": _setup_from_simple("breakout_high"),
+    "breakout_range": _setup_from_simple("breakout_range"),
+    "dump_fade_reversion": _setup_from_simple("dump_fade_reversion"),
+    "ema_trend_follow": _setup_from_simple("ema_trend_follow"),
+    "failed_breakout_fade": _setup_from_simple("failed_breakout_fade"),
+    "intraday_range_fade": _setup_from_simple("intraday_range_fade"),
+    "mm_reversion_micro": _setup_from_simple("mm_reversion_micro"),
+    "mm_spread_capture": _setup_from_simple("mm_spread_capture"),
+    "pump_chase_momo": _setup_from_simple("pump_chase_momo"),
+    "scalp_liquidity_sweep": _setup_from_simple("scalp_liquidity_sweep"),
+    "scalp_reversal_snapback": _setup_from_simple("scalp_reversal_snapback"),
+    "scalp_trend_continuation": _setup_from_simple("scalp_trend_continuation"),
+    "squeeze_release": _setup_from_simple("squeeze_release"),
+    "swing_reversion_channel": _setup_from_simple("swing_reversion_channel"),
+    "swing_reversion_extreme": _setup_from_simple("swing_reversion_extreme"),
+    "swing_trend_continuation": _setup_from_simple("swing_trend_continuation"),
+    "swing_trend_follow": _setup_from_simple("swing_trend_follow"),
+    "trend_breakout_retest": _setup_from_simple("trend_breakout_retest"),
+    "trend_pullback": _setup_from_simple("trend_pullback"),
+}
+
+
 def tf_display(tf: str) -> str:
-    """
-    Convert raw interval (e.g. "5") to something nicer like "5m".
-    """
     if tf.endswith(("m", "h", "d")):
         return tf
-    # crude mapping: assume minutes if just a number
     return f"{tf}m"
 
-
-# ---------- JSONL export for auto_executor ----------
 
 def _slug_from_reason(prefix: str, side_text: str, reason: str) -> str:
     base = reason.strip().lower().replace(" ", "_")
@@ -479,18 +525,6 @@ def append_signal_jsonl(
     sub_uid: Optional[str] = None,
     strategy_name: Optional[str] = None,
 ) -> None:
-    """
-    Append a single JSONL line in the format expected by auto_executor.
-
-    Fields we care about:
-        - symbol
-        - side      ("Buy"/"Sell")
-        - timeframe ("5m", "15m", etc.)
-        - price     (approx last close)
-        - setup_type (based on reason)
-        - ts_ms     (bar start/end)
-    Extra fields are fine; executor just ignores them.
-    """
     if side_text not in ("LONG", "SHORT"):
         return
 
@@ -507,13 +541,13 @@ def append_signal_jsonl(
         "debug": {
             "engine": "signal_engine_v2",
             "raw_reason": reason,
+            "regime": debug.get("regime"),
             "last_close": debug.get("last_close"),
             "prev_close": debug.get("prev_close"),
             "ma": debug.get("ma"),
         },
     }
 
-    # Critical: executor sizing logic needs a price
     if price is not None:
         payload["price"] = float(price)
 
@@ -530,29 +564,7 @@ def append_signal_jsonl(
         print(f"[signal_engine] Failed to append to {SIGNALS_PATH}: {e}")
 
 
-# ---------- Strategy helpers ----------
-
-def _get_strat_attr(s: Any, key: str, default: Any = None) -> Any:
-    """
-    Helper that works for both:
-      - dict-like strategies
-      - object-like strategies (e.g. dataclasses / Pydantic models)
-    """
-    if isinstance(s, dict):
-        return s.get(key, default)
-    return getattr(s, key, default)
-
-
-# ---------- Strategy-aware universe ----------
-
 def build_universe() -> Dict[Tuple[str, str], List[Dict[str, Any]]]:
-    """
-    Build mapping:
-        (symbol, timeframe_raw) -> [strategy_dict, ...]
-    When SIG_USE_STRATEGIES is enabled and strategies.yaml is available,
-    we use subaccount strategy definitions.
-    Otherwise, fall back to SIG_SYMBOLS / SIG_TIMEFRAMES with no strategies.
-    """
     universe: Dict[Tuple[str, str], List[Dict[str, Any]]] = {}
 
     if SIG_USE_STRATEGIES and _HAS_STRATEGY_REGISTRY:
@@ -590,11 +602,10 @@ def build_universe() -> Dict[Tuple[str, str], List[Dict[str, Any]]]:
                         "symbols": symbols,
                         "timeframes": tfs,
                         "automation_mode": automation_mode,
-                        "raw": s,
+                        "raw": s,  # may be object OR dict, we handle both
                     }
                     universe.setdefault(key, []).append(entry)
 
-    # Fallback if no strategies or disabled
     if not universe:
         for sym in SIG_SYMBOLS:
             for tf in SIG_TIMEFRAMES:
@@ -603,10 +614,44 @@ def build_universe() -> Dict[Tuple[str, str], List[Dict[str, Any]]]:
     return universe
 
 
-# ---------- Main Loop ----------
-
 def main() -> None:
     universe = build_universe()
+
+    # PRUNE_DEAD_SYMBOLS (startup sanity): drop symbols that return *consistently empty* klines.
+    # IMPORTANT:
+    # - Only prune on our explicit "Empty kline list ..." error
+    # - Do NOT prune on transient HTTP/network/timeouts/rate-limits
+    dead_syms = set()
+    try:
+        probe_tf = "5"
+        # GATE_PRUNE_DEAD_SYMBOLS_V1
+        probe_syms = ([] if os.getenv('SIG_PRUNE_DEAD_SYMBOLS','0') != '1' else sorted({k[0] for k in universe.keys()}))
+        for sym in probe_syms:
+            empty_hits = 0
+            for _attempt in range(2):
+                try:
+                    _ = fetch_recent_klines(sym, probe_tf, limit=10)
+                    break
+                except Exception as e:
+                    msg = str(e)
+                    if "Empty kline list" in msg:
+                        empty_hits += 1
+                        continue
+                    # Non-empty exceptions are treated as transient: keep symbol
+                    print(f"[WARN] Dead-symbol probe transient error (keeping {sym}): {type(e).__name__}: {e}")
+                    break
+            if empty_hits >= 2:
+                dead_syms.add(sym)
+
+        if dead_syms:
+            print(f"[WARN] Pruning dead symbols (empty klines x2): {sorted(dead_syms)}")
+            universe = {k: v for k, v in universe.items() if k[0] not in dead_syms}
+    except Exception as _e:
+        print(f"[WARN] Dead-symbol prune failed (non-fatal): {type(_e).__name__}: {_e}")
+
+
+
+
     all_symbols = sorted({k[0] for k in universe.keys()})
     all_tfs = sorted({k[1] for k in universe.keys()})
 
@@ -636,7 +681,6 @@ def main() -> None:
         tg_info(msg)
         return
 
-    # Startup Telegram
     if SIG_USE_STRATEGIES and _HAS_STRATEGY_REGISTRY:
         try:
             strat_objs = stratreg.all_sub_strategies()
@@ -666,15 +710,18 @@ def main() -> None:
             f"AI logging: {'on' if _HAS_AI_HOOKS else 'OFF (stub)'}"
         )
 
-    # Track last bar we emitted a signal for
     last_signal_bar: Dict[Tuple[str, str], int] = {}
 
     start_ts = time.time()
     next_heartbeat = start_ts + SIG_HEARTBEAT_SEC
 
     while True:
+        # DBG_LOOP_START_V1
+        print("[DBG] LOOP_START (entered while loop)", flush=True)
         loop_start = time.time()
         total_signals_this_loop = 0
+        seen_emit = set()  # DEDUPE_EMIT_V1: prevent duplicate observed.jsonl rows per run
+
 
         for (symbol, tf), strat_list in universe.items():
             key = (symbol, tf)
@@ -694,103 +741,117 @@ def main() -> None:
             bar_ts = latest_bar["ts_ms"]
             last_close = latest_bar["close"]
 
-            # Only act once per bar for this (symbol, timeframe)
             last_ts = last_signal_bar.get(key)
             if last_ts is not None and bar_ts <= last_ts:
                 continue
 
-            # --- Strategy-aware + regime-filtered signal generation ---
             regime_ind = compute_regime_indicators(candles)
+            tf_label = tf_display(tf)
 
-            side = None
-            reason = ""
-            debug: Dict[str, Any] = {}
+            # Collect per-strategy matches (NO global fanout)
+            matched: List[Dict[str, Any]] = []
+            # DBG_UNIVERSE_ONCE_V1
+            if os.getenv('SIG_DBG_UNIVERSE','0') == '1':
+                if not hasattr(main, '_dbg_universe_once'):
+                    main._dbg_universe_once = True
+                    try:
+                        print(f'[DBG] universe key={symbol} tf={tf_label} strat_list_len={len(strat_list) if strat_list else 0}', flush=True)
+                        if strat_list:
+                            for j, strat in enumerate(strat_list[:3], start=1):
+                                raw_obj = strat.get('raw')
+                                print(f'[DBG] strat#{j} keys={sorted(list(strat.keys()))}', flush=True)
+                                print(f'[DBG] strat#{j} raw_type={type(raw_obj).__name__} raw_keys={(sorted(list(raw_obj.keys())) if isinstance(raw_obj, dict) else None)}', flush=True)
+                                st = _get_strat_attr(raw_obj, 'setup_types', []) or []
+                                print(f'[DBG] strat#{j} setup_types_type={type(st).__name__} setup_types={st}', flush=True)
+                    except Exception as e:
+                        print(f'[DBG] universe debug failed: {type(e).__name__}: {e}', flush=True)
+            # STRAT_COUNTERS_V1
+            c_setup_types_empty = 0
+            c_setups_checked = 0
+            c_missing_logic = 0
+            c_logic_none = 0
+            c_regime_blocked = 0
+            c_matched_added = 0
 
-            # 1) Try strategy setups with regime gating
+            # 1) Strategy setups with regime gating (object-safe) - per sub/strategy
             if strat_list:
                 for strat in strat_list:
-                    raw = strat.get("raw") or {}
-                    setup_types = raw.get("setup_types", []) or []
+                    raw_obj = strat.get("raw")
+                    setup_types = _get_strat_attr(raw_obj, "setup_types", []) or []
+                    if not setup_types:
+                        c_setup_types_empty += 1
+                    if not isinstance(setup_types, list):
+                        setup_types = []
+
                     for setup in setup_types:
-                        logic_fn = SETUP_LOGIC.get(setup)
+                        c_setups_checked += 1
+                        logic_fn = SETUP_LOGIC.get(str(setup))
                         if not logic_fn:
+                            c_missing_logic += 1
                             continue
-                        s, r = logic_fn(candles)
-                        if not s:
-                            continue
-
-                        # check regime filters
-                        if not passes_regime_filters(raw, regime_ind):
+                        s_side, s_reason = logic_fn(candles)
+                        if not s_side:
+                            c_logic_none += 1
                             continue
 
-                        side = s
-                        reason = f"{setup}:{r}"
-                        debug["setup"] = setup
-                        debug["regime"] = regime_ind
-                        debug["signal_origin"] = "strategy"
-                        break
-                    if side:
-                        break
+                        if not passes_regime_filters(raw_obj, regime_ind):
+                            c_regime_blocked += 1  # COUNTERS_CLEANUP_V1
+                            continue
 
-            # 2) Fallback to simple signal if no strategy fired
-            if side is None:
+                        m_debug: Dict[str, Any] = {"setup": setup, "regime": regime_ind, "signal_origin": "strategy"}
+                        c_matched_added += 1
+                        matched.append({"strat": strat, "side": s_side, "reason": f"{setup}:{s_reason}", "debug": m_debug})
+                        break  # one setup per strategy per bar
+
+            # 2) Fallback (only if allowed) and ONLY if nothing matched
+            fallback_payload = None
+            if (not matched) and SIG_ALLOW_FALLBACK:
                 simple_side, simple_debug = compute_simple_signal(candles)
                 if simple_side:
-                    side = simple_side
-                    reason = f"fallback:{simple_debug.get('reason')}"
-                    debug.update(simple_debug)
-                    debug["signal_origin"] = "fallback"
-                    debug["regime"] = regime_ind
+                    fb_debug = dict(simple_debug)
+                    fb_debug["signal_origin"] = "fallback"
+                    fb_debug["regime"] = regime_ind
+                    fallback_payload = {"side": simple_side, "reason": f"fallback:{simple_debug.get('reason')}", "debug": fb_debug}
 
-            # 3) If still no direction, skip this bar
-            if side is None:
+            # If nothing at all, mark bar processed and continue
+            if (not matched) and (fallback_payload is None):
                 last_signal_bar[key] = bar_ts
                 continue
 
-            # 4) Confirmed signal
+            # Mark bar processed for this (symbol, tf) regardless
             last_signal_bar[key] = bar_ts
-            total_signals_this_loop += 1
 
-            tf_label = tf_display(tf)
-            applicable_strats: List[Dict[str, Any]] = strat_list or []
+            # Emit matched strategies (strategy-only)
+            if matched:
+                for item in matched:
+                    strat = item["strat"]
+                    side = item["side"]
+                    reason = item["reason"]
+                    debug = item["debug"]
 
-            # Build and send human-friendly message
-            if applicable_strats:
-                strat_names_str = ", ".join(
-                    s.get("name", f"sub-{s.get('sub_uid')}") for s in applicable_strats
-                )
-                msg = (
-                    f"📡 *Signal Engine v2* — {symbol} / {tf_label}\n"
-                    f"Side: *{side}*\n"
-                    f"Strategies: `{strat_names_str}`\n"
-                    f"Last close: `{last_close}`\n"
-                    f"Reason: `{reason}`\n"
-                    f"(No orders placed here; executors handle trades.)"
-                )
-            else:
-                msg = (
-                    f"📡 *Signal Engine v2* — {symbol} / {tf_label}\n"
-                    f"Side: *{side}*\n"
-                    f"Last close: `{last_close}`\n"
-                    f"Reason: `{reason}`\n"
-                    f"(No orders placed here; executors handle trades, generic universe.)"
-                )
+                    sub_uid = str(strat.get("sub_uid"))
+                    _dk = (sub_uid, symbol, tf_label, bar_ts, side, reason)
+                    if _dk in seen_emit:
+                        continue
+                    seen_emit.add(_dk)  # DEDUPE_EMIT_V1
 
-            tg_info(msg)
+                    strat_name = strat.get("name", f"sub-{sub_uid}")
+                    automation_mode = strat.get("automation_mode")
 
-            # AI logging hook
-            regime_tags = [reason]
-            base_extra = {
-                "engine": "signal_engine_v2",
-                "raw_debug": debug,
-                "tf_raw": tf,
-            }
+                    msg = (
+                        f"📡 *Signal Engine v2* - {symbol} / {tf_label}\n"
+                        f"Side: *{side}*\n"
+                        f"Strategy: `{strat_name}`\n"
+                        f"Sub UID: `{sub_uid}`\n"
+                        f"Last close: `{last_close}`\n"
+                        f"Reason: `{reason}`\n"
+                        f"(No orders placed here; executors handle trades.)"
+                    )
+                    tg_info(msg)
 
-            if applicable_strats:
-                for s in applicable_strats:
-                    sub_uid = str(s.get("sub_uid"))
-                    strat_name = s.get("name", f"sub-{sub_uid}")
-                    automation_mode = s.get("automation_mode")
+                    regime_tags = [reason]
+                    base_extra = {"engine": "signal_engine_v2", "raw_debug": debug, "tf_raw": tf}
+
                     try:
                         sub_label = stratreg.get_sub_label(sub_uid) if _HAS_STRATEGY_REGISTRY else None
                     except Exception:
@@ -803,7 +864,7 @@ def main() -> None:
                             "strategy_automation_mode": automation_mode,
                             "sub_uid": sub_uid,
                             "sub_label": sub_label,
-                            "strategy_raw": s.get("raw") or s,
+                            "strategy_raw": strat.get("raw") or strat,
                         }
                     )
 
@@ -825,7 +886,6 @@ def main() -> None:
                         f"strategy={strat_name} sub_uid={sub_uid} | signal_id={signal_id} | reason={reason}"
                     )
 
-                    # JSONL export per strategy for auto_executor
                     append_signal_jsonl(
                         symbol=symbol,
                         side_text=side,
@@ -833,44 +893,118 @@ def main() -> None:
                         bar_ts=bar_ts,
                         price=last_close,
                         reason=reason,
-                        debug=debug,
+                        debug=_ensure_debug(candles, debug),  # FORCE_DEBUG_CALLSITE_V1
                         sub_uid=sub_uid,
                         strategy_name=strat_name,
                     )
-            else:
-                # Generic fallback
-                extra = dict(base_extra)
-                extra.update({"strategy_name": None, "strategy_automation_mode": None})
-                signal_id = log_signal_from_engine(
-                    symbol=symbol,
-                    timeframe=tf_label,
-                    side=side,
-                    source="signal_engine_v2",
-                    confidence=None,
-                    stop_hint=None,
-                    owner="AUTO_STRATEGY",
-                    sub_uid=None,
-                    strategy_role="GENERIC_SIGNAL_ENGINE",
-                    regime_tags=regime_tags,
-                    extra=extra,
-                )
-                print(
-                    f"[SIGNAL] {symbol} {tf_label} {side} | strategy=GENERIC | signal_id={signal_id} | reason={reason}"
-                )
 
-                append_signal_jsonl(
-                    symbol=symbol,
-                    side_text=side,
-                    tf_label=tf_label,
-                    bar_ts=bar_ts,
-                    price=last_close,
-                    reason=reason,
-                    debug=debug,
-                    sub_uid=None,
-                    strategy_name=None,
-                )
+                    total_signals_this_loop += 1
 
-        # Heartbeat
+            # Emit fallback (generic or fanout, depending on env)
+            elif fallback_payload is not None:
+                side = fallback_payload["side"]
+                reason = fallback_payload["reason"]
+                debug = fallback_payload["debug"]
+
+                msg = (
+                    f"📡 *Signal Engine v2* - {symbol} / {tf_label}\n"
+                    f"Side: *{side}*\n"
+                    f"Last close: `{last_close}`\n"
+                    f"Reason: `{reason}`\n"
+                    f"(Fallback mode)\n"
+                    f"(No orders placed here; executors handle trades.)"
+                )
+                tg_info(msg)
+
+                regime_tags = [reason]
+                base_extra = {"engine": "signal_engine_v2", "raw_debug": debug, "tf_raw": tf}
+
+                if SIG_FALLBACK_FANOUT and strat_list:
+                    for strat in (strat_list or []):
+                        sub_uid = str(strat.get("sub_uid"))
+                        strat_name = strat.get("name", f"sub-{sub_uid}")
+                        automation_mode = strat.get("automation_mode")
+
+                        try:
+                            sub_label = stratreg.get_sub_label(sub_uid) if _HAS_STRATEGY_REGISTRY else None
+                        except Exception:
+                            sub_label = None
+
+                        extra = dict(base_extra)
+                        extra.update(
+                            {
+                                "strategy_name": strat_name,
+                                "strategy_automation_mode": automation_mode,
+                                "sub_uid": sub_uid,
+                                "sub_label": sub_label,
+                                "strategy_raw": strat.get("raw") or strat,
+                            }
+                        )
+
+                        signal_id = log_signal_from_engine(
+                            symbol=symbol,
+                            timeframe=tf_label,
+                            side=side,
+                            source="signal_engine_v2",
+                            confidence=None,
+                            stop_hint=None,
+                            owner="AUTO_STRATEGY",
+                            sub_uid=sub_uid,
+                            strategy_role=strat_name,
+                        regime_tags=regime_tags,
+                            extra=extra,
+                        )
+                        print(
+                            f"[SIGNAL] {symbol} {tf_label} {side} | "
+                            f"strategy={strat_name} sub_uid={sub_uid} | signal_id={signal_id} | reason={reason}"
+                        )
+
+                        append_signal_jsonl(
+                            symbol=symbol,
+                            side_text=side,
+                            tf_label=tf_label,
+                            bar_ts=bar_ts,
+                            price=last_close,
+                            reason=reason,
+                            debug=_ensure_debug(candles, debug),
+                            sub_uid=sub_uid,
+                            strategy_name=strat_name,
+                        )
+
+                        total_signals_this_loop += 1
+
+                else:
+                    extra = dict(base_extra)
+                    extra.update({"strategy_name": None, "strategy_automation_mode": None})
+
+                    signal_id = log_signal_from_engine(
+                        symbol=symbol,
+                        timeframe=tf_label,
+                        side=side,
+                        source="signal_engine_v2",
+                        confidence=None,
+                        stop_hint=None,
+                        owner="AUTO_STRATEGY",
+                        sub_uid=None,
+                        strategy_role="GENERIC_SIGNAL_ENGINE",
+                        regime_tags=regime_tags,
+                        extra=extra,
+                    )
+                    print(f"[SIGNAL] {symbol} {tf_label} {side} | strategy=GENERIC | signal_id={signal_id} | reason={reason}")
+
+                    append_signal_jsonl(
+                        symbol=symbol,
+                        side_text=side,
+                        tf_label=tf_label,
+                        bar_ts=bar_ts,
+                        price=last_close,
+                        reason=reason,
+                        debug=_ensure_debug(candles, debug),
+                        sub_uid=None,
+                        strategy_name=None,
+                    )
+
+                    total_signals_this_loop += 1
         now = time.time()
         if now >= next_heartbeat:
             uptime_min = int((now - start_ts) / 60)
@@ -887,6 +1021,20 @@ def main() -> None:
             next_heartbeat = now + SIG_HEARTBEAT_SEC
 
         sleep_for = max(1.0, SIG_POLL_SEC - (time.time() - loop_start))
+        # WARN_TUNE_V1: no-match is normal. Warn only on suspicious conditions.
+        if c_setups_checked > 0 and c_matched_added == 0:
+            suspicious = (
+                (c_missing_logic > 0) or
+                (c_setup_types_empty > 0) or
+                (c_regime_blocked == c_setups_checked and c_setups_checked >= 3)
+            )
+            if suspicious:
+                print(
+                    f"[WARN] suspicious_no_match setups_checked={c_setups_checked} missing_logic={c_missing_logic} "
+                    f"logic_none={c_logic_none} regime_blocked={c_regime_blocked} setup_types_empty={c_setup_types_empty}",
+                    flush=True,
+                )
+        print(f"[DBG] setups_checked={c_setups_checked} missing_logic={c_missing_logic} logic_none={c_logic_none} setup_types_empty={c_setup_types_empty} matched_added={c_matched_added}", flush=True)
         time.sleep(sleep_for)
 
 

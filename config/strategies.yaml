@@ -93,7 +93,6 @@ subaccounts:
       - OPUSDT
       - AVAXUSDT
       - DOGEUSDT
-      - MATICUSDT
       - NEARUSDT
       - ARBUSDT
       - HBARUSDT
@@ -178,7 +177,6 @@ subaccounts:
       - ADAUSDT
       - LINKUSDT
       - AVAXUSDT
-      - MATICUSDT
     timeframes:
       - "15"
       - "60"
@@ -327,7 +325,6 @@ subaccounts:
       - INJUSDT
       - OPUSDT
       - AVAXUSDT
-      - MATICUSDT
       - NEARUSDT
       - ARBUSDT
       - HBARUSDT
@@ -409,7 +406,6 @@ subaccounts:
       - OPUSDT
       - AVAXUSDT
       - DOGEUSDT
-      - MATICUSDT
       - NEARUSDT
       - ARBUSDT
       - HBARUSDT

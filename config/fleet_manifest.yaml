@@ -1,0 +1,264 @@
+version: 1
+generated_from:
+  strategies: config/strategies.yaml
+  subaccounts: config/subaccounts.yaml
+fleet:
+- account_label: main
+  sub_uid: null
+  enabled: false
+  enable_ai_stack: false
+  strategy_name: main_manual
+  role: main
+  automation_mode: 'OFF'
+  ai_profile: manual_v1
+  risk_pct: 0.01
+  max_concurrent_positions: 1
+  exit_profile: standard_10
+  timeframes:
+  - '5'
+  - '15'
+  symbols:
+  - BTCUSDT
+  - ETHUSDT
+  - SOLUSDT
+  - XRPUSDT
+  - ADAUSDT
+  - LINKUSDT
+  - AVAXUSDT
+  setup_types: []
+  promotion_rules: null
+- account_label: flashback01
+  sub_uid: 524630315
+  enabled: true
+  enable_ai_stack: true
+  strategy_name: Sub1_Trend
+  role: trend_follow
+  automation_mode: LEARN_DRY
+  ai_profile: trend_v1
+  risk_pct: 0.1
+  max_concurrent_positions: 2
+  exit_profile: standard_5
+  timeframes:
+  - '15'
+  - '60'
+  symbols:
+  - BTCUSDT
+  - ETHUSDT
+  - SOLUSDT
+  - XRPUSDT
+  - ADAUSDT
+  - LINKUSDT
+  - INJUSDT
+  - OPUSDT
+  - AVAXUSDT
+  - DOGEUSDT
+  setup_types:
+  - trend_pullback
+  - trend_breakout_retest
+  - ema_trend_follow
+  promotion_rules: null
+  min_trades: 150
+  min_winrate: 0.52
+  min_avg_r: 0.3
+  min_expectancy_r: 0.15
+  max_drawdown_pct: 18.0
+- account_label: flashback02
+  sub_uid: 524633243
+  enabled: true
+  enable_ai_stack: true
+  strategy_name: Sub2_Breakout
+  role: breakout_momentum
+  automation_mode: LEARN_DRY
+  ai_profile: breakout_v1
+  risk_pct: 0.1
+  max_concurrent_positions: 2
+  exit_profile: standard_5
+  timeframes:
+  - '5'
+  - '15'
+  symbols:
+  - BTCUSDT
+  - ETHUSDT
+  - SOLUSDT
+  - XRPUSDT
+  - ADAUSDT
+  - LINKUSDT
+  - INJUSDT
+  - OPUSDT
+  - AVAXUSDT
+  - DOGEUSDT
+  - MATICUSDT
+  - NEARUSDT
+  - ARBUSDT
+  - HBARUSDT
+  - FARTCOINUSDT
+  - PUMPFUNUSDT
+  setup_types:
+  - breakout_high
+  - breakout_range
+  - squeeze_release
+  promotion_rules: null
+  min_trades: 200
+  min_winrate: 0.5
+  min_avg_r: 0.35
+  min_expectancy_r: 0.2
+  max_drawdown_pct: 20.0
+- account_label: flashback03
+  sub_uid: 524634622
+  enabled: false
+  enable_ai_stack: true
+  strategy_name: Sub3_ScalpMajors
+  role: scalp_intraday
+  automation_mode: LEARN_DRY
+  ai_profile: scalp_v1
+  risk_pct: 0.1
+  max_concurrent_positions: 2
+  exit_profile: standard_5
+  timeframes:
+  - '1'
+  - '3'
+  - '5'
+  symbols:
+  - BTCUSDT
+  - ETHUSDT
+  - SOLUSDT
+  - XRPUSDT
+  - ADAUSDT
+  - LINKUSDT
+  - DOGEUSDT
+  setup_types:
+  - scalp_liquidity_sweep
+  - scalp_trend_continuation
+  - scalp_reversal_snapback
+  promotion_rules: null
+  min_trades: 250
+  min_winrate: 0.5
+  min_avg_r: 0.2
+  min_expectancy_r: 0.1
+  max_drawdown_pct: 22.0
+- account_label: flashback04
+  sub_uid: 524636309
+  enabled: false
+  enable_ai_stack: true
+  strategy_name: Sub4_SwingRevert
+  role: swing_reversion
+  automation_mode: LEARN_DRY
+  ai_profile: reversion_v1
+  risk_pct: 0.1
+  max_concurrent_positions: 2
+  exit_profile: standard_5
+  timeframes:
+  - '15'
+  - '60'
+  - '240'
+  symbols:
+  - BTCUSDT
+  - ETHUSDT
+  - XRPUSDT
+  - ADAUSDT
+  - LINKUSDT
+  - AVAXUSDT
+  - MATICUSDT
+  setup_types:
+  - swing_reversion_extreme
+  - swing_reversion_channel
+  promotion_rules: null
+  min_trades: 120
+  min_winrate: 0.52
+  min_avg_r: 0.35
+  min_expectancy_r: 0.2
+  max_drawdown_pct: 18.0
+- account_label: flashback05
+  sub_uid: 524637467
+  enabled: false
+  enable_ai_stack: true
+  strategy_name: Sub5_HFT_MM
+  role: hft_market_maker
+  automation_mode: LEARN_DRY
+  ai_profile: hft_mm_v1
+  risk_pct: 0.05
+  max_concurrent_positions: 3
+  exit_profile: standard_5
+  timeframes:
+  - '1'
+  symbols:
+  - BTCUSDT
+  - ETHUSDT
+  setup_types:
+  - mm_spread_capture
+  - mm_reversion_micro
+  promotion_rules: null
+  min_trades: 400
+  min_winrate: 0.49
+  min_avg_r: 0.12
+  min_expectancy_r: 0.05
+  max_drawdown_pct: 15.0
+- account_label: flashback06
+  sub_uid: 524638768
+  enabled: false
+  enable_ai_stack: true
+  strategy_name: Sub6_Speculative
+  role: microcap_spec
+  automation_mode: LEARN_DRY
+  ai_profile: spec_v1
+  risk_pct: 0.1
+  max_concurrent_positions: 1
+  exit_profile: standard_5
+  timeframes:
+  - '1'
+  - '5'
+  symbols:
+  - FARTCOINUSDT
+  - PUMPFUNUSDT
+  - HBARUSDT
+  setup_types:
+  - pump_chase_momo
+  - dump_fade_reversion
+  promotion_rules: null
+  min_trades: 200
+  min_winrate: 0.48
+  min_avg_r: 0.35
+  min_expectancy_r: 0.18
+  max_drawdown_pct: 25.0
+- account_label: flashback07
+  sub_uid: 524649709
+  enabled: true
+  enable_ai_stack: true
+  strategy_name: Sub7_Canary
+  role: canary_experimental
+  automation_mode: LEARN_DRY
+  ai_profile: canary_v1
+  risk_pct: 0.1
+  max_concurrent_positions: 1
+  exit_profile: standard_5
+  timeframes:
+  - '5'
+  - '15'
+  symbols:
+  - BTCUSDT
+  - ETHUSDT
+  - SOLUSDT
+  - LINKUSDT
+  - INJUSDT
+  - AVAXUSDT
+  - OPUSDT
+  setup_types:
+  - trend_pullback
+  - breakout_high
+  - swing_trend_continuation
+  promotion_rules: null
+  min_trades: 150
+  min_winrate: 0.52
+  min_avg_r: 0.3
+  min_expectancy_r: 0.18
+  max_drawdown_pct: 18.0
+- account_label: flashback08
+  enabled: false
+  enable_ai_stack: true
+  automation_mode: LEARN_DRY
+- account_label: flashback09
+  enabled: false
+  enable_ai_stack: true
+  automation_mode: LEARN_DRY
+- account_label: flashback10
+  should_run: false

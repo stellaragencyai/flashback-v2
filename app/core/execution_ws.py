@@ -69,6 +69,10 @@ def _normalize_symbol(symbol: str) -> str:
 def _log(msg: str) -> None:
     """
     Best-effort Telegram log for execution events.
+
+    HARD RULE:
+      - In EXEC_DRY_RUN, send_tg() is a no-op by default (no network).
+      - In LIVE, send_tg() uses short timeouts and never raises.
     """
     try:
         send_tg(msg)

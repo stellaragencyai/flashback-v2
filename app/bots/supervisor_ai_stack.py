@@ -27,6 +27,19 @@ import time
 from pathlib import Path
 from typing import Callable, Dict, Optional, List, Tuple, Any
 
+# --- PHASE8_IMPORT_PATH_SHIM ---
+import os as _os
+import sys as _sys
+from pathlib import Path as _Path
+_ROOT = _Path(__file__).resolve().parents[2]
+if str(_ROOT) not in _sys.path:
+    _sys.path.insert(0, str(_ROOT))
+# Force UTF-8 so logs/emoji do not crash on Windows cp1252
+_os.environ.setdefault('PYTHONUTF8','1')
+_os.environ.setdefault('PYTHONIOENCODING','utf-8')
+# --- END PHASE8_IMPORT_PATH_SHIM ---
+
+
 
 # ---------------------------------------------------------------------------
 # Logging (import-safe)
@@ -182,7 +195,7 @@ def _hard_gate_validate_config(log, send_tg) -> bool:
     try:
         from app.tools.validate_config import main as validate_config_main  # type: ignore
     except Exception as e:
-        msg = f"🛑 Config validator import failed: {e}. Refusing to start AI stack."
+        msg = f"STOP Config validator import failed: {e}. Refusing to start AI stack."
         log.error(msg)
         try:
             send_tg(msg)
@@ -193,7 +206,7 @@ def _hard_gate_validate_config(log, send_tg) -> bool:
     try:
         rc = validate_config_main()
         if rc != 0:
-            msg = f"🛑 Config validation FAILED (rc={rc}). Refusing to start AI stack."
+            msg = f"STOP Config validation FAILED (rc={rc}). Refusing to start AI stack."
             log.error(msg)
             try:
                 send_tg(msg)
@@ -204,7 +217,7 @@ def _hard_gate_validate_config(log, send_tg) -> bool:
         log.info("Config validation PASS ✅")
         return True
     except Exception as e:
-        msg = f"🛑 Config validator crashed: {e}. Refusing to start AI stack."
+        msg = f"STOP Config validator crashed: {e}. Refusing to start AI stack."
         log.error(msg)
         try:
             send_tg(msg)
@@ -634,7 +647,7 @@ def main() -> None:
         log.info(msg)
         _ops_write("supervisor_ai_stack", account_label, False, {"phase": "disabled", "reason": "subaccounts.yaml gate"})
         try:
-            send_tg(f"🛑 {msg}")
+            send_tg(f"STOP {msg}")
         except Exception:
             pass
         return

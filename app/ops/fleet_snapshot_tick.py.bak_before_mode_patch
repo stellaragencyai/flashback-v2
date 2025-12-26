@@ -1,0 +1,102 @@
+﻿from __future__ import annotations
+
+import json
+import os
+import time
+from pathlib import Path
+from typing import Any, Dict
+
+ROOT = Path(__file__).resolve().parents[2]
+STATE = ROOT / "state"
+OUT_PATH = STATE / "fleet_snapshot.json"
+CFG = ROOT / "config" / "fleet_manifest.yaml"
+
+def _now_ms() -> int:
+    return int(time.time() * 1000)
+
+def _load_json(path: Path) -> Dict[str, Any]:
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+def _stat(path: Path) -> Dict[str, Any]:
+    try:
+        st = path.stat()
+        mtime_ms = int(st.st_mtime * 1000)
+        age_ms = max(0, _now_ms() - mtime_ms)
+        return {"exists": True, "path": str(path), "size": int(st.st_size), "mtime_ms": mtime_ms, "age_ms": age_ms}
+    except Exception:
+        return {"exists": False, "path": str(path), "size": 0, "mtime_ms": None, "age_ms": None}
+
+def _read_manifest_labels() -> list[str]:
+    if not CFG.exists():
+        return []
+    labels: list[str] = []
+    for line in CFG.read_text(encoding="utf-8", errors="ignore").splitlines():
+        s = line.strip()
+        if s.startswith("account_label:"):
+            lbl = s.split(":", 1)[1].strip().strip("'").strip('"')
+            if lbl:
+                labels.append(lbl)
+    seen = set()
+    out = []
+    for x in labels:
+        if x not in seen:
+            seen.add(x)
+            out.append(x)
+    return out
+
+def main() -> int:
+    STATE.mkdir(parents=True, exist_ok=True)
+
+    buses = {
+        "heartbeats": _stat(STATE / "heartbeats.json"),
+        "ops_snapshot": _stat(STATE / "ops_snapshot.json"),
+        "orderbook_bus": _stat(STATE / "orderbook_bus.json"),
+        "positions_bus": _stat(STATE / "positions_bus.json"),
+        "trades_bus": _stat(STATE / "trades_bus.json"),
+    }
+
+    labels = _read_manifest_labels()
+    subs: Dict[str, Any] = {}
+
+    ops = _load_json(STATE / "ops_snapshot.json")
+    ops_accounts = ops.get("accounts") if isinstance(ops, dict) else None
+    if not isinstance(ops_accounts, dict):
+        ops_accounts = {}
+
+    for label in labels:
+        acc = ops_accounts.get(label) if isinstance(ops_accounts, dict) else None
+        if not isinstance(acc, dict):
+            acc = {}
+
+        enabled = bool(acc.get("enabled", True)) if acc else True
+        enable_ai_stack = bool(acc.get("enable_ai_stack", True)) if acc else True
+
+        sup = acc.get("supervisor_ai_stack") if isinstance(acc.get("supervisor_ai_stack"), dict) else {}
+        alive = bool(sup.get("ok")) if isinstance(sup, dict) and sup else False
+        pid = sup.get("pid") if isinstance(sup, dict) else None
+
+        subs[label] = {
+            "enabled": enabled,
+            "enable_ai_stack": enable_ai_stack,
+            "should_run": bool(enabled and enable_ai_stack),
+            "alive": alive,
+            "pid": pid,
+        }
+
+    out = {
+        "ts_ms": _now_ms(),
+        "root": str(ROOT),
+        "manifest": {"path": str(CFG), "mtime_ms": int(CFG.stat().st_mtime * 1000) if CFG.exists() else None},
+        "buses": buses,
+        "fleet": {"count": len(labels), "labels": labels, "subs": subs},
+        "orchestrator": {"pid": os.getpid(), "cwd": str(Path.cwd())},
+    }
+
+    OUT_PATH.write_text(json.dumps(out, indent=2), encoding="utf-8")
+    return 0
+
+if __name__ == "__main__":
+    raise SystemExit(main())

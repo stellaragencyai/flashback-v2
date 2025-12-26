@@ -1,4 +1,4 @@
-﻿#!/usr/bin/env python3
+#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
 Flashback — AI Action Router (Adapter / Tailer)
@@ -16,7 +16,7 @@ from __future__ import annotations
 import os
 import time
 from pathlib import Path
-from typing import Any, Dict, List, Tuple, Optional
+from typing import Any, Dict, List, Tuple
 
 import orjson
 
@@ -24,14 +24,15 @@ from app.core.flashback_common import (
     send_tg,
     record_heartbeat,
     alert_bot_error,
+    EXEC_DRY_RUN,
 )
 
 from app.core.ai_action_router import apply_ai_action
 
 ACCOUNT_LABEL = os.getenv("ACCOUNT_LABEL", "main").strip() or "main"
-AI_ROUTER_ENABLED = os.getenv("AI_ROUTER_ENABLED", "true").strip().lower() in ("1","true","yes","on")
+AI_ROUTER_ENABLED = os.getenv("AI_ROUTER_ENABLED", "true").strip().lower() in ("1", "true", "yes", "on")
 POLL_SECONDS = int(os.getenv("AI_ROUTER_POLL_SECONDS", "2").strip() or "2")
-SEND_TG = os.getenv("AI_ROUTER_SEND_TG", "true").strip().lower() in ("1","true","yes","on")
+SEND_TG = os.getenv("AI_ROUTER_SEND_TG", "true").strip().lower() in ("1", "true", "yes", "on")
 
 ACTIONS_FILE = Path(os.getenv("AI_ACTIONS_PATH", "state/ai_actions.jsonl")).resolve()
 OFFSET_DIR = Path("state/offsets").resolve()
@@ -98,11 +99,12 @@ def loop() -> None:
     # Load persisted offset (prevents replay)
     offset = _load_offset()
 
-    # Startup notice
-    try:
-        send_tg(f"📡 AI Action Router adapter online for {ACCOUNT_LABEL}")
-    except Exception:
-        pass
+    # Startup notice (respects DRY_RUN + flag)
+    if SEND_TG and not EXEC_DRY_RUN:
+        try:
+            send_tg(f"📡 AI Action Router adapter online for {ACCOUNT_LABEL}")
+        except Exception:
+            pass
 
     while True:
         record_heartbeat("ai_action_router_adapter")
@@ -120,8 +122,8 @@ def loop() -> None:
 
                 res = apply_ai_action(env)
 
-                # Optional TG logging (lightweight)
-                if SEND_TG:
+                # Optional TG logging (lightweight) - NEVER in DRY_RUN
+                if SEND_TG and not EXEC_DRY_RUN:
                     try:
                         ok = res.get("ok")
                         norm = res.get("normalized") or {}

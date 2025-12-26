@@ -41,6 +41,28 @@ def _now_ms() -> int:
     return int(time.time() * 1000)
 
 
+def _normalize_timeframe(tf: Any, default: str = "5m") -> str:
+    """
+    Normalize timeframe to canonical string form:
+    - "5" -> "5m"
+    - "5m" -> "5m"
+    - "1h" -> "1h"
+    - None/"" -> default
+    """
+    s = ""
+    try:
+        s = str(tf).strip().lower()
+    except Exception:
+        s = ""
+    if not s:
+        return default
+    if s.endswith(("m", "h", "d", "w")):
+        return s
+    if s.isdigit():
+        return f"{s}m"
+    return s or default
+
+
 def log_policy_decision(
     *,
     strat_id: str,
@@ -61,7 +83,7 @@ def log_policy_decision(
                 "account_label": "...",
                 "sub_uid": "...",
                 "symbol": "...",
-                "timeframe": "5",
+                "timeframe": "5m",
                 "side": "Buy"/"Sell"/"long"/"short",
                 "mode": "PAPER" | "LIVE_CANARY" | "LIVE_FULL" | "OFF"/"UNKNOWN",
             }
@@ -78,6 +100,9 @@ def log_policy_decision(
                 "raw_reason": str | None,
             }
     """
+    tf_ctx = _normalize_timeframe(ctx.get("timeframe"), default="5m")
+    tf_sig = _normalize_timeframe(signal.get("timeframe") or signal.get("tf"), default=tf_ctx)
+
     row = {
         "ts_ms": _now_ms(),
         "strategy": strat_id,
@@ -85,7 +110,7 @@ def log_policy_decision(
             "account_label": ctx.get("account_label"),
             "sub_uid": ctx.get("sub_uid"),
             "symbol": ctx.get("symbol"),
-            "timeframe": ctx.get("timeframe"),
+            "timeframe": tf_ctx,
             "side": ctx.get("side"),
             "mode": ctx.get("mode"),
         },
@@ -109,7 +134,7 @@ def log_policy_decision(
         # Optional: minimal signal info for later debugging
         "signal_meta": {
             "symbol": signal.get("symbol"),
-            "timeframe": signal.get("timeframe") or signal.get("tf"),
+            "timeframe": tf_sig,
             "setup_type": signal.get("setup_type"),
         },
     }

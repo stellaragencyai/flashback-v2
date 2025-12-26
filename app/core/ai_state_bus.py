@@ -34,14 +34,16 @@ PATCH (2025-12-14)
 ------------------
 - If include_trades=False, DO NOT enforce trades_bus staleness.
   Otherwise AI Pilot gets blocked even though it doesn't request trades.
+
+PATCH (2025-12-19)
+------------------
+- Harden account snapshot: do NOT crash if Bybit private endpoints 403.
+  Adds account.fetch_ok + account.fetch_errors for later Phase 7 fail-closed gating.
 """
 
 from __future__ import annotations
 
 import os
-
-# Mirror of flashback_common.EXEC_DRY_RUN (avoid import coupling)
-EXEC_DRY_RUN: bool = os.getenv("EXEC_DRY_RUN", "false").strip().lower() in ("1","true","yes","y","on")
 import time
 from decimal import Decimal
 from typing import Any, Dict, List, Optional, Tuple
@@ -114,9 +116,30 @@ def _account_state() -> Dict[str, Any]:
     """
     Return core account state (REST-driven, WS-agnostic).
     All numeric fields are stringified so downstream JSON is stable.
+
+    IMPORTANT:
+    - Must never raise (Bybit can 403; paper should still run).
     """
-    eq = get_equity_usdt()
-    mmr = get_mmr_pct()
+    fetch_errors: List[str] = []
+    fetch_ok = True
+
+    eq = Decimal("0")
+    mmr = Decimal("0")
+
+    try:
+        eq = get_equity_usdt()
+    except Exception as e:
+        fetch_ok = False
+        fetch_errors.append(f"equity_error:{type(e).__name__}:{e}")
+        eq = Decimal("0")
+
+    try:
+        mmr = get_mmr_pct()
+    except Exception as e:
+        fetch_ok = False
+        fetch_errors.append(f"mmr_error:{type(e).__name__}:{e}")
+        mmr = Decimal("0")
+
     tier, level = tier_from_equity(eq)
     cap_pct = cap_pct_for_tier(tier)
     max_conc = max_conc_for_tier(tier)
@@ -128,6 +151,9 @@ def _account_state() -> Dict[str, Any]:
         "level": level,
         "tier_size_cap_pct": str(cap_pct),
         "tier_max_conc": max_conc,
+        # NEW: surfaced status for Phase 7 fail-closed gating
+        "fetch_ok": bool(fetch_ok),
+        "fetch_errors": fetch_errors,
     }
 
 
@@ -282,10 +308,6 @@ def _evaluate_snapshot_safety(
     reasons: List[str] = []
     is_safe = True
 
-    # DRY_RUN: positions may be empty; do not fail safety on positions freshness
-    if EXEC_DRY_RUN:
-        positions_bus_age_sec = None
-
     if positions_bus_age_sec is not None and positions_bus_age_sec > _POS_MAX_AGE_SEC:
         is_safe = False
         reasons.append(
@@ -390,12 +412,6 @@ def build_symbol_state(
     ob_age_sec, tr_age_sec = _market_bus_ages()
     if not include_trades:
         tr_age_sec = None
-    if not include_orderbook:
-        ob_age_sec = None
-
-    # DRY_RUN: positions freshness must not gate safety
-    if EXEC_DRY_RUN:
-        pos_age_sec = None
 
     freshness = {
         "positions_bus_age_sec": pos_age_sec,
@@ -452,8 +468,6 @@ def build_ai_snapshot(
     ob_age_sec, tr_age_sec = _market_bus_ages()
     if not include_trades:
         tr_age_sec = None
-    if not include_orderbook:
-        ob_age_sec = None
 
     # Determine which symbols to include in market view
     symbols_set = set()
@@ -474,10 +488,6 @@ def build_ai_snapshot(
             include_trades=include_trades,
             trades_limit=trades_limit,
         )
-
-    # DRY_RUN: positions freshness must not gate safety
-    if EXEC_DRY_RUN:
-        pos_age_sec = None
 
     freshness = {
         "positions_bus_age_sec": pos_age_sec,

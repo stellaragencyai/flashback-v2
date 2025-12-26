@@ -23,25 +23,6 @@ import hashlib
 import json
 import sqlite3
 import time
-
-def _debug_bad_row_once(raw):
-    try:
-        if globals().get('_FB_BADROW_PRINTED', False):
-            return
-        globals()['_FB_BADROW_PRINTED'] = True
-        if isinstance(raw, dict):
-            import json
-            et = str(raw.get('event_type') or '')
-            tid = str(raw.get('trade_id') or '')
-            preview = json.dumps(raw)[:500]
-        else:
-            et = ''
-            tid = ''
-            preview = str(raw)[:500]
-        print('BAD_ROW_DEBUG:', {'event_type': et, 'trade_id': tid, 'preview': preview})
-    except Exception:
-        pass
-
 from pathlib import Path
 from typing import Any, Dict, Optional, Tuple
 
@@ -199,7 +180,9 @@ def _memory_id_from(
 # ----------------------------- INDEX BUILD ---------------------------------
 
 
-def _load_setups_index(paths: ContractPaths, *, max_lines: Optional[int] = None) -> Tuple[Dict[str, Dict[str, Any]], int, int]:
+def _load_setups_index(
+    paths: ContractPaths, *, max_lines: Optional[int] = None
+) -> Tuple[Dict[str, Dict[str, Any]], int, int]:
     idx: Dict[str, Dict[str, Any]] = {}
     ok_n = 0
     bad_n = 0
@@ -221,7 +204,9 @@ def _load_setups_index(paths: ContractPaths, *, max_lines: Optional[int] = None)
     return idx, ok_n, bad_n
 
 
-def _load_decisions_map(paths: ContractPaths, *, max_lines: Optional[int] = None) -> Tuple[Dict[str, Dict[str, Any]], int, int]:
+def _load_decisions_map(
+    paths: ContractPaths, *, max_lines: Optional[int] = None
+) -> Tuple[Dict[str, Dict[str, Any]], int, int]:
     out: Dict[str, Dict[str, Any]] = {}
     ok_n = 0
     bad_n = 0
@@ -258,30 +243,16 @@ def _try_enrich_outcome_record(raw: Dict[str, Any], setups_idx: Dict[str, Dict[s
     if not isinstance(setup, dict):
         return None
 
-    # outcome_record legacy rows may store data under "payload" instead of "outcome"
-    outcome: Dict[str, Any]
-    if isinstance(raw.get("outcome"), dict):
-        outcome = raw.get("outcome") or {}
-    elif isinstance(raw.get("payload"), dict):
-        outcome = {"payload": raw.get("payload")}
-    else:
-        outcome = {}
-    # Build an enriched-like envelope (schema-tolerant)
+    outcome = raw.get("outcome") if isinstance(raw.get("outcome"), dict) else {}
     enriched: Dict[str, Any] = {
         "event_type": "outcome_enriched",
         "trade_id": tid,
         "ts": raw.get("ts", setup.get("ts")),
-        "ts_ms": (raw.get("ts_ms") or raw.get("ts") or setup.get("ts_ms") or setup.get("ts")),
+        "ts_ms": raw.get("ts_ms"),
         "account_label": raw.get("account_label", setup.get("account_label")),
         "ai_profile": raw.get("ai_profile", setup.get("ai_profile")),
         "symbol": raw.get("symbol", setup.get("symbol")),
-        "timeframe": (
-            raw.get("timeframe")
-            or setup.get("timeframe")
-            or (raw.get("payload") if isinstance(raw.get("payload"), dict) else {}).get("timeframe")
-            or (setup.get("payload") if isinstance(setup.get("payload"), dict) else {}).get("timeframe")
-            or "unknown"
-        ),
+        "timeframe": raw.get("timeframe", setup.get("timeframe")),
         "strategy": raw.get("strategy", setup.get("strategy")),
         "setup_type": raw.get("setup_type", setup.get("setup_type")),
         "policy": raw.get("policy", setup.get("policy")),
@@ -480,7 +451,6 @@ def build_memory_entries(
     """
     t0 = time.time()
 
-    # Make derived paths consistent with args
     local_paths = ContractPaths(
         setups_path=paths.setups_path,
         outcomes_path=paths.outcomes_path,
@@ -504,28 +474,10 @@ def build_memory_entries(
             conn = _connect(local_paths.memory_index_path)
             _init_db(conn)
 
-    # In ingest mode: auto since_ts_ms from DB max(ts_ms) + 1 if not provided
     if mode.lower() != "rebuild":
         if since_ts_ms is None:
             latest = _get_latest_ts_ms(conn)
             since_ts_ms = (latest + 1) if latest is not None else None
-
-    # ✅ Phase 5 backfill mode (one-time history build)
-    # If AI_MEMORY_BACKFILL=true, do NOT skip historical outcomes by ts_ms.
-    # Optional cap: AI_MEMORY_BACKFILL_MAX_OUTCOMES (only applied when max_outcome_lines is not provided)
-    try:
-        backfill = os.getenv("AI_MEMORY_BACKFILL", "false").strip().lower() in ("1","true","yes","y","on")
-    except Exception:
-        backfill = False
-
-    if mode.lower() != "rebuild" and backfill:
-        since_ts_ms = None
-        try:
-            cap = int(os.getenv("AI_MEMORY_BACKFILL_MAX_OUTCOMES", "0").strip() or "0")
-        except Exception:
-            cap = 0
-        if (max_outcome_lines is None) and cap > 0:
-            max_outcome_lines = cap
 
     processed = 0
     inserted = 0
@@ -538,7 +490,6 @@ def build_memory_entries(
     for raw in iter_jsonl(local_paths.outcomes_path, max_lines=max_outcome_lines):
         processed += 1
 
-        # Filter by time (ingest only)
         ts_ms = get_ts_ms(raw)
         if mode.lower() != "rebuild" and since_ts_ms is not None and ts_ms < int(since_ts_ms):
             skipped_old += 1
@@ -556,7 +507,6 @@ def build_memory_entries(
                 enriched_from_setup += 1
 
         if enriched is None:
-            _debug_bad_row_once(raw)
             bad_rows += 1
             continue
 
@@ -582,8 +532,8 @@ def build_memory_entries(
         if after == before:
             skipped_existing += 1
         else:
-            inserted += 1
             append_jsonl(local_paths.memory_entries_path, entry)
+            inserted += 1
 
         if (inserted + skipped_existing) % 250 == 0:
             conn.commit()
@@ -594,7 +544,6 @@ def build_memory_entries(
     elapsed = round(time.time() - t0, 3)
 
     return {
-        # Tool-friendly keys (legacy expectations)
         "processed_outcome_rows": processed,
         "inserted": inserted,
         "skipped_existing": skipped_existing,
@@ -604,7 +553,6 @@ def build_memory_entries(
         "decision_index_ok": decision_ok,
         "decision_index_bad": decision_bad,
         "elapsed_sec": elapsed,
-        # Extra useful debug
         "mode": mode.lower(),
         "since_ts_ms": since_ts_ms,
         "outcomes_skipped_old": skipped_old,
@@ -634,9 +582,7 @@ def main() -> None:
     out_jsonl = paths.memory_entries_path
     db_path = paths.memory_index_path
 
-    mode = "ingest"
-    if args.rebuild:
-        mode = "rebuild"
+    mode = "rebuild" if args.rebuild else "ingest"
 
     max_dec = args.max_decisions if args.max_decisions and args.max_decisions > 0 else None
     max_out = args.max_outcomes if args.max_outcomes and args.max_outcomes > 0 else None

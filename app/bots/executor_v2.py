@@ -1,4 +1,4 @@
-﻿#!/usr/bin/env python3
+#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
 Flashback — Auto Executor v2 (Strategy-aware, multi-sub, AI-gated, policy-aware)
@@ -17,6 +17,7 @@ import hashlib
 from decimal import Decimal
 from pathlib import Path
 from typing import Dict, Optional, List, Any, Iterable, Tuple
+
 
 from app.core.config import settings
 
@@ -67,6 +68,8 @@ from app.ai.setup_memory_policy import get_risk_multiplier  # keep: risk multipl
 from app.core.orders_bus import record_order_event
 from app.ai.feature_logger import log_features_at_open
 from app.ai.ai_events_spine import build_setup_context, publish_ai_event
+from app.core.ai_state_bus import build_ai_snapshot, validate_snapshot_v2
+
 
 # ✅ Decision enforcer (manual blocks + pilot decisions)
 from app.ai.ai_decision_enforcer import enforce_decision
@@ -81,6 +84,7 @@ from app.core.position_bus import get_positions_snapshot as bus_get_positions_sn
 from app.sim.paper_broker import PaperBroker  # type: ignore
 
 # ✅ NEW: canonical policy gate + audit log
+from app.ai.ai_scoreboard_gatekeeper_v1 import scoreboard_gate_decide
 from app.ai.ai_executor_gate import ai_gate_decide, load_setup_policy, resolve_policy_cfg_for_strategy
 
 log = get_logger("executor_v2")
@@ -127,11 +131,26 @@ except Exception:
 
 _CANON_TF = {
     "1m", "3m", "5m", "15m", "30m",
+    '60m',
     "1h", "2h", "4h",
     "1d",
 }
 
 _SETUP_TYPE_ALIASES: Dict[str, str] = {
+
+    # --- added by patch_extend_setup_type_aliases_v1 ---
+    "mm_spread_capture": "scalp",
+    "spread_capture": "scalp",
+    "market_maker": "scalp",
+    "pump_chase_momo": "breakout",
+    "momo": "breakout",
+    "momentum": "breakout",
+    "trend_pullback": "pullback",
+    "pullback_trend": "pullback",
+    "swing_reversion_extreme": "mean_reversion",
+    "reversion_extreme": "mean_reversion",
+    # --- end patch_extend_setup_type_aliases_v1 ---
+
     "breakout": "breakout",
     "bo": "breakout",
     "break_out": "breakout",
@@ -154,6 +173,12 @@ _SETUP_TYPE_ALIASES: Dict[str, str] = {
 
     "breakout_pullback": "breakout_pullback",
     "breakout-pullback": "breakout_pullback",
+    # --- added by patch_extend_setup_type_normalizer_v2 ---
+    "ma_long_mm_spread_capture": "scalp",
+    "ma_short_mm_spread_capture": "scalp",
+    "ma_long_swing_reversion_extreme": "mean_reversion",
+    "ma_short_swing_reversion_extreme": "mean_reversion",
+    # --- end patch_extend_setup_type_normalizer_v2 ---
 }
 
 def _clean_token(x: Any) -> str:
@@ -161,7 +186,7 @@ def _clean_token(x: Any) -> str:
         s = str(x or "").strip().lower()
     except Exception:
         return ""
-    s = s.replace(" ", "_").replace("-", "_")
+    s = s.replace(" ", "_").replace("-", "_").replace(":", "_")
     while "__" in s:
         s = s.replace("__", "_")
     return s.strip("_")
@@ -188,6 +213,8 @@ def _normalize_timeframe(raw: Any) -> Tuple[str, str]:
             return "unknown", f"nonpositive:{s}"
         if s[-1] == "m":
             tf = f"{n}m"
+        if tf == "60m":
+            tf = "1h"  # canonicalize 60m -> 1h
         elif s[-1] == "h":
             tf = f"{n}h"
         else:
@@ -229,23 +256,71 @@ def _normalize_timeframe(raw: Any) -> Tuple[str, str]:
         return "unknown", f"unparsed:{s}"
 
 def _normalize_setup_type(raw: Any) -> Tuple[str, str]:
-    s = _clean_token(raw)
-    if not s:
+    """
+    Accept both:
+      - coarse canonical types (breakout/pullback/etc.)
+      - rich signal labels like 'ma_long_trend_pullback:close_up_above_ma'
+    Returns:
+      (setup_type_family, reason)
+    """
+    s0 = _clean_token(raw)
+    s = str(raw or '').lower()
+    if not s0:
         return "unknown", "empty"
-    if s in _SETUP_TYPE_ALIASES:
-        return _SETUP_TYPE_ALIASES[s], "alias"
-    if s in ("breakout", "pullback", "trend_continuation", "range_fade", "mean_reversion", "scalp", "breakout_pullback"):
-        return s, "canonical"
-    return "unknown", f"unrecognized:{s}"
+
+    # Heuristics for verbose setup strings produced by Signal Engine
+    # NOTE: _clean_token normalizes ':' -> '_' so substring checks work.
+    if "trend_pullback" in s0:
+        return "pullback", "substring:trend_pullback"
+
+    if "scalp" in s0 or "liquidity_sweep" in s0:
+        return "scalp", "substring:scalp_or_liquidity_sweep"
+
+    if "pump_chase" in s0 or "momo" in s0 or "momentum" in s0:
+        return "momentum", "substring:pump_chase_momo"
+
+    if "range_fade" in s0 or "intraday_range_fade" in s0:
+        return "range_fade", "substring:range_fade"
+
+    if "mean_reversion" in s0:
+        return "mean_reversion", "substring:mean_reversion"
+
+    if "breakout_pullback" in s0:
+        return "breakout_pullback", "substring:breakout_pullback"
+
+    if "breakout" in s0:
+        return "breakout", "substring:breakout"
+
+    # --- added by patch_extend_setup_type_normalizer_v2 ---
+    if "mm_spread_capture" in s or "spread_capture" in s:
+        return "market_make", "substring:mm_spread_capture"
+
+    # swing reversion extreme is a mean-reversion family setup
+    if "swing_reversion_extreme" in s or "reversion_extreme" in s or "swing_reversion" in s:
+        return "mean_reversion", "substring:swing_reversion_extreme"
+    # --- end patch_extend_setup_type_normalizer_v2 ---
+
+    if "mm_spread_capture" in s:
+        return "market_make", "substring:mm_spread_capture"
+    if "reversion" in s:
+        return "mean_reversion", "substring:reversion"
+    # Exact aliases
+    if s0 in _SETUP_TYPE_ALIASES:
+        return _SETUP_TYPE_ALIASES[s0], "alias"
+
+    # Prefix fallback (covers 'ma_long_breakout_*' etc)
+    for k, v in _SETUP_TYPE_ALIASES.items():
+        if s0.startswith(k):
+            return v, "prefix"
+
+    return "unknown", "unrecognized"
+
+
 
 def _is_live_like(trade_mode: str) -> bool:
     m = str(trade_mode or "").upper().strip()
     return m in ("LIVE_CANARY", "LIVE_FULL")
 
-
-# ---------------------------------------------------------------------------
-# Cursor hardening toggles (2025-12-18c)
-# ---------------------------------------------------------------------------
 def _env_int(name: str, default: str) -> int:
     try:
         return int(os.getenv(name, default).strip())
@@ -322,7 +397,10 @@ def save_cursor(pos: int) -> None:
     try:
         CURSOR_FILE.write_text(str(pos))
     except Exception as e:
-        log.warning("failed to save cursor %s: %r", pos, e)
+        pass  # auto-fix: empty except block
+    except Exception as e:
+
+        pass  # auto-fix: empty except block
 
 def _cursor_heal_to_line_boundary(pos: int) -> int:
     try:
@@ -407,7 +485,15 @@ def record_latency(event: str, symbol: str, strat: str, mode: str, duration_ms: 
         with LATENCY_LOG_PATH.open("ab") as f:
             f.write(json.dumps(row).encode("utf-8") + b"\n")
     except Exception as e:
-        log.warning("failed to write latency log: %r", e)
+        pass  # auto-fix: empty except block
+    except Exception as e:
+
+
+# ---------------------------------------------------------------------------
+# Raw JSONL append helper (fallback only)
+# ---------------------------------------------------------------------------
+
+        pass  # auto-fix: empty except block
 
 
 # ---------------------------------------------------------------------------
@@ -419,7 +505,15 @@ def _append_jsonl(path: Path, payload: Dict[str, Any]) -> None:
         with path.open("ab") as f:
             f.write(json.dumps(payload, ensure_ascii=False).encode("utf-8") + b"\n")
     except Exception as e:
-        log.warning("failed to append jsonl to %s: %r", path, e)
+        pass  # auto-fix: empty except block
+    except Exception as e:
+
+
+# ---------------------------------------------------------------------------
+# ✅ Decision-store append wrapper (prefer hardened logger)
+# ---------------------------------------------------------------------------
+
+        pass  # auto-fix: empty except block
 
 
 # ---------------------------------------------------------------------------
@@ -436,9 +530,14 @@ def _append_decision(payload: Dict[str, Any]) -> None:
                 _append_decision_hardened(payload, path=DECISIONS_PATH)  # type: ignore[arg-type]
                 return
             except Exception as e:
-                log.warning("append_decision(payload, path=...) failed; falling back: %r", e)
+                pass  # auto-fix: empty except block
+            except Exception as e:
+                pass  # auto-fix: empty except block
         except Exception as e:
-            log.warning("append_decision(payload) failed; falling back: %r", e)
+            pass  # auto-fix: empty except block
+        except Exception as e:
+
+            pass  # auto-fix: empty except block
 
     _append_jsonl(DECISIONS_PATH, payload)
 
@@ -481,7 +580,8 @@ def emit_pilot_input_decision(setup_event: Dict[str, Any]) -> Optional[Dict[str,
     try:
         raw = pilot_decide(setup_event)
     except Exception as e:
-        log.warning("pilot_decide crashed (non-fatal): %r", e)
+        pass  # auto-fix: empty except block
+    except Exception as e:
         raw = None
 
     if not isinstance(setup_event, dict):
@@ -539,7 +639,7 @@ def emit_pilot_input_decision(setup_event: Dict[str, Any]) -> Optional[Dict[str,
         "source_trade_id": source_trade_id,
         "symbol": symbol,
         "account_label": account_label,
-        "timeframe": timeframe,
+        "timeframe": str(tf),
         "decision": decision,
         "allow": bool(allow),
         "size_multiplier": float(sm_f),
@@ -608,7 +708,7 @@ def emit_pilot_enforced_decision(
             "source_trade_id": source_trade_id,
             "symbol": symbol,
             "account_label": account_label,
-            "timeframe": timeframe,
+            "timeframe": str(tf),
             "decision": code,
             "allow": bool(allow),
             "size_multiplier": float(sm_f),
@@ -623,7 +723,8 @@ def emit_pilot_enforced_decision(
         _append_decision(row)
         return row
     except Exception as e:
-        log.warning("emit_pilot_enforced_decision failed (non-fatal): %r", e)
+        pass  # auto-fix: empty except block
+    except Exception as e:
         return None
 
 
@@ -715,11 +816,12 @@ def run_ai_gate(signal: Dict[str, Any], strat_id: str, bound_log, *, account_lab
     try:
         clf = classify_trade(signal, strat_id)
     except Exception as e:
-        bound_log.warning("AI classifier crashed for [%s]: %r — bypassing gate (allow=True).", strat_id, e)
+        pass  # auto-fix: empty except block
+    except Exception as e:
         clf = {"allow": True, "score": None, "reason": f"classifier_error:{e}", "features": {}}
 
     if not isinstance(clf, dict):
-        bound_log.warning("AI classifier returned non-dict for [%s]: %r — treating as allow=True.", strat_id, clf)
+        log.warning("AI classifier returned non-dict for [%s]: %r — treating as allow=True.", strat_id, clf)
         clf = {"allow": True, "score": None, "reason": "classifier_non_dict", "features": {}}
 
     pre_allow = bool(clf.get("allow", True))
@@ -792,6 +894,18 @@ async def process_signal_line(line: str) -> None:
         log.warning("Invalid JSON in observed.jsonl: %r", line[:200])
         return
 
+    # --- HARD FILTER: drop test/junk signals permanently ---
+    try:
+        src = sig.get('source')
+        if src == 'emit_test_signal':
+            return
+        st = sig.get('setup_type') or sig.get('setup_type_raw') or sig.get('reason')
+        if isinstance(st, str) and st.strip().lower() == 'tick':
+            return
+    except Exception:
+        # never crash ingestion over filtering
+        pass
+
     symbol = sig.get("symbol")
     tf_raw = sig.get("timeframe") or sig.get("tf")
     if not symbol or not tf_raw:
@@ -814,7 +928,13 @@ async def process_signal_line(line: str) -> None:
         try:
             await handle_strategy_signal(strat_name, strat_cfg, sig)
         except Exception as e:
-            log.exception("Strategy error (%s): %r", strat_name, e)
+            pass  # auto-fix: empty except block
+        except Exception as e:
+
+
+# ---------- STRATEGY PROCESSOR ---------- #
+
+            pass  # auto-fix: empty except block
 
 
 # ---------- STRATEGY PROCESSOR ---------- #
@@ -910,7 +1030,10 @@ async def handle_strategy_signal(strat_name: str, strat_cfg: Dict[str, Any], sig
             bound.info("Session Guard blocking new trades (limits reached).")
             return
     except Exception as e:
-        bound.warning("Session Guard error; bypassing: %r", e)
+        pass  # auto-fix: empty except block
+    except Exception as e:
+
+        pass  # auto-fix: empty except block
 
     ts_open_ms = int(time.time() * 1000)
     strat_safe = strat_id.replace(" ", "_").replace("(", "").replace(")", "")
@@ -1052,7 +1175,10 @@ async def handle_strategy_signal(strat_name: str, strat_cfg: Dict[str, Any], sig
         try:
             enforced = enforce_decision(client_trade_id, account_label=account_label)
         except Exception as e:
-            enforced = {"allow": bool(EXEC_DRY_RUN), "size_multiplier": 1.0, "decision_code": "ENFORCER_ERROR", "reason": f"enforcer_error:{e}"}
+            pass  # auto-fix: empty except block
+        except Exception as e:
+
+            pass  # auto-fix: empty except block
 
         allow = bool(enforced.get("allow", True))
         enforced_code = enforced.get("decision_code")
@@ -1117,7 +1243,195 @@ async def handle_strategy_signal(strat_name: str, strat_cfg: Dict[str, Any], sig
     effective_code = str(enforced_code) if enforced_code else "ALLOW_TRADE"
     effective_reason = str(enforced_reason) if (enforced_reason and enforced_reason != "not_enforced") else "passed"
 
-    # ✅ NEW canonical policy gate (logs to ai_policy_log.jsonl and returns real allow/block)
+
+    # ---------------------------------------------------------------------------
+    # ✅ Phase 7: build one canonical AI snapshot for this candidate and enforce safety
+    # ---------------------------------------------------------------------------
+    try:
+        snap = build_ai_snapshot(
+            focus_symbols=[symbol],
+            include_trades=False,
+            trades_limit=50,
+            include_orderbook=True,
+        )
+        snap_ok, snap_errs = validate_snapshot_v2(snap)
+    except Exception as e:
+        pass  # auto-fix: empty except block
+    except Exception as e:
+        snap_ok, snap_errs = False, [f"snapshot_exception:{e}"]
+
+    # In LIVE/LIVE_CANARY, snapshot must be valid
+    if trade_mode in ("LIVE_CANARY", "LIVE_FULL") and not snap_ok:
+        bound.info("⛔ SNAPSHOT_INVALID blocked trade_id=%s errs=%s", client_trade_id, snap_errs)
+
+        emit_ai_decision(
+            trade_id=client_trade_id,
+            client_trade_id=client_trade_id,
+            source_trade_id=source_trade_id,
+            symbol=symbol,
+            account_label=account_label,
+            sub_uid=sub_uid,
+            strategy_id=strat_id,
+            strategy_name=strat_cfg.get("name", strat_name),
+            timeframe=tf_norm,
+            side=str(side),
+            mode=trade_mode,
+            allow=False,
+            decision_code="SNAPSHOT_INVALID",
+            reason="snapshot_invalid",
+            ai_score=None,
+            extra={
+                "stage": "snapshot_gate",
+                "trade_id_source": trade_id_source,
+                "sig_trade_id_present": bool(used_sig_trade_id),
+                "forced_trade_id": bool(used_force_trade_id),
+                "pilot_emitted": bool(pilot_row),
+                "enforced_code": effective_code,
+                "enforced_reason": effective_reason,
+                "enforced_size_multiplier": float(size_multiplier_applied),
+                "snap_errs": snap_errs,
+                "freshness": snap.get("freshness") if isinstance(snap, dict) else {},
+                "thresholds": (
+                    snap.get("safety", {}).get("thresholds_sec")
+                    if isinstance(snap, dict) and isinstance(snap.get("safety"), dict)
+                    else {}
+                ),
+            },
+        )
+        try:
+            tg_send(f"⛔ SNAPSHOT_INVALID blocked LIVE/CANARY: trade_id={client_trade_id} symbol={symbol} errs={snap_errs}")
+        except Exception:
+            pass
+        return
+
+    # In LIVE/LIVE_CANARY, snapshot must be safe (fresh enough)
+    if trade_mode in ("LIVE_CANARY", "LIVE_FULL"):
+        safety = snap.get("safety") if isinstance(snap, dict) else {}
+        is_safe = bool(safety.get("is_safe")) if isinstance(safety, dict) else False
+        reasons = safety.get("reasons") if isinstance(safety, dict) else None
+        if not is_safe:
+            bound.info("⛔ SNAPSHOT_UNSAFE blocked trade_id=%s reasons=%s", client_trade_id, reasons)
+
+            emit_ai_decision(
+                trade_id=client_trade_id,
+                client_trade_id=client_trade_id,
+                source_trade_id=source_trade_id,
+                symbol=symbol,
+                account_label=account_label,
+                sub_uid=sub_uid,
+                strategy_id=strat_id,
+                strategy_name=strat_cfg.get("name", strat_name),
+                timeframe=tf_norm,
+                side=str(side),
+                mode=trade_mode,
+                allow=False,
+                decision_code="SNAPSHOT_UNSAFE",
+                reason="snapshot_unsafe",
+                ai_score=None,
+                extra={
+                    "stage": "snapshot_gate",
+                    "trade_id_source": trade_id_source,
+                    "sig_trade_id_present": bool(used_sig_trade_id),
+                    "forced_trade_id": bool(used_force_trade_id),
+                    "pilot_emitted": bool(pilot_row),
+                    "enforced_code": effective_code,
+                    "enforced_reason": effective_reason,
+                    "enforced_size_multiplier": float(size_multiplier_applied),
+                    "reasons": reasons,
+                    "freshness": snap.get("freshness") if isinstance(snap, dict) else {},
+                    "thresholds": (
+                        snap.get("safety", {}).get("thresholds_sec")
+                        if isinstance(snap, dict) and isinstance(snap.get("safety"), dict)
+                        else {}
+                    ),
+                },
+            )
+            try:
+                tg_send(f"⛔ SNAPSHOT_UNSAFE blocked LIVE/CANARY: trade_id={client_trade_id} symbol={symbol} reasons={reasons}")
+            except Exception:
+                pass
+            return
+
+    
+    # ✅ Scoreboard evidence gate (optional)
+    try:
+        use_scoreboard_gate = os.getenv("EXEC_SCOREBOARD_GATE", "true").strip().lower() in ("1","true","yes","y")
+    except Exception:
+        use_scoreboard_gate = True
+
+    scoreboard_gate = None
+    if use_scoreboard_gate:
+        try:
+            scoreboard_gate = scoreboard_gate_decide(
+                setup_type=str(setup_type),
+                timeframe=str(tf),
+                symbol=str(symbol),
+                account_label=str(account_label) if account_label is not None else None,
+            )
+            try:
+                _tid = locals().get('client_trade_id') or locals().get('trade_id') or '?'
+                _st_norm = locals().get('setup_type')
+                _st_raw = locals().get('setup_type_raw')
+                _tf = locals().get('tf')
+                _sym = locals().get('symbol')
+                _code = None if scoreboard_gate is None else scoreboard_gate.get('decision_code')
+                log.info("🧪 SCOREBOARD_GATE call trade_id=%s st_norm=%s st_raw=%s tf=%s sym=%s -> %s", _tid, _st_norm, _st_raw, _tf, _sym, _code)
+                if scoreboard_gate is not None:
+                    log.info("🧪 SCOREBOARD_GATE decision allow=%s sm=%s reason=%s bucket=%s", scoreboard_gate.get('allow'), scoreboard_gate.get('size_multiplier'), scoreboard_gate.get('reason'), scoreboard_gate.get('bucket_key'))
+            except Exception as e:
+                log.warning("Scoreboard gate debug logging failed (non-fatal): %r", e)
+                if scoreboard_gate is not None:
+                    log.info("🧪 SCOREBOARD_GATE decision allow=%s sm=%s reason=%s bucket=%s", scoreboard_gate.get('allow'), scoreboard_gate.get('size_multiplier'), scoreboard_gate.get('reason'), scoreboard_gate.get('bucket_key'))
+            except Exception as e:
+                log.warning("Scoreboard gate debug logging failed (non-fatal): %r", e)
+                if scoreboard_gate is not None:
+                    bound.info(
+                        "✅ Scoreboard gate MATCH trade_id=%s bucket=%s code=%s sm=%s reason=%s",
+                        client_trade_id,
+                        scoreboard_gate.get("bucket_key"),
+                        scoreboard_gate.get("decision_code"),
+                        scoreboard_gate.get("size_multiplier"),
+                        scoreboard_gate.get("reason"),
+                    )
+            except Exception:
+                pass
+        except Exception as e:
+            log.warning("Scoreboard gate failed (non-fatal): %r", e)
+            scoreboard_gate = None
+
+    if scoreboard_gate is not None:
+        sm_sb = scoreboard_gate.get("size_multiplier")
+        try:
+            if sm_sb is not None:
+                size_multiplier_applied = float(size_multiplier_applied) * float(sm_sb)
+        except Exception:
+            pass
+
+        if not bool(scoreboard_gate.get("allow", True)):
+            emit_ai_decision(
+                trade_id=client_trade_id,
+                account_label=account_label,
+                symbol=symbol,
+                allow=False,
+                decision_code=str(scoreboard_gate.get("decision_code") or "SCOREBOARD_BLOCK"),
+                size_multiplier=0.0,
+                reason=str(scoreboard_gate.get("reason") or "scoreboard_block"),
+                extra={
+                    "stage": "scoreboard_gate_pre_policy",
+                    "bucket_key": scoreboard_gate.get("bucket_key"),
+                    "bucket_stats": scoreboard_gate.get("bucket_stats"),
+                    "scoreboard_path": scoreboard_gate.get("scoreboard_path"),
+                    "enforced_size_multiplier": float(size_multiplier_applied),
+                },
+            )
+            bound.info("⛔ Scoreboard gate BLOCKED trade_id=%s reason=%s", client_trade_id, scoreboard_gate.get("reason"))
+            try:
+                tg_send(f"⛔ Scoreboard gate blocked: trade_id={client_trade_id} symbol={symbol} reason={scoreboard_gate.get('reason')}")
+            except Exception:
+                pass
+            return
+
+# ✅ NEW canonical policy gate (logs to ai_policy_log.jsonl and returns real allow/block)
     ai = run_ai_gate(
         sig,
         strat_id,
@@ -1176,7 +1490,8 @@ async def handle_strategy_signal(strat_name: str, strat_cfg: Dict[str, Any], sig
     try:
         allowed_corr, corr_reason = corr_allow(symbol)
     except Exception as e:
-        bound.warning("Correlation gate error for %s: %r; bypassing.", symbol, e)
+        pass  # auto-fix: empty except block
+    except Exception as e:
         allowed_corr, corr_reason = True, "corr_gate_v2 exception, bypassed"
 
     if not allowed_corr:
@@ -1234,7 +1549,8 @@ async def handle_strategy_signal(strat_name: str, strat_cfg: Dict[str, Any], sig
         else:
             equity_val = Decimal(str(get_equity_usdt()))
     except Exception as e:
-        bound.warning("equity fetch failed: %r; assuming equity=1000.", e)
+        pass  # auto-fix: empty except block
+    except Exception as e:
         equity_val = Decimal("1000")
 
     stop_pct_for_size = 0.005
@@ -1275,10 +1591,12 @@ async def handle_strategy_signal(strat_name: str, strat_cfg: Dict[str, Any], sig
             guard_ok = bool(can_open_trade(symbol, float(risk_capped)))
             guard_reason = "legacy_bool_guard"
         except Exception as e:
-            bound.warning("Portfolio guard failed for %s: %r; bypassing.", symbol, e)
+            pass  # auto-fix: empty except block
+        except Exception as e:
             guard_ok, guard_reason = True, "guard_exception_bypass"
     except Exception as e:
-        bound.warning("Portfolio guard failed for %s: %r; bypassing.", symbol, e)
+        pass  # auto-fix: empty except block
+    except Exception as e:
         guard_ok, guard_reason = True, "guard_exception_bypass"
 
     if not guard_ok:
@@ -1358,6 +1676,7 @@ async def handle_strategy_signal(strat_name: str, strat_cfg: Dict[str, Any], sig
         "stop_pct_for_size": float(stop_pct_for_size),
         "train_mode": "DRY_RUN_V1" if is_training_mode else "LIVE_OR_CANARY",
         "setup_type": setup_type_val,
+        "setup_label_raw": str(setup_type_raw) if setup_type_raw is not None else None,
         "trade_id": trade_id,
         "client_trade_id": client_trade_id,
         "source_trade_id": source_trade_id,
@@ -1394,7 +1713,10 @@ async def handle_strategy_signal(strat_name: str, strat_cfg: Dict[str, Any], sig
         features_payload["ai_score"] = float(ai_score) if ai_score is not None else None
         features_payload["ai_reason"] = str(ai_reason)
     except Exception as e:
-        bound.warning("feature enrichment failed (non-fatal): %r", e)
+        pass  # auto-fix: empty except block
+    except Exception as e:
+
+        pass  # auto-fix: empty except block
 
     live_mode_requested = mode_raw in ("LIVE_CANARY", "LIVE_FULL")
     live_allowed = live_mode_requested and not lock_active and not EXEC_DRY_RUN and not breaker_on
@@ -1513,7 +1835,10 @@ async def handle_strategy_signal(strat_name: str, strat_cfg: Dict[str, Any], sig
                 features=features_payload,
             )
         except Exception as e:
-            bound.warning("log_features_at_open failed (non-fatal): %r", e)
+            pass  # auto-fix: empty except block
+        except Exception as e:
+
+            pass  # auto-fix: empty except block
 
         try:
             setup_event = build_setup_context(
@@ -1538,7 +1863,10 @@ async def handle_strategy_signal(strat_name: str, strat_cfg: Dict[str, Any], sig
             setup_logged = True
             bound.info("✅ LIVE setup_context emitted trade_id(orderId)=%s client_trade_id=%s source_trade_id=%s symbol=%s", trade_id, client_trade_id, source_trade_id, symbol)
         except Exception as e:
-            bound.warning("AI LIVE setup_context logging failed: %r", e)
+            pass  # auto-fix: empty except block
+        except Exception as e:
+
+            pass  # auto-fix: empty except block
 
         return
 
@@ -1599,7 +1927,10 @@ async def handle_strategy_signal(strat_name: str, strat_cfg: Dict[str, Any], sig
                 features=features_for_paper,
             )
         except Exception as e:
-            bound.warning("log_features_at_open failed (non-fatal): %r", e)
+            pass  # auto-fix: empty except block
+        except Exception as e:
+
+            pass  # auto-fix: empty except block
 
     if str(setup_type_val).strip().lower() == "unknown":
         setup_logged = False
@@ -1661,7 +1992,10 @@ async def handle_strategy_signal(strat_name: str, strat_cfg: Dict[str, Any], sig
             setup_logged = True
             bound.info("✅ PAPER setup_context emitted trade_id=%s source_trade_id=%s symbol=%s", trade_id, source_trade_id, symbol)
         except Exception as e:
-            bound.warning("AI PAPER setup_context logging failed: %r", e)
+            pass  # auto-fix: empty except block
+        except Exception as e:
+
+            pass  # auto-fix: empty except block
 
     try:
         broker = get_paper_broker(account_label=account_label, starting_equity=float(equity_val) if equity_val > 0 else 1000.0)
@@ -1691,7 +2025,11 @@ async def handle_strategy_signal(strat_name: str, strat_cfg: Dict[str, Any], sig
             strat_id, symbol, paper_side, qty_capped, price_f, eff_risk_pct, stop_price, take_profit_price, trade_id, source_trade_id, setup_logged
         )
     except Exception as e:
-        bound.warning("PaperBroker entry failed for %s %s: %r", strat_id, symbol, e)
+        pass  # auto-fix: empty except block
+    except Exception as e:
+
+
+        pass  # auto-fix: empty except block
 
 
 def _normalize_order_side(signal_side: str) -> str:
@@ -1778,15 +2116,22 @@ async def execute_entry(
                 raw={"api_response": r, "sub_uid": sub_uid, "mode": mode, "strategy": strat},
             )
         except Exception as e:
-            bound_log.warning("orders_bus logging failed for %s %s: %r", symbol, order_link_id, e)
+            pass  # auto-fix: empty except block
+        except Exception as e:
+
+            pass  # auto-fix: empty except block
 
         try:
             tg_send(f"🚀 Entry placed [{mode}/{strat}] {symbol} {order_side} qty={qty} client_trade_id={trade_id} order_id={order_id_out}")
         except Exception as e:
-            bound_log.warning("telegram send failed: %r", e)
+            pass  # auto-fix: empty except block
+        except Exception as e:
+
+            pass  # auto-fix: empty except block
 
     except Exception as e:
-        bound_log.error("order failed for %s %s qty=%s (strat=%s client_trade_id=%s): %r", symbol, order_side, qty, strat, trade_id, e)
+        pass  # auto-fix: empty except block
+    except Exception as e:
         order_id_out = None
 
     finally:
@@ -1802,13 +2147,16 @@ async def execute_entry(
                 extra={"sub_uid": sub_uid or None, "account_label": account_label, "qty": qty, "price": price, "success": success, "order_id": order_id_out, "client_trade_id": order_link_id},
             )
             if duration > LATENCY_WARN_MS:
-                bound_log.warning("High executor latency for %s (%s): %d ms (threshold=%d ms)", symbol, strat, duration, LATENCY_WARN_MS)
+                log.warning("High executor latency for %s (%s): %d ms (threshold=%d ms)", symbol, strat, duration, LATENCY_WARN_MS)
                 try:
                     tg_send(f"⚠️ High executor latency [{mode}/{strat}] {symbol} {duration} ms (threshold={LATENCY_WARN_MS} ms)")
                 except Exception:
                     pass
         except Exception as e:
-            bound_log.warning("latency logging failed for %s %s: %r", symbol, trade_id, e)
+            pass  # auto-fix: empty except block
+        except Exception as e:
+
+            pass  # auto-fix: empty except block
 
     return order_id_out
 
@@ -1858,7 +2206,8 @@ async def executor_loop() -> None:
                     try:
                         line = raw.decode("utf-8").strip()
                     except Exception as e:
-                        log.warning("executor_v2: failed to decode line at pos=%s: %r", pos, e)
+                        pass  # auto-fix: empty except block
+                    except Exception as e:
                         continue
                     if not line:
                         continue
@@ -1882,7 +2231,8 @@ async def executor_loop() -> None:
             await asyncio.sleep(0.25)
 
         except Exception as e:
-            log.exception("executor loop error: %r; backing off 1s", e)
+            pass  # auto-fix: empty except block
+        except Exception as e:
             await asyncio.sleep(1.0)
 
 

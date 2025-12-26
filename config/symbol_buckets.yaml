@@ -1,0 +1,20 @@
+version: 1
+buckets:
+  majors:
+    - BTCUSDT
+    - ETHUSDT
+    - SOLUSDT
+  alts:
+    - ADAUSDT
+    - ARBUSDT
+    - AVAXUSDT
+    - DOGEUSDT
+    - FARTCOINUSDT
+    - HBARUSDT
+    - INJUSDT
+    - LINKUSDT
+    - MATICUSDT
+    - NEARUSDT
+    - OPUSDT
+    - PUMPFUNUSDT
+    - XRPUSDT

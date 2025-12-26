@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+﻿#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
 Flashback — AI Action Schema
@@ -15,6 +15,7 @@ Notes
     • type
     • symbol
     • side
+    • trade_id        (canonical join key for the learning loop)
     • risk_R
     • expected_R
 
@@ -51,6 +52,9 @@ RiskMode = Literal[
 ]
 
 
+TRADE_BEARING_TYPES = {"open", "add", "reduce", "close", "close_all", "hold"}
+
+
 class AIAction(TypedDict, total=False):
     """
     Canonical AI action record.
@@ -61,6 +65,12 @@ class AIAction(TypedDict, total=False):
     ts_ms: int
     account_label: str           # e.g. "main", "flashback01"
     action_id: str               # optional unique ID for deduping
+
+    # Join keys (learning loop)
+    trade_id: str                # canonical join key for Decision -> Action -> Outcome
+    decision_id: Optional[str]   # optional if you emit it
+    client_trade_id: Optional[str]
+    source_trade_id: Optional[str]
 
     # Core decision
     type: ActionType             # open / add / reduce / close / close_all / hold / heartbeat / noop
@@ -92,9 +102,18 @@ REQUIRED_FOR_TRADE = [
     "type",
     "symbol",
     "side",
+    "trade_id",
     "risk_R",
     "expected_R",
 ]
+
+
+def is_trade_bearing(action: Dict[str, Any]) -> bool:
+    """
+    Return True if this looks like a trade-bearing action (should have join keys + risk fields).
+    """
+    atype = str(action.get("type") or "").lower()
+    return atype in TRADE_BEARING_TYPES
 
 
 def is_heartbeat(action: Dict[str, Any]) -> bool:
@@ -120,7 +139,7 @@ def missing_trade_fields(action: Dict[str, Any]) -> Dict[str, bool]:
     Return a dict of {field_name: True} for each required field missing on a
     trade-bearing action.
     """
-    missing = {}
+    missing: Dict[str, bool] = {}
     for key in REQUIRED_FOR_TRADE:
         if key not in action or action.get(key) in (None, ""):
             missing[key] = True

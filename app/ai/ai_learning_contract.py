@@ -38,6 +38,7 @@ class LearningPaths:
 
     @classmethod
     def default(cls) -> "LearningPaths":
+        # Mirror ContractPaths default style without depending on settings
         root = Path(__file__).resolve().parents[2]
         state = root / "state"
         learning_dir = state / "ai_learning"

@@ -19,6 +19,10 @@ Where:
 - account_label is pulled from action["account_label"] (or provided label)
 - type is pulled from action["type"]
 
+Integrity:
+- Any trade-bearing action missing required join/risk fields is downgraded to "noop"
+  and annotated in extra, so it cannot poison learning datasets.
+
 Controls (env):
 - AI_ACTIONS_PATH                 : override file path (default state/ai_actions.jsonl)
 - AI_ACTIONS_DEDUPE               : true/false (default true)
@@ -32,9 +36,11 @@ import os
 import time
 from collections import OrderedDict, deque
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional
 
 import orjson
+
+from app.core.ai_action_schema import is_heartbeat, is_trade_bearing, missing_trade_fields
 
 # ---------------------------------------------------------------------------
 # ROOT & path resolution
@@ -84,6 +90,23 @@ def _now_ms() -> int:
     return int(time.time() * 1000)
 
 
+def _extract_trade_id(a: Dict[str, Any]) -> str:
+    """
+    Pull trade_id from setup_context.trade_id first, then action.trade_id.
+    """
+    setup = a.get("setup_context") or {}
+    if isinstance(setup, dict):
+        tid = str(setup.get("trade_id") or "").strip()
+        if tid:
+            return tid
+        # allow aliases for debugging, but do not treat as canonical
+        alias = str(setup.get("client_trade_id") or setup.get("source_trade_id") or "").strip()
+        if alias:
+            return alias
+
+    return str(a.get("trade_id") or a.get("client_trade_id") or a.get("source_trade_id") or "").strip()
+
+
 # ---------------------------------------------------------------------------
 # Dedupe (lightweight)
 # ---------------------------------------------------------------------------
@@ -103,16 +126,8 @@ def _extract_dedupe_key(a: Dict[str, Any]) -> Optional[str]:
     """
     try:
         acct = str(a.get("account_label") or "").strip()
-        typ = str(a.get("type") or "").strip()
-
-        setup = a.get("setup_context") or {}
-        if isinstance(setup, dict):
-            tid = str(setup.get("trade_id") or setup.get("client_trade_id") or "").strip()
-        else:
-            tid = ""
-
-        if not tid:
-            tid = str(a.get("trade_id") or a.get("client_trade_id") or "").strip()
+        typ = str(a.get("type") or "").strip().lower()
+        tid = _extract_trade_id(a)
 
         if not (acct and typ and tid):
             return None
@@ -127,7 +142,6 @@ def _dedupe_remember(key: str, ts_ms: int) -> None:
         return
     _DEDUPE_CACHE[key] = ts_ms
     _DEDUPE_CACHE.move_to_end(key, last=True)
-    # trim
     while len(_DEDUPE_CACHE) > _DEDUPE_MAX:
         _DEDUPE_CACHE.popitem(last=False)
 
@@ -157,8 +171,6 @@ def _seed_dedupe_from_tail() -> None:
         if not ACTION_LOG_PATH.exists():
             return
 
-        # Read last chunk and split lines; we keep last N non-empty lines.
-        # This is intentionally simple and best-effort.
         data = ACTION_LOG_PATH.read_bytes()
         lines = data.splitlines()
         tail = deque(lines, maxlen=max(1, _DEDUPE_SEED_TAIL))
@@ -205,6 +217,27 @@ def ai_actions_age_sec() -> Optional[float]:
         return None
 
 
+def _downgrade_to_noop(a: Dict[str, Any], *, missing: Dict[str, bool]) -> Dict[str, Any]:
+    """
+    Convert a broken trade-bearing action into a safe noop, preserving evidence in extra.
+    """
+    extra = a.get("extra")
+    if not isinstance(extra, dict):
+        extra = {}
+    extra = dict(extra)
+    extra.setdefault("phase8", {})
+    if isinstance(extra["phase8"], dict):
+        extra["phase8"]["dropped_trade_action_missing_fields"] = sorted(missing.keys())
+        extra["phase8"]["original_type"] = str(a.get("type") or "")
+        extra["phase8"]["original_action_id"] = str(a.get("action_id") or "")
+        extra["phase8"]["original_trade_id"] = _extract_trade_id(a)
+    a["extra"] = extra
+
+    a["type"] = "noop"
+    a.setdefault("reason", "downgraded_to_noop_missing_required_trade_fields")
+    return a
+
+
 # ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
@@ -223,10 +256,11 @@ def append_actions(
     """
     _seed_dedupe_from_tail()
 
-    ts = _now_ms()
+    batch_ts = _now_ms()
     buf: List[bytes] = []
     written = 0
     skipped = 0
+    downgraded = 0
 
     for raw in actions:
         if not isinstance(raw, dict):
@@ -236,7 +270,7 @@ def append_actions(
         a = dict(raw)
 
         # normalize + stamp
-        a.setdefault("ts_ms", ts)
+        a.setdefault("ts_ms", batch_ts)
         if label is not None:
             a.setdefault("account_label", label)
         a.setdefault("account_label", a.get("account_label") or "unknown")
@@ -245,6 +279,18 @@ def append_actions(
             a["dry_run"] = bool(dry_run)
         else:
             a.setdefault("dry_run", True)
+
+        # Enforce Phase 8 integrity: trade-bearing actions must be joinable.
+        if not is_heartbeat(a) and is_trade_bearing(a):
+            # If producer only put trade_id inside setup_context, materialize it flat too.
+            tid = _extract_trade_id(a)
+            if tid and not a.get("trade_id"):
+                a["trade_id"] = tid
+
+            missing = missing_trade_fields(a)
+            if missing:
+                a = _downgrade_to_noop(a, missing=missing)
+                downgraded += 1
 
         k = _extract_dedupe_key(a)
         if k and _dedupe_seen(k):
@@ -255,7 +301,7 @@ def append_actions(
             buf.append(orjson.dumps(a) + b"\n")
             written += 1
             if k:
-                _dedupe_remember(k, int(a.get("ts_ms") or ts))
+                _dedupe_remember(k, int(a.get("ts_ms") or batch_ts))
         except Exception as e:
             logger.warning("append_actions: failed to encode action %r: %r", a, e)
             continue
@@ -273,8 +319,9 @@ def append_actions(
         logger.error("append_actions: failed to write %d actions: %r", len(buf), e)
         return 0
 
-    if skipped:
-        logger.info("append_actions: wrote %s actions, skipped %s duplicates", written, skipped)
+    if skipped or downgraded:
+        logger.info("append_actions: wrote %s actions, skipped %s duplicates, downgraded %s broken trade-actions",
+                    written, skipped, downgraded)
 
     return written
 

@@ -755,10 +755,13 @@ def get_mmr_pct() -> Decimal:
     """
     Robust MMR% fetcher.
 
-    IMPORTANT:
-      - Must NOT crash the stack if Bybit private endpoints 403.
-      - In EXEC_DRY_RUN, returns 0 on any failure (paper must keep running).
+    DRY-RUN:
+      - Must NOT depend on private Bybit endpoints.
+      - Always returns 0.
     """
+    if EXEC_DRY_RUN:
+        return Decimal("0")
+
     try:
         res = bybit_get("/v5/account/wallet-balance", {"accountType": "UNIFIED"})
     except Exception:
@@ -771,6 +774,7 @@ def get_mmr_pct() -> Decimal:
         return Decimal(str(lst[0].get("marginRatio", "0"))) * Decimal("100")
     except Exception:
         return Decimal("0")
+
 
 
 def list_open_positions(
@@ -803,11 +807,16 @@ def list_open_positions(
 
 
 def list_open_orders(symbol: Optional[str] = None) -> List[dict]:
+    # DRY-RUN: paper must not depend on private endpoints.
+    if EXEC_DRY_RUN:
+        return []
+
     params: Dict[str, Any] = {"category": "linear"}
     if symbol:
         params["symbol"] = symbol
     else:
         params["settleCoin"] = "USDT"
+
     r = bybit_get("/v5/order/realtime", params)
     return r.get("result", {}).get("list", []) or []
 
