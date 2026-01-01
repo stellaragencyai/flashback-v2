@@ -198,6 +198,39 @@
     .badge.yellow{ background: var(--yellowSoft); border-color: rgba(245,158,11,.35); color: #92400e; }
     .badge.gray{ background: var(--graySoft); border-color: rgba(100,116,139,.25); color: var(--gray); }
 
+    /* The "green ONLINE button" you asked for */
+    .onlineBtn{
+      font-size: 11px;
+      font-weight: 950;
+      border-radius: 999px;
+      padding: 3px 10px;
+      border: 1px solid var(--border);
+      text-transform: uppercase;
+      letter-spacing: .35px;
+      white-space: nowrap;
+      user-select: none;
+      background: #f8fafc;
+      color: #64748b;
+    }
+    .onlineBtn.on{
+      background: var(--greenSoft);
+      border-color: rgba(22,163,74,.25);
+      color: var(--green);
+    }
+    .onlineBtn.off{
+      background: var(--graySoft);
+      border-color: rgba(100,116,139,.25);
+      color: var(--gray);
+    }
+
+    .rightPills{
+      display:flex;
+      gap: 8px;
+      align-items:center;
+      flex-wrap: wrap;
+      justify-content:flex-end;
+    }
+
     .twoCols{
       display:grid;
       grid-template-columns: 1fr 1fr;
@@ -335,10 +368,13 @@
   {# ------------------------------------------------------------ #}
   {# Summary tiles computed from rows (truth-first, fail-soft).     #}
   {# ------------------------------------------------------------ #}
-  {% set ns = namespace(total_equity=0.0, avail=0.0, unreal=0.0, acct_count=0) %}
+  {% set ns = namespace(total_equity=0.0, avail=0.0, unreal=0.0, acct_count=0, online_count=0) %}
   {% for r in rows %}
     {% if r.account_label and r.account_label not in ["components","version","updatedms","updated_ms","meta","schema_version"] %}
       {% set ns.acct_count = ns.acct_count + 1 %}
+      {% if (r.online is not none and r.online) or ((r.status or "")|upper in ["RUNNING","ONLINE"]) %}
+        {% set ns.online_count = ns.online_count + 1 %}
+      {% endif %}
     {% endif %}
     {% if r.total_balance is not none %}
       {% set ns.total_equity = ns.total_equity + (r.total_balance or 0.0) %}
@@ -375,152 +411,151 @@
     </div>
     <div class="sCard">
       <div>
-        <div class="sK">Total Accounts</div>
-        <div class="sV">{{ ns.acct_count }}</div>
+        <div class="sK">Online / Total</div>
+        <div class="sV">{{ ns.online_count }} / {{ ns.acct_count }}</div>
       </div>
     </div>
   </div>
 
-  {# ------------------------------------------------------------ #}
-  {# IMPORTANT: Jinja does not support lambda in sort keys.         #}
-  {# We render in deterministic status order, then sort by label.   #}
-  {# ------------------------------------------------------------ #}
-  {% set status_order = ["RUNNING","ONLINE","STALE","DEGRADED","OFFLINE","DOWN","DISABLED","UNKNOWN"] %}
-  {% set base_rows = rows|sort(attribute="account_label") %}
-
   <div class="grid">
-    {% for st in status_order %}
-      {% for r in base_rows %}
-        {% set status = ((r.status or "UNKNOWN")|upper) %}
-        {% if status == st %}
+    {% for r in rows %}
+      {# ------------------------------------------------------------ #}
+      {# Per-card deterministic display values (fail-soft).            #}
+      {# ------------------------------------------------------------ #}
+      {% set acct = (r.account_label or "unknown") %}
+      {% set status = (r.status or "UNKNOWN")|upper %}
+      {% set color = (r.state_color or "gray") %}
+      {% set strat = (r.strategy_name or "unknown") %}
+      {% set mode = (r.automation_mode or "unknown") %}
+      {% set role = (r.role or "") %}
+      {% set ai = (r.ai_profile or "") %}
 
-          {# ------------------------------------------------------------ #}
-          {# Per-card deterministic display values (fail-soft).            #}
-          {# ------------------------------------------------------------ #}
-          {% set acct = (r.account_label or "unknown") %}
-          {% set color = (r.state_color or "gray") %}
-          {% set strat = (r.strategy_name or "unknown") %}
-          {% set mode = (r.automation_mode or "unknown") %}
-          {% set role = (r.role or "") %}
-          {% set ai = (r.ai_profile or "") %}
+      {# Online truth: prefer r.online boolean; else infer from status string #}
+      {% set is_online = false %}
+      {% if r.online is not none %}
+        {% set is_online = (true if r.online else false) %}
+      {% else %}
+        {% if status in ["RUNNING","ONLINE"] %}
+          {% set is_online = true %}
+        {% endif %}
+      {% endif %}
 
-          {# Avatar: MA for main, else FB01..FB10 #}
-          {% if acct == "main" %}
-            {% set avatar = "MA" %}
-            {% set acct_name = "Main Trading Account" %}
-          {% else %}
-            {% set digits = acct|replace("flashback","") %}
-            {% set digits = digits|replace("_","") %}
-            {% if digits|length == 1 %}
-              {% set digits = "0" ~ digits %}
-            {% endif %}
-            {% set avatar = "FB" ~ digits %}
-            {% set acct_name = acct %}
-          {% endif %}
+      {# Avatar: MA for main, else FB01..FB10 #}
+      {% if acct == "main" %}
+        {% set avatar = "MA" %}
+        {% set acct_name = "Main Trading Account" %}
+      {% else %}
+        {% set digits = acct|replace("flashback","") %}
+        {% set digits = digits|replace("_","") %}
+        {% if digits|length == 1 %}
+          {% set digits = "0" ~ digits %}
+        {% endif %}
+        {% set avatar = "FB" ~ digits %}
+        {% set acct_name = acct %}
+      {% endif %}
 
-          <div class="card {{ color }}">
-            <div class="header">
-              <div class="acctWrap">
-                <div class="avatar">{{ avatar|upper }}</div>
-                <div>
-                  <div class="acctName">{{ acct_name }}</div>
-                  <div class="acctMeta">
-                    <span class="chip">{{ mode }}</span>
-                    <span class="chip">Strategy: {{ strat }}</span>
-                    {% if role %}<span class="chip">Role: {{ role }}</span>{% endif %}
-                    {% if ai %}<span class="chip">AI: {{ ai }}</span>{% endif %}
-                  </div>
-                </div>
+      <div class="card {{ color }}">
+        <div class="header">
+          <div class="acctWrap">
+            <div class="avatar">{{ avatar|upper }}</div>
+            <div>
+              <div class="acctName">{{ acct_name }}</div>
+              <div class="acctMeta">
+                <span class="chip">{{ mode }}</span>
+                <span class="chip">Strategy: {{ strat }}</span>
+                {% if role %}<span class="chip">Role: {{ role }}</span>{% endif %}
+                {% if ai %}<span class="chip">AI: {{ ai }}</span>{% endif %}
               </div>
-
-              <div class="badge {{ color }}">{{ status }}</div>
-            </div>
-
-            <div class="twoCols">
-              <div class="mini">
-                <div class="miniK">Total Equity</div>
-                <div class="miniV">${{ "%.2f"|format(r.total_balance or 0.0) }}</div>
-              </div>
-              <div class="mini">
-                <div class="miniK">Available Balance</div>
-                <div class="miniV">${{ "%.2f"|format(r.available_balance or 0.0) }}</div>
-              </div>
-            </div>
-
-            <div class="tabs">
-              <div class="tab active">7 Days</div>
-              <div class="tab">30 Days</div>
-              <div class="tab">1 Year</div>
-            </div>
-
-            <div class="triple">
-              <div class="stat">
-                <div class="statK">Trades</div>
-                <div class="statV">{{ r.total_trades or 0 }}</div>
-              </div>
-              <div class="stat">
-                <div class="statK">PnL (24h)</div>
-                <div class="statV {% if (r.ltm_pnl_24h or 0.0) >= 0 %}pos{% else %}neg{% endif %}">
-                  ${{ "%.2f"|format(r.ltm_pnl_24h or 0.0) }}
-                </div>
-              </div>
-              <div class="stat">
-                <div class="statK">Win Rate</div>
-                <div class="statV">{{ "%.2f"|format(r.win_rate_pct or 0.0) }}%</div>
-              </div>
-            </div>
-
-            {# Risk bar: prefer manifest risk_pct; else integrity_score as stability proxy #}
-            {% set risk_pct = r.risk_pct %}
-            {% if risk_pct is none %}
-              {% set risk_pct = (r.integrity_score or 0) %}
-            {% endif %}
-            {% set w = risk_pct %}
-            {% if w < 0 %}{% set w = 0 %}{% endif %}
-            {% if w > 100 %}{% set w = 100 %}{% endif %}
-
-            <div class="barLabel">
-              <span>Risk Level</span>
-              <span>{{ "%.1f"|format(risk_pct or 0.0) }}%</span>
-            </div>
-            <div class="bar">
-              <div class="fill" style="width: {{ w }}%"></div>
-            </div>
-
-            <div class="chips">
-              <span class="chip">Integrity: {{ r.integrity_score or 0 }}/100</span>
-              <span class="chip">Join: {{ "%.2f"|format(r.join_pct or 0.0) }}%</span>
-              <span class="chip">Unknown: {{ "%.2f"|format(r.unknown_pct or 0.0) }}%</span>
-              <span class="chip">Buckets: {{ r.n_buckets if r.n_buckets is not none else "—" }}</span>
-              <span class="chip">LTM Trades: {{ r.ltm_trades_24h or 0 }}</span>
-
-              {% if r.ready_for_full_auto %}
-                <span class="chip">Ready: YES</span>
-              {% else %}
-                <span class="chip">Ready: NO</span>
-              {% endif %}
-
-              {% if r.cull_recommended %}
-                <span class="chip">Cull: YES</span>
-              {% else %}
-                <span class="chip">Cull: NO</span>
-              {% endif %}
-
-              {% if r.integrity_alerts and (r.integrity_alerts|length > 0) %}
-                <span class="chip">Alerts: {{ r.integrity_alerts|join(", ") }}</span>
-              {% else %}
-                <span class="chip">Alerts: none</span>
-              {% endif %}
-            </div>
-
-            <div class="footer">
-              <div>Truth: <span class="mono">{{ r.truth_source or "none" }}</span></div>
-              <div>Freshness: <span class="mono">{{ r.freshness_sec if r.freshness_sec is not none else "—" }}</span>s</div>
             </div>
           </div>
 
+          <div class="rightPills">
+            <div class="onlineBtn {% if is_online %}on{% else %}off{% endif %}">
+              {% if is_online %}ONLINE{% else %}OFFLINE{% endif %}
+            </div>
+            <div class="badge {{ color }}">{{ status }}</div>
+          </div>
+        </div>
+
+        <div class="twoCols">
+          <div class="mini">
+            <div class="miniK">Total Equity</div>
+            <div class="miniV">${{ "%.2f"|format(r.total_balance or 0.0) }}</div>
+          </div>
+          <div class="mini">
+            <div class="miniK">Available Balance</div>
+            <div class="miniV">${{ "%.2f"|format(r.available_balance or 0.0) }}</div>
+          </div>
+        </div>
+
+        <div class="tabs">
+          <div class="tab active">7 Days</div>
+          <div class="tab">30 Days</div>
+          <div class="tab">1 Year</div>
+        </div>
+
+        <div class="triple">
+          <div class="stat">
+            <div class="statK">Trades</div>
+            <div class="statV">{{ r.total_trades or 0 }}</div>
+          </div>
+          <div class="stat">
+            <div class="statK">PnL (24h)</div>
+            <div class="statV {% if (r.ltm_pnl_24h or 0.0) >= 0 %}pos{% else %}neg{% endif %}">
+              ${{ "%.2f"|format(r.ltm_pnl_24h or 0.0) }}
+            </div>
+          </div>
+          <div class="stat">
+            <div class="statK">Win Rate</div>
+            <div class="statV">{{ "%.2f"|format(r.win_rate_pct or 0.0) }}%</div>
+          </div>
+        </div>
+
+        {# Risk bar: prefer manifest risk_pct; else integrity_score as stability proxy #}
+        {% set risk_pct = r.risk_pct %}
+        {% if risk_pct is none %}
+          {% set risk_pct = (r.integrity_score or 0) %}
         {% endif %}
-      {% endfor %}
+        {% set w = risk_pct %}
+        {% if w < 0 %}{% set w = 0 %}{% endif %}
+        {% if w > 100 %}{% set w = 100 %}{% endif %}
+
+        <div class="barLabel">
+          <span>Risk Level</span>
+          <span>{{ "%.1f"|format(risk_pct or 0.0) }}%</span>
+        </div>
+        <div class="bar">
+          <div class="fill" style="width: {{ w }}%"></div>
+        </div>
+
+        <div class="chips">
+          <span class="chip">Integrity: {{ r.integrity_score or 0 }}/100</span>
+          <span class="chip">Join: {{ "%.2f"|format(r.join_pct or 0.0) }}%</span>
+          <span class="chip">Unknown: {{ "%.2f"|format(r.unknown_pct or 0.0) }}%</span>
+          <span class="chip">Buckets: {{ r.n_buckets if r.n_buckets is not none else "—" }}</span>
+          <span class="chip">LTM Trades: {{ r.ltm_trades_24h or 0 }}</span>
+          {% if r.ready_for_full_auto %}
+            <span class="chip">Ready: YES</span>
+          {% else %}
+            <span class="chip">Ready: NO</span>
+          {% endif %}
+          {% if r.cull_recommended %}
+            <span class="chip">Cull: YES</span>
+          {% else %}
+            <span class="chip">Cull: NO</span>
+          {% endif %}
+          {% if r.integrity_alerts and (r.integrity_alerts|length > 0) %}
+            <span class="chip">Alerts: {{ r.integrity_alerts|join(", ") }}</span>
+          {% else %}
+            <span class="chip">Alerts: none</span>
+          {% endif %}
+        </div>
+
+        <div class="footer">
+          <div>Truth: <span class="mono">{{ r.truth_source or "none" }}</span></div>
+          <div>Freshness: <span class="mono">{{ r.freshness_sec if r.freshness_sec is not none else "—" }}</span>s</div>
+        </div>
+      </div>
     {% endfor %}
   </div>
 

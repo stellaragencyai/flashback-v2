@@ -37,6 +37,7 @@ from typing import Any, Dict, List, Optional, Tuple
 import websocket  # type: ignore
 
 from app.core.logger import get_logger
+from app.core.notifier_bot import tg_send
 
 websocket.enableTrace(False)
 
@@ -263,28 +264,11 @@ def _maybe_send_online_notification(account_label: str) -> None:
     if not (_ws_private_ready and _ws_public_ready):
         return
 
-    # Lazy imports to avoid circular import landmines.
-    get_equity_usdt = None
-    tg_send = None
-    try:
-        from app.core.flashback_common import get_equity_usdt as _geu  # type: ignore
-        get_equity_usdt = _geu
-    except Exception as e:
-        LOG.debug("Lazy import failed: get_equity_usdt: %r", e)
-
-    try:
-        from app.core.notifier_bot import tg_send as _tg_send  # type: ignore
-        tg_send = _tg_send
-    except Exception as e:
-        LOG.debug("Lazy import failed: tg_send: %r", e)
-
     # Attempt to fetch balance for the current label
-    balance: Any = "unknown"
-    if callable(get_equity_usdt):
-        try:
-            balance = get_equity_usdt()
-        except Exception:
-            balance = "unknown"
+    try:
+        balance = get_equity_usdt()
+    except Exception:
+        balance = "unknown"
 
     # Write truth marker first (so even if TG fails, dashboard can still show online)
     try:
@@ -292,12 +276,7 @@ def _maybe_send_online_notification(account_label: str) -> None:
     except Exception as e:
         LOG.debug("WS online marker write failed: %r", e)
 
-    if not callable(tg_send):
-        LOG.warning("tg_send unavailable (notifier_bot import failed). WS online TG notify skipped.")
-        _already_notified = True
-        return
-
-    # Subaccount channel
+    # Subaccount channel (uses per-subaccount token mapping in notifier_bot)
     try:
         tg_send(
             f"🚀 WS ONLINE — {account_label}\n💰 Balance: {balance} USDT",

@@ -1,20 +1,25 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Flashback — WS Switchboard v5.3
+Flashback — WS Switchboard v5.2
 
-What changed vs v5.2:
-1) WS ONLINE notification is now Phase-7 notifier based:
-   - Uses app.core.notifier_bot.tg_send (per-subaccount tokens supported)
-   - Also sends a main/global notification
-2) Writes a deterministic WS online truth marker:
-   - state/ws_online/<account_label>.json
-   - Dashboard can consume this to show a green ONLINE button without "estimating"
-3) Resets WS ready flags on close
-   - Optional re-notify on reconnect via WS_ONLINE_RENOTIFY_ON_RECONNECT=true
+What changed vs v5.1:
+1) Self-rotating WS logs (proactive):
+   - Automatically rotates:
+       state/public_trades.jsonl
+       state/ws_executions.jsonl
+   - Prevents multi-hundred-MB bloat if health_check isn't run.
+   - Policy via env:
+       WS_LOG_ROTATE_ENABLED=true/false (default true)
+       WS_LOG_ROTATE_WARN_MB=50
+       WS_LOG_ROTATE_CAP_MB=150
+       WS_LOG_ROTATE_KEEP=3
+       WS_LOG_ROTATE_EVERY_SEC=30
 
 Retains:
-- Self-rotating WS logs (public_trades.jsonl, ws_executions.jsonl)
+- Log symmetry + cleanliness:
+    [PRIVATE] WS CONNECTED
+    [PUBLIC] WS CONNECTED
 - Strategy-driven public symbols
 - Delta-safe positions merge
 - Always-valid buses even when empty
@@ -37,6 +42,7 @@ from typing import Any, Dict, List, Optional, Tuple
 import websocket  # type: ignore
 
 from app.core.logger import get_logger
+from app.core.flashback_common import send_tg, get_equity_usdt
 
 websocket.enableTrace(False)
 
@@ -61,21 +67,43 @@ _ws_public_ready = False
 _already_notified = False
 
 
-def _now_ms() -> int:
-    return int(time.time() * 1000)
+def _maybe_send_online_notification(account_label: str) -> None:
+    """
+    Once both private & public WS streams are connected,
+    send a Telegram notification via the subaccount bot (if configured),
+    and optionally also via the global/master bot.
+    This only runs once per process start.
+    """
+    global _ws_private_ready, _ws_public_ready, _already_notified
 
+    # Only send once
+    if _already_notified:
+        return
 
-def _safe_float(x: Any) -> float:
+    # Only when both streams are ready
+    if not (_ws_private_ready and _ws_public_ready):
+        return
+
+    # Attempt to fetch balance for the ACCOUNT_LABEL
     try:
-        return float(x)
+        balance = get_equity_usdt()
     except Exception:
-        return 0.0
+        balance = "unknown"
 
+    # Send via the subaccount’s bot (if configured)
+    send_tg(
+        f"🚀 WS ONLINE — {account_label}\n💰 Balance: {balance} USDT",
+        label=account_label
+    )
 
-def _env_bool(name: str, default: str = "false") -> bool:
-    raw = os.getenv(name, default)
-    return str(raw).strip().lower() in ("1", "true", "yes", "y", "on")
+    # Optional: also send a global/master notifier
+    send_tg(
+        f"📡 {account_label} is ONLINE — balance ≈ {balance} USDT",
+        label=account_label,
+        main=True
+    )
 
+    _already_notified = True
 
 # ---------------------------------------------------------------------------
 # Suppress third-party websocket spam logger ("Websocket connected")
@@ -93,9 +121,6 @@ ORDERBOOK_BUS_PATH: Path = STATE_DIR / "orderbook_bus.json"
 TRADES_BUS_PATH: Path = STATE_DIR / "trades_bus.json"
 PUBLIC_TRADES_PATH: Path = STATE_DIR / "public_trades.jsonl"
 EXECUTIONS_PATH: Path = STATE_DIR / "ws_executions.jsonl"
-
-WS_ONLINE_DIR: Path = STATE_DIR / "ws_online"
-WS_ONLINE_DIR.mkdir(parents=True, exist_ok=True)
 
 TRADES_BUS_MAX_PER_SYMBOL: int = int(os.getenv("TRADES_BUS_MAX_PER_SYMBOL", "200"))
 
@@ -121,6 +146,53 @@ WS_RECONNECT_MAX_SEC: float = float(os.getenv("WS_RECONNECT_MAX_SEC", "30"))
 WS_DEBUG_ORDERBOOK: bool = os.getenv("WS_DEBUG_ORDERBOOK", "false").strip().lower() in ("1", "true", "yes", "y")
 WS_DEBUG_ORDERBOOK_EVERY: int = int(os.getenv("WS_DEBUG_ORDERBOOK_EVERY", "200"))
 _WS_ORDERBOOK_SEEN: int = 0
+
+
+def _now_ms() -> int:
+    return int(time.time() * 1000)
+
+
+def _safe_float(x: Any) -> float:
+    try:
+        return float(x)
+    except Exception:
+        return 0.0
+
+
+def _env_bool(name: str, default: str = "false") -> bool:
+    raw = os.getenv(name, default)
+    return str(raw).strip().lower() in ("1", "true", "yes", "y", "on")
+
+
+def normalize_position(raw: dict, account_label: str) -> dict:
+    symbol = str(raw.get("symbol", "")).upper()
+    side = str(raw.get("side", "")).title()
+
+    size = _safe_float(raw.get("size", 0))
+    avg = _safe_float(raw.get("avgPrice", raw.get("entryPrice", 0)))
+
+    sl_raw = raw.get("stopLoss") or raw.get("stopLossPrice") or raw.get("slPrice") or 0
+    stop_loss = _safe_float(sl_raw)
+
+    sub_uid = (
+        raw.get("sub_uid")
+        or raw.get("subAccountId")
+        or raw.get("accountId")
+        or raw.get("subId")
+        or ""
+    )
+    sub_uid = str(sub_uid)
+
+    return {
+        "symbol": symbol,
+        "side": side,
+        "size": size,
+        "avgPrice": avg,
+        "stopLoss": stop_loss,
+        "sub_uid": sub_uid,
+        "account_label": account_label,
+        "category": "linear",
+    }
 
 
 # -------------------------
@@ -227,116 +299,6 @@ def _touch_positions_bus_forever(interval_sec: int, account_label: str, stop_eve
 
 
 # -------------------------
-# WS ONLINE truth marker + Telegram
-# -------------------------
-
-def _write_ws_online_marker(account_label: str, balance: Any) -> None:
-    """
-    Deterministic truth source for dashboard + ops.
-    """
-    payload = {
-        "version": 1,
-        "account_label": account_label,
-        "ts_ms": _now_ms(),
-        "balance": balance,
-        "ws_private_ready": bool(_ws_private_ready),
-        "ws_public_ready": bool(_ws_public_ready),
-    }
-    path = WS_ONLINE_DIR / f"{account_label}.json"
-    _atomic_write_json(path, payload)
-
-
-def _maybe_send_online_notification(account_label: str) -> None:
-    """
-    Once both private & public WS streams are connected, send:
-      - per-subaccount Telegram: channel=account_label
-      - global/main Telegram: channel="main"
-    Also writes a WS online marker file for dashboard truth.
-
-    This only runs once per process start (unless WS_ONLINE_RENOTIFY_ON_RECONNECT=true).
-    """
-    global _ws_private_ready, _ws_public_ready, _already_notified
-
-    if _already_notified:
-        return
-
-    if not (_ws_private_ready and _ws_public_ready):
-        return
-
-    # Lazy imports to avoid circular import landmines.
-    get_equity_usdt = None
-    tg_send = None
-    try:
-        from app.core.flashback_common import get_equity_usdt as _geu  # type: ignore
-        get_equity_usdt = _geu
-    except Exception as e:
-        LOG.debug("Lazy import failed: get_equity_usdt: %r", e)
-
-    try:
-        from app.core.notifier_bot import tg_send as _tg_send  # type: ignore
-        tg_send = _tg_send
-    except Exception as e:
-        LOG.debug("Lazy import failed: tg_send: %r", e)
-
-    # Attempt to fetch balance for the current label
-    balance: Any = "unknown"
-    if callable(get_equity_usdt):
-        try:
-            balance = get_equity_usdt()
-        except Exception:
-            balance = "unknown"
-
-    # Write truth marker first (so even if TG fails, dashboard can still show online)
-    try:
-        _write_ws_online_marker(account_label, balance)
-    except Exception as e:
-        LOG.debug("WS online marker write failed: %r", e)
-
-    if not callable(tg_send):
-        LOG.warning("tg_send unavailable (notifier_bot import failed). WS online TG notify skipped.")
-        _already_notified = True
-        return
-
-    # Subaccount channel
-    try:
-        tg_send(
-            f"🚀 WS ONLINE — {account_label}\n💰 Balance: {balance} USDT",
-            channel=account_label,
-            level="info",
-        )
-    except Exception as e:
-        LOG.debug("Subaccount TG send failed: %r", e)
-
-    # Global/main channel
-    try:
-        tg_send(
-            f"📡 {account_label} is ONLINE — balance ≈ {balance} USDT",
-            channel="main",
-            level="info",
-        )
-    except Exception as e:
-        LOG.debug("Main TG send failed: %r", e)
-
-    _already_notified = True
-
-
-def _reset_ws_ready(which: str) -> None:
-    """
-    Reset readiness flags on WS close.
-    If WS_ONLINE_RENOTIFY_ON_RECONNECT=true, allow re-notify on a future reconnect.
-    """
-    global _ws_private_ready, _ws_public_ready, _already_notified
-
-    if which == "private":
-        _ws_private_ready = False
-    elif which == "public":
-        _ws_public_ready = False
-
-    if _env_bool("WS_ONLINE_RENOTIFY_ON_RECONNECT", "false"):
-        _already_notified = False
-
-
-# -------------------------
 # Log rotation (self-healing)
 # -------------------------
 
@@ -365,6 +327,7 @@ def _rotate_file(path: Path, keep: int) -> bool:
         if keep < 1:
             keep = 1
 
+        # delete oldest
         oldest = path.with_name(f"{path.name}.{keep}")
         try:
             if oldest.exists():
@@ -372,6 +335,7 @@ def _rotate_file(path: Path, keep: int) -> bool:
         except Exception:
             pass
 
+        # shift down
         for i in range(keep - 1, 0, -1):
             src = path.with_name(f"{path.name}.{i}")
             dst = path.with_name(f"{path.name}.{i+1}")
@@ -381,10 +345,12 @@ def _rotate_file(path: Path, keep: int) -> bool:
                 except Exception:
                     pass
 
+        # move current to .1
         dst1 = path.with_name(f"{path.name}.1")
         try:
             os.replace(str(path), str(dst1))
         except Exception:
+            # last resort: copy-then-truncate
             try:
                 data = path.read_bytes()
                 dst1.write_bytes(data)
@@ -393,6 +359,7 @@ def _rotate_file(path: Path, keep: int) -> bool:
             except Exception:
                 return False
 
+        # create new empty file
         try:
             path.write_text("", encoding="utf-8")
         except Exception:
@@ -404,6 +371,9 @@ def _rotate_file(path: Path, keep: int) -> bool:
 
 
 def _log_rotate_loop(stop_event: threading.Event) -> None:
+    """
+    Periodically checks and rotates logs to prevent runaway file sizes.
+    """
     enabled = _env_bool("WS_LOG_ROTATE_ENABLED", "true")
     if not enabled:
         LOG.info("WS log rotation disabled (WS_LOG_ROTATE_ENABLED=false).")
@@ -497,6 +467,7 @@ def _load_public_symbols_from_strategies(account_label: str) -> List[str]:
             if sym_u:
                 symbols.append(sym_u)
 
+    # de-dupe while preserving order
     seen = set()
     out: List[str] = []
     for sym in symbols:
@@ -571,37 +542,6 @@ def _build_ws_auth_payload(api_key: str, api_secret: str) -> Dict[str, Any]:
 # -------------------------
 # PRIVATE WS
 # -------------------------
-
-def normalize_position(raw: dict, account_label: str) -> dict:
-    symbol = str(raw.get("symbol", "")).upper()
-    side = str(raw.get("side", "")).title()
-
-    size = _safe_float(raw.get("size", 0))
-    avg = _safe_float(raw.get("avgPrice", raw.get("entryPrice", 0)))
-
-    sl_raw = raw.get("stopLoss") or raw.get("stopLossPrice") or raw.get("slPrice") or 0
-    stop_loss = _safe_float(sl_raw)
-
-    sub_uid = (
-        raw.get("sub_uid")
-        or raw.get("subAccountId")
-        or raw.get("accountId")
-        or raw.get("subId")
-        or ""
-    )
-    sub_uid = str(sub_uid)
-
-    return {
-        "symbol": symbol,
-        "side": side,
-        "size": size,
-        "avgPrice": avg,
-        "stopLoss": stop_loss,
-        "sub_uid": sub_uid,
-        "account_label": account_label,
-        "category": "linear",
-    }
-
 
 def _handle_private_message(msg: Dict[str, Any], account_label: str) -> None:
     if msg.get("op") == "auth":
@@ -699,7 +639,6 @@ def _run_private_ws(
     stop_event: threading.Event,
 ) -> None:
     backoff = WS_RECONNECT_MIN_SEC
-
     def on_open(ws: websocket.WebSocketApp) -> None:  # type: ignore
         nonlocal backoff
         backoff = WS_RECONNECT_MIN_SEC
@@ -710,9 +649,12 @@ def _run_private_ws(
         ws.send(json.dumps(auth_payload))
         ws.send(json.dumps({"op": "subscribe", "args": ["position", "execution"]}))
 
+        # ===== ADD THESE LINES =====
         global _ws_private_ready
         _ws_private_ready = True
         _maybe_send_online_notification(account_label)
+        # ============================
+
 
     def on_message(ws: websocket.WebSocketApp, message: str) -> None:  # type: ignore
         try:
@@ -727,7 +669,6 @@ def _run_private_ws(
 
     def on_close(ws: websocket.WebSocketApp, status_code: Any, msg: Any) -> None:  # type: ignore
         LOG.warning("[PRIVATE] WS closed: code=%s msg=%s", status_code, msg)
-        _reset_ws_ready("private")
 
     while not stop_event.is_set():
         try:
@@ -861,6 +802,7 @@ def _run_public_ws(
     stop_event: threading.Event,
     account_label: str,
 ) -> None:
+
     symbols_clean = [str(s).strip().upper() for s in symbols if str(s).strip()]
     topics: List[str] = []
     for s in symbols_clean:
@@ -873,14 +815,16 @@ def _run_public_ws(
     def on_open(ws: websocket.WebSocketApp) -> None:  # type: ignore
         nonlocal backoff
         backoff = WS_RECONNECT_MIN_SEC
-
+        
         LOG.info("[PUBLIC] WS CONNECTED")
         LOG.info("[PUBLIC] WS opened, subscribing (%d topics)...", len(topics))
         ws.send(json.dumps(sub_payload))
 
+    # Mark public WS ready and maybe notify
         global _ws_public_ready
         _ws_public_ready = True
         _maybe_send_online_notification(account_label)
+
 
     def on_message(ws: websocket.WebSocketApp, message: str) -> None:  # type: ignore
         try:
@@ -895,7 +839,6 @@ def _run_public_ws(
 
     def on_close(ws: websocket.WebSocketApp, status_code: Any, msg: Any) -> None:  # type: ignore
         LOG.warning("[PUBLIC] WS closed: code=%s msg=%s", status_code, msg)
-        _reset_ws_ready("public")
 
     while not stop_event.is_set():
         try:
@@ -961,7 +904,7 @@ def main() -> None:
 
     touch_interval = int(os.getenv("WS_POSITIONS_BUS_TOUCH_SEC", "5"))
 
-    LOG.info("Starting WS Switchboard v5.3")
+    LOG.info("Starting WS Switchboard v5.2")
     LOG.info("ACCOUNT_LABEL        : %s", account_label)
     LOG.info("WS_ENABLE_PRIVATE    : %s", enable_private)
     LOG.info("WS_ENABLE_PUBLIC     : %s", enable_public)
@@ -980,6 +923,7 @@ def main() -> None:
 
     stop_event = threading.Event()
 
+    # Heartbeat writer
     hb_thread = threading.Thread(
         target=_heartbeat_loop,
         name="ws_heartbeat",
@@ -988,6 +932,7 @@ def main() -> None:
     )
     hb_thread.start()
 
+    # Bus-touch loop to prevent false stale alarms
     touch_thread = threading.Thread(
         target=_touch_positions_bus_forever,
         name="bus_touch_positions",
@@ -996,6 +941,7 @@ def main() -> None:
     )
     touch_thread.start()
 
+    # NEW: log rotation loop (proactive)
     rotate_thread = threading.Thread(
         target=_log_rotate_loop,
         name="ws_log_rotate",

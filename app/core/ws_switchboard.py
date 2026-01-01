@@ -25,6 +25,12 @@ Retains:
 - Always-valid buses even when empty
 - Windows-safe atomic writes
 - positions_bus touch loop to avoid false stale alarms
+
+v5.2 FIX (critical):
+- Avoid circular imports: ws_switchboard must NOT import flashback_common or notifier_bot at import time.
+  This file now:
+    • Sends Telegram notifications directly (env-driven) without depending on notifier_bot/flashback_common.
+    • Attempts to import get_equity_usdt only at runtime, inside a try/except (safe).
 """
 
 from __future__ import annotations
@@ -40,9 +46,9 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 import websocket  # type: ignore
+import requests
 
 from app.core.logger import get_logger
-from app.core.flashback_common import send_tg, get_equity_usdt
 
 websocket.enableTrace(False)
 
@@ -67,6 +73,86 @@ _ws_public_ready = False
 _already_notified = False
 
 
+# -------------------------
+# Telegram sending (NO circular imports)
+# -------------------------
+
+TG_HTTP_TIMEOUT = float(os.getenv("TG_HTTP_TIMEOUT", "6"))
+
+def _tg_env_pair_for_label(account_label: str, main: bool = False) -> Tuple[str, str]:
+    """
+    Map label -> (token, chat_id).
+    Uses the same env keys as notifier_bot.py.
+
+    main/master:
+      TG_TOKEN_MAIN / TG_CHAT_MAIN
+
+    subs:
+      flashback01 -> TG_TOKEN_SUB_1 / TG_CHAT_SUB_1
+      ...
+      flashback10 -> TG_TOKEN_SUB_10 / TG_CHAT_SUB_10
+    """
+    if main:
+        return os.getenv("TG_TOKEN_MAIN", ""), os.getenv("TG_CHAT_MAIN", "")
+
+    lab = (account_label or "").strip().lower()
+    if lab == "main":
+        return os.getenv("TG_TOKEN_MAIN", ""), os.getenv("TG_CHAT_MAIN", "")
+
+    # flashback01..flashback10 mapping
+    if lab.startswith("flashback") and len(lab) == len("flashback00"):
+        suffix = lab.replace("flashback", "")
+        if suffix.isdigit():
+            n = int(suffix)
+            if 1 <= n <= 10:
+                return os.getenv(f"TG_TOKEN_SUB_{n}", ""), os.getenv(f"TG_CHAT_SUB_{n}", "")
+
+    # fallback: main channel
+    return os.getenv("TG_TOKEN_MAIN", ""), os.getenv("TG_CHAT_MAIN", "")
+
+
+def _tg_send_raw(text: str, account_label: str, also_main: bool = False) -> None:
+    """
+    Fire-and-forget Telegram send, import-safe.
+    Will NOT crash the process if Telegram flakes or env is missing.
+    """
+    def _send_one(token: str, chat_id: str, msg: str) -> None:
+        if not token or not chat_id:
+            return
+        url = f"https://api.telegram.org/bot{token}/sendMessage"
+        try:
+            requests.post(
+                url,
+                json={"chat_id": chat_id, "text": msg, "disable_web_page_preview": True},
+                timeout=TG_HTTP_TIMEOUT,
+            )
+        except Exception as e:
+            LOG.debug("[TG] send failed: %r", e)
+
+    # per-label send
+    token, chat_id = _tg_env_pair_for_label(account_label, main=False)
+    _send_one(token, chat_id, text)
+
+    # optional also send to main/master
+    if also_main:
+        mtoken, mchat = _tg_env_pair_for_label(account_label, main=True)
+        _send_one(mtoken, mchat, text)
+
+
+def _maybe_get_equity_usdt_safe() -> str:
+    """
+    Attempt to fetch equity using existing project helper if it can be imported safely.
+    If circular import exists elsewhere, this will fail safely and return 'unknown'.
+    """
+    try:
+        # Delayed import to avoid circulars at module import time
+        from app.core.flashback_common import get_equity_usdt  # type: ignore
+        bal = get_equity_usdt()
+        return str(bal)
+    except Exception:
+        return "unknown"
+
+
 def _maybe_send_online_notification(account_label: str) -> None:
     """
     Once both private & public WS streams are connected,
@@ -84,26 +170,19 @@ def _maybe_send_online_notification(account_label: str) -> None:
     if not (_ws_private_ready and _ws_public_ready):
         return
 
-    # Attempt to fetch balance for the ACCOUNT_LABEL
-    try:
-        balance = get_equity_usdt()
-    except Exception:
-        balance = "unknown"
+    balance = _maybe_get_equity_usdt_safe()
 
-    # Send via the subaccount’s bot (if configured)
-    send_tg(
-        f"🚀 WS ONLINE — {account_label}\n💰 Balance: {balance} USDT",
-        label=account_label
-    )
+    msg_sub = f"🚀 WS ONLINE — {account_label}\n💰 Balance: {balance} USDT"
+    msg_main = f"📡 {account_label} is ONLINE — balance ≈ {balance} USDT"
 
-    # Optional: also send a global/master notifier
-    send_tg(
-        f"📡 {account_label} is ONLINE — balance ≈ {balance} USDT",
-        label=account_label,
-        main=True
-    )
+    # Send to sub channel (or fallback main)
+    _tg_send_raw(msg_sub, account_label, also_main=False)
+
+    # Also send to master/main if desired (kept as behavior parity)
+    _tg_send_raw(msg_main, account_label, also_main=True)
 
     _already_notified = True
+
 
 # ---------------------------------------------------------------------------
 # Suppress third-party websocket spam logger ("Websocket connected")
@@ -639,6 +718,7 @@ def _run_private_ws(
     stop_event: threading.Event,
 ) -> None:
     backoff = WS_RECONNECT_MIN_SEC
+
     def on_open(ws: websocket.WebSocketApp) -> None:  # type: ignore
         nonlocal backoff
         backoff = WS_RECONNECT_MIN_SEC
@@ -649,12 +729,9 @@ def _run_private_ws(
         ws.send(json.dumps(auth_payload))
         ws.send(json.dumps({"op": "subscribe", "args": ["position", "execution"]}))
 
-        # ===== ADD THESE LINES =====
         global _ws_private_ready
         _ws_private_ready = True
         _maybe_send_online_notification(account_label)
-        # ============================
-
 
     def on_message(ws: websocket.WebSocketApp, message: str) -> None:  # type: ignore
         try:
@@ -802,7 +879,6 @@ def _run_public_ws(
     stop_event: threading.Event,
     account_label: str,
 ) -> None:
-
     symbols_clean = [str(s).strip().upper() for s in symbols if str(s).strip()]
     topics: List[str] = []
     for s in symbols_clean:
@@ -815,16 +891,14 @@ def _run_public_ws(
     def on_open(ws: websocket.WebSocketApp) -> None:  # type: ignore
         nonlocal backoff
         backoff = WS_RECONNECT_MIN_SEC
-        
+
         LOG.info("[PUBLIC] WS CONNECTED")
         LOG.info("[PUBLIC] WS opened, subscribing (%d topics)...", len(topics))
         ws.send(json.dumps(sub_payload))
 
-    # Mark public WS ready and maybe notify
         global _ws_public_ready
         _ws_public_ready = True
         _maybe_send_online_notification(account_label)
-
 
     def on_message(ws: websocket.WebSocketApp, message: str) -> None:  # type: ignore
         try:
