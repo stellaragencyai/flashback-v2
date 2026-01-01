@@ -9,6 +9,7 @@ from typing import Any, Dict, Optional, Tuple
 ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_SCOREBOARD_PATH = str(ROOT / "state" / "ai_memory" / "scoreboard.v1.json")
 
+
 def _as_float(x: Any) -> Optional[float]:
     try:
         v = float(x)
@@ -18,8 +19,10 @@ def _as_float(x: Any) -> Optional[float]:
     except Exception:
         return None
 
+
 def _clamp(x: float, lo: float, hi: float) -> float:
     return max(lo, min(hi, x))
+
 
 def _load_scoreboard(path: str) -> Optional[Dict[str, Any]]:
     p = Path(path)
@@ -30,8 +33,14 @@ def _load_scoreboard(path: str) -> Optional[Dict[str, Any]]:
     except Exception:
         return None
 
+
 def _bucket_key(setup_type: str, timeframe: str, symbol: str) -> Tuple[str, str, str]:
-    return (str(setup_type or "unknown"), str(timeframe or "unknown"), str(symbol or "unknown"))
+    return (
+        str(setup_type or "unknown"),
+        str(timeframe or "unknown"),
+        str(symbol or "unknown"),
+    )
+
 
 def scoreboard_gate_decide(
     setup_type: str,
@@ -59,7 +68,11 @@ def scoreboard_gate_decide(
     match = None
     for b in buckets:
         bk = b.get("bucket_key") or {}
-        k2 = _bucket_key(bk.get("setup_type"), bk.get("timeframe"), bk.get("symbol"))
+        k2 = _bucket_key(
+            bk.get("setup_type"),
+            bk.get("timeframe"),
+            bk.get("symbol"),
+        )
         if k2 == key:
             match = b
             break
@@ -79,7 +92,10 @@ def scoreboard_gate_decide(
             "allow": True,
             "size_multiplier": None,
             "decision_code": "SCOREBOARD_INSUFFICIENT_DATA",
-            "reason": f"insufficient_data n={n} conf={conf:.2f} (min_n={min_n} min_conf={min_conf})",
+            "reason": (
+                f"insufficient_data n={n} conf={conf:.2f} "
+                f"(min_n={min_n} min_conf={min_conf})"
+            ),
             "bucket_key": match.get("bucket_key"),
             "bucket_stats": match,
             "scoreboard_path": path,

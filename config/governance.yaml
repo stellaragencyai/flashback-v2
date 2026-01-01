@@ -1,0 +1,8 @@
+﻿districts:
+  default:
+    autonomy_enabled: false
+    telegram_enabled: false
+    trading_enabled: false
+    strategy_locked: false
+    last_command: system_init
+    updated_at: null

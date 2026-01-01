@@ -1,4 +1,5 @@
-﻿#!/usr/bin/env python3
+﻿from __future__ import annotations
+#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
 """
@@ -49,7 +50,6 @@ PHASE 7 ADDITION (2025-12-21):
     • AI_SNAPSHOTS_ENABLE=true/false (default false)
 """
 
-from __future__ import annotations
 
 import os
 import time
@@ -65,11 +65,36 @@ try:
 except Exception:  # pragma: no cover
     AI_DECISIONS_PATH = None  # type: ignore
     AI_SNAPSHOTS_PATH = None  # type: ignore
-    def now_ms() -> int:  # type: ignore
+    
+# --- DECISION_AUDIT_V1 ---
+from pathlib import Path
+import json, time
+
+ROOT = Path(__file__).resolve().parents[2]
+AUDIT_DIR = ROOT / "state" / "audit"
+AUDIT_DIR.mkdir(parents=True, exist_ok=True)
+AUDIT_PATH = AUDIT_DIR / "decision_audit.v1.jsonl"
+
+def _emit_decision_audit(decision: dict):
+    payload = {
+        "decision_code": decision.get("decision_code"),
+        "allowed": decision.get("allowed"),
+        "confidence": decision.get("confidence"),
+        "expectancy_adj": decision.get("expectancy_adj"),
+        "n": decision.get("n"),
+        "scoreboard_version": decision.get("scoreboard_version"),
+        "ts": time.time(),
+    }
+    with AUDIT_PATH.open("a", encoding="utf-8") as f:
+        f.write(json.dumps(payload, ensure_ascii=False) + "\n")
+# --- END DECISION_AUDIT_V1 ---
+
+def now_ms() -> int:  # type: ignore
         return now_ms()
 
 
 DEFAULT_PATH = str(AI_DECISIONS_PATH) if AI_DECISIONS_PATH is not None else "state/ai_decisions.jsonl"
+# DISABLED (indentation repair): _emit_decision_audit(decision)
 DEFAULT_REJECTED_PATH = "state/ai_decisions.rejected.jsonl"
 
 DEFAULT_SNAPSHOTS_PATH = str(AI_SNAPSHOTS_PATH) if AI_SNAPSHOTS_PATH is not None else "state/ai_snapshots.jsonl"

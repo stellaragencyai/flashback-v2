@@ -1,7 +1,7 @@
-#!/usr/bin/env python3
+﻿#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Flashback — AI Stack Supervisor v3.2 (Ops Truth + worker telemetry bundle)
+Flashback â€” AI Stack Supervisor v3.2 (Ops Truth + worker telemetry bundle)
 
 Bundle upgrades (v3.2):
 1) Writes supervisor status into state/ops_snapshot.json (best-effort)
@@ -214,7 +214,7 @@ def _hard_gate_validate_config(log, send_tg) -> bool:
                 pass
             return False
 
-        log.info("Config validation PASS ✅")
+        log.info("Config validation PASS âœ…")
         return True
     except Exception as e:
         msg = f"STOP Config validator crashed: {e}. Refusing to start AI stack."
@@ -434,6 +434,36 @@ def _should_alert(last_alert_ms: int, min_interval_sec: int) -> bool:
     return (_now_ms() - last_alert_ms) >= int(min_interval_sec * 1000)
 
 
+
+# --- TELEMETRY_V0_2 ---
+def _telemetry_mode():
+    import os
+    return os.getenv("FLASHBACK_MODE", "DRY")
+
+def _telemetry_emit_fleet(account_label, enabled, running, dead):
+    try:
+        from app.ops.ops_state import write_component_status
+        write_component_status(
+            component="fleet_summary",
+            account_label=account_label,
+            ok=(len(dead) == 0),
+            details={
+                "mode": _telemetry_mode(),
+                "enabled_workers": enabled,
+                "running_workers": running,
+                "dead_workers": dead,
+                "counts": {
+                    "enabled": len(enabled),
+                    "running": len(running),
+                    "dead": len(dead),
+                },
+            },
+        )
+    except Exception:
+        pass
+# --- END TELEMETRY_V0_2 ---
+
+
 # ---------------------------------------------------------------------------
 # Supervisor core
 # ---------------------------------------------------------------------------
@@ -488,6 +518,8 @@ def _supervisor_loop(root: Path, account_label: str, poll_seconds: int, env_file
     last_alert_ms = 0
 
     log.info("BOOT | ROOT=%s | ACCOUNT_LABEL=%s | poll=%ss", root, account_label, poll_seconds)
+if (Path(_ROOT / "state" / "KILL_SWITCH").exists()):
+    raise SystemExit("KILL SWITCH ACTIVE")
 
     specs = _build_worker_specs(env_file_vars)
 
@@ -515,9 +547,10 @@ def _supervisor_loop(root: Path, account_label: str, poll_seconds: int, env_file
             "note": "supervisor online",
         },
     )
+    # DISABLED (indentation repair): _telemetry_emit_fleet(account_label, enabled_names, running_names, dead_names)
 
     try:
-        send_tg(f"🧩 AI Stack Supervisor online (label={account_label}, poll={poll_seconds}s)")
+        send_tg(f"ðŸ§© AI Stack Supervisor online (label={account_label}, poll={poll_seconds}s)")
     except Exception:
         pass
 

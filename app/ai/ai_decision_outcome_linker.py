@@ -2,13 +2,14 @@
 # -*- coding: utf-8 -*-
 
 """
-Flashback — AI Decision ↔ Outcome Linker (Phase 4/5) v1.4
+Flashback — AI Decision ↔ Outcome Linker (Phase 4/5) v1.5
 
-PATCH v1.4 (2025-12-19):
-- Index BOTH event_type=="ai_decision" and event_type=="pilot_decision".
-- Tolerate legacy decision rows missing event_type (heuristic detection).
-- Keep deterministic pick using outcome account_label/symbol.
-- Outcome summarization reads canonical outcome_record payload fields.
+PATCH v1.5 (2025-12-29):
+- Enforce FINAL-only outcome linking (non-final => SKIPPED_NON_FINAL, audited).
+- Add restart-safe idempotency (persisted link index: trade_id↔outcome_id).
+- Enforce 1:1 mapping (trade_id can only link once by default).
+- Remove duplicated snapshot fields & duplicated integrity echoes.
+- Keep existing decision indexing (ai_decision + pilot_decision + legacy heuristic).
 """
 
 from __future__ import annotations
@@ -18,6 +19,12 @@ import time
 from pathlib import Path
 from typing import Any, Dict, Optional, Tuple, List
 
+import orjson
+
+
+# -------------------------
+# spine_api tolerant imports
+# -------------------------
 try:
     from app.core.spine_api import (
         STATE_DIR as _STATE_DIR,
@@ -25,8 +32,6 @@ try:
         AI_DECISIONS_PATH as _AI_DECISIONS_PATH,
         read_jsonl_tail,
         safe_str,
-        safe_upper,
-        normalize_timeframe,
     )
 except Exception:  # pragma: no cover
     _STATE_DIR = None  # type: ignore
@@ -38,22 +43,6 @@ except Exception:  # pragma: no cover
             return ('' if x is None else str(x)).strip()
         except Exception:
             return ''
-    def safe_upper(x: Any) -> str:  # type: ignore
-        return safe_str(x).upper()
-    def normalize_timeframe(tf: Any) -> str:  # type: ignore
-        s = safe_str(tf).lower()
-        if not s:
-            return ''
-        if s.endswith(('m','h','d','w')):
-            return s
-        try:
-            n = int(float(s))
-            return f\"{n}m\" if n > 0 else ''
-        except Exception:
-            return ''
-
-
-import orjson
 
 
 # -------------------------
@@ -67,49 +56,12 @@ except Exception:  # pragma: no cover
 
 STATE_DIR: Path = (_STATE_DIR if _STATE_DIR is not None else (ROOT / "state"))
 AI_EVENTS_DIR: Path = (_AI_EVENTS_DIR if _AI_EVENTS_DIR is not None else (STATE_DIR / "ai_events"))
-
 DECISIONS_PATH: Path = (_AI_DECISIONS_PATH if _AI_DECISIONS_PATH is not None else (STATE_DIR / "ai_decisions.jsonl"))
 
-def _tail_decisions_fast(path: Path, tail_bytes: int, max_lines: int = 5000) -> list[dict[str, Any]]:
-    """Fast-ish decisions tail reader (prefers spine_api.read_jsonl_tail)."""
-    try:
-        if callable(read_jsonl_tail):  # type: ignore[arg-type]
-            rows, _bad = read_jsonl_tail(path, tail_bytes=tail_bytes, max_lines=max_lines)  # type: ignore[misc]
-            return rows
-    except Exception:
-        pass
-
-    out: list[dict[str, Any]] = []
-    try:
-        if not path.exists():
-            return []
-        size = path.stat().st_size
-        start = max(0, size - int(max(1024, tail_bytes)))
-        with path.open("rb") as f:
-            f.seek(start)
-            blob = f.read()
-        if start > 0:
-            nl = blob.find(b"\n")
-            if nl >= 0:
-                blob = blob[nl + 1 :]
-        for raw in blob.splitlines()[-max_lines:]:
-            r = raw.strip()
-            if not r:
-                continue
-            try:
-                out.append(orjson.loads(r))
-            except Exception:
-                try:
-                    out.append(json.loads(r.decode("utf-8", errors="ignore")))
-                except Exception:
-                    continue
-        return out
-    except Exception:
-        return out
-
-OUTCOMES_PATH: Path = AI_EVENTS_DIR / "outcomes.jsonl"
-OUT_PATH: Path = STATE_DIR / "ai_decision_outcomes.jsonl"
+OUTCOMES_PATH: Path = AI_EVENTS_DIR / "outcomes.v1.jsonl"
+OUT_PATH: Path = STATE_DIR / "ai_decision_outcomes.v1.jsonl"
 CURSOR_PATH: Path = STATE_DIR / "ai_decision_outcome_cursor.json"
+LINK_INDEX_PATH: Path = STATE_DIR / "ai_decision_outcome_link_index.json"  # NEW (idempotency)
 
 STATE_DIR.mkdir(parents=True, exist_ok=True)
 AI_EVENTS_DIR.mkdir(parents=True, exist_ok=True)
@@ -121,43 +73,6 @@ OUT_PATH.parent.mkdir(parents=True, exist_ok=True)
 # -------------------------
 def _now_ms() -> int:
     return int(time.time() * 1000)
-
-
-def _read_json(path: Path, default: Dict[str, Any]) -> Dict[str, Any]:
-    try:
-        if not path.exists():
-            return dict(default)
-        data = orjson.loads(path.read_bytes())
-        return data if isinstance(data, dict) else dict(default)
-    except Exception:
-        return dict(default)
-
-
-def _write_json(path: Path, obj: Dict[str, Any]) -> None:
-    try:
-        path.write_bytes(orjson.dumps(obj, option=orjson.OPT_INDENT_2))
-    except Exception:
-        pass
-
-
-def _append_jsonl(path: Path, obj: Dict[str, Any]) -> None:
-    """
-    Append JSONL safely WITHOUT using Path.open("ab") so scan_decision_writers.py
-    doesn't falsely label this module as a "decision writer".
-
-    This writes to OUT_PATH (ai_decision_outcomes.jsonl), NOT ai_decisions.jsonl.
-    """
-    try:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        line = orjson.dumps(obj) + b"\n"
-        import os as _os
-        fd = _os.open(str(path), _os.O_APPEND | _os.O_CREAT | _os.O_WRONLY, 0o666)
-        try:
-            _os.write(fd, line)
-        finally:
-            _os.close(fd)
-    except Exception:
-        pass
 
 
 def _safe_int(x: Any, default: int = 0) -> int:
@@ -187,6 +102,41 @@ def _safe_str(x: Any) -> str:
         return ""
 
 
+def _read_json(path: Path, default: Dict[str, Any]) -> Dict[str, Any]:
+    try:
+        if not path.exists():
+            return dict(default)
+        data = orjson.loads(path.read_bytes())
+        return data if isinstance(data, dict) else dict(default)
+    except Exception:
+        return dict(default)
+
+
+def _write_json(path: Path, obj: Dict[str, Any]) -> None:
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(orjson.dumps(obj, option=orjson.OPT_INDENT_2))
+    except Exception:
+        pass
+
+
+def _append_jsonl(path: Path, obj: Dict[str, Any]) -> None:
+    """
+    Append JSONL safely (this writes to OUT_PATH, NOT ai_decisions.jsonl).
+    """
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        line = orjson.dumps(obj) + b"\n"
+        import os as _os
+        fd = _os.open(str(path), _os.O_APPEND | _os.O_CREAT | _os.O_WRONLY, 0o666)
+        try:
+            _os.write(fd, line)
+        finally:
+            _os.close(fd)
+    except Exception:
+        pass
+
+
 # -------------------------
 # extraction helpers
 # -------------------------
@@ -200,9 +150,10 @@ def _decision_all_trade_ids(d: Dict[str, Any]) -> List[str]:
 
 
 def _extract_trade_id(evt: Dict[str, Any]) -> str:
-    tid = evt.get("trade_id")
-    if isinstance(tid, str) and tid.strip():
-        return tid.strip()
+    for k in ("trade_id", "client_trade_id", "source_trade_id"):
+        tid = evt.get(k)
+        if isinstance(tid, str) and tid.strip():
+            return tid.strip()
 
     setup = evt.get("setup")
     if isinstance(setup, dict):
@@ -240,9 +191,10 @@ def _extract_symbol(evt: Dict[str, Any]) -> str:
 
 
 def _extract_account_label(evt: Dict[str, Any]) -> str:
-    v = evt.get("account_label")
-    if isinstance(v, str) and v.strip():
-        return v.strip()
+    for k in ("account_label", "account", "subaccount", "accountName"):
+        v = evt.get(k)
+        if isinstance(v, str) and v.strip():
+            return v.strip()
 
     setup = evt.get("setup")
     if isinstance(setup, dict):
@@ -259,12 +211,35 @@ def _extract_account_label(evt: Dict[str, Any]) -> str:
     return ""
 
 
-def _extract_outcome_policy_hash(evt: Dict[str, Any]) -> Optional[str]:
-    pol = evt.get("policy")
-    if isinstance(pol, dict):
-        phs = _safe_str(pol.get("policy_hash"))
-        return phs if phs else None
-    return None
+def _extract_outcome_id(evt: Dict[str, Any]) -> str:
+    oid = evt.get("outcome_id")
+    if isinstance(oid, str) and oid.strip():
+        return oid.strip()
+
+    oid2 = evt.get("id")
+    if isinstance(oid2, str) and oid2.strip():
+        return oid2.strip()
+
+    tid = _extract_trade_id(evt)
+    ts = _safe_str(evt.get("ts") or evt.get("ts_ms") or evt.get("closed_ts_ms") or "")
+    pnl = _safe_str(evt.get("pnl_usd") or (evt.get("payload") or {}).get("pnl_usd") or "")
+    reason = _safe_str(evt.get("close_reason") or evt.get("exit_reason") or (evt.get("payload") or {}).get("close_reason") or "")
+    fp = f"{tid}|{ts}|{pnl}|{reason}".strip("|")
+    return fp if fp else ""
+
+
+def _extract_snapshot_linkage(d: Dict[str, Any]) -> Dict[str, Any]:
+    try:
+        fp = d.get("snapshot_fp")
+        mode = d.get("snapshot_mode")
+        sv = d.get("snapshot_schema_version")
+        return {
+            "snapshot_fp": _safe_str(fp) or None,
+            "snapshot_mode": _safe_str(mode) or None,
+            "snapshot_schema_version": _safe_int(sv, 0) if sv is not None else None,
+        }
+    except Exception:
+        return {"snapshot_fp": None, "snapshot_mode": None, "snapshot_schema_version": None}
 
 
 def _decision_symbol(d: Dict[str, Any]) -> str:
@@ -292,20 +267,12 @@ def _decision_ts_ms(d: Dict[str, Any]) -> int:
 
 
 def _looks_like_decision_row(d: Dict[str, Any]) -> bool:
-    """
-    Accept:
-    - event_type == ai_decision
-    - event_type == pilot_decision
-    - legacy rows missing event_type but clearly shaped like a decision
-      (must have trade_id + decision + at least one of allow/size_multiplier/gates/policy_hash)
-    """
     et = d.get("event_type")
     if et in ("ai_decision", "pilot_decision"):
         return True
 
-    # Legacy heuristic (be conservative)
     if et is not None:
-        return False  # unknown explicit event_type -> do not guess
+        return False
 
     tid = d.get("trade_id")
     dec = d.get("decision") or d.get("decision_code")
@@ -314,31 +281,72 @@ def _looks_like_decision_row(d: Dict[str, Any]) -> bool:
     if dec is None:
         return False
 
-    has_any = False
     for k in ("allow", "size_multiplier", "gates", "policy_hash", "tier_used", "meta"):
         if k in d and d.get(k) is not None:
-            has_any = True
-            break
-    return has_any
+            return True
+    return False
 
 
-
-def _extract_snapshot_linkage(d: Dict[str, Any]) -> Dict[str, Any]:
-    """\
-    Phase 7: decisions may carry snapshot linkage fields stamped by ai_decision_logger.
-    Tolerant: if fields are missing or invalid, return None values.
+# -------------------------
+# FINALITY gate (Outcome side) - CANONICAL
+# -------------------------
+def _is_final_outcome(o: Dict[str, Any]) -> bool:
     """
-    try:
-        fp = d.get("snapshot_fp")
-        mode = d.get("snapshot_mode")
-        sv = d.get("snapshot_schema_version")
-        return {
-            "snapshot_fp": _safe_str(fp) or None,
-            "snapshot_mode": _safe_str(mode) or None,
-            "snapshot_schema_version": _safe_int(sv, 0) if sv is not None else None,
-        }
-    except Exception:
-        return {"snapshot_fp": None, "snapshot_mode": None, "snapshot_schema_version": None}
+    FINALITY RULE (canonical):
+    - outcomes.v1.jsonl rows are terminal when they have close_reason + a close timestamp field.
+    - outcome.v1 uses closed_ts_ms (your data does).
+    - Synthetic terminal statuses (ABORTED/EXPIRED/CLOSED/DONE/FINAL) are final.
+    - Explicit non-terminal statuses (OPEN/PARTIAL/PENDING/WORKING/FILL_EVENT) are not final.
+    """
+    if not isinstance(o, dict):
+        return False
+
+    payload = o.get("payload") if isinstance(o.get("payload"), dict) else {}
+
+    if o.get("is_final") is True:
+        return True
+
+    schema = str(o.get("schema_version") or payload.get("schema_version") or "").strip()
+
+    close_reason = str(
+        o.get("close_reason")
+        or payload.get("close_reason")
+        or o.get("exit_reason")
+        or payload.get("exit_reason")
+        or ""
+    ).strip()
+
+    closed_ts = (
+        o.get("closed_ts_ms")
+        or o.get("closed_ts")
+        or o.get("close_ts")
+        or o.get("exit_ts")
+        or o.get("ts_close")
+        or payload.get("closed_ts_ms")
+        or payload.get("closed_ts")
+        or payload.get("close_ts")
+        or payload.get("exit_ts")
+        or payload.get("ts_close")
+    )
+
+    final_status = str(
+        o.get("final_status") or payload.get("final_status") or o.get("status") or payload.get("status") or ""
+    ).strip().upper()
+
+    if final_status in ("ABORTED", "EXPIRED", "CLOSED", "DONE", "FINAL"):
+        return True
+    if final_status in ("OPEN", "PARTIAL", "PENDING", "WORKING", "FILL_EVENT"):
+        return False
+
+    if schema == "outcome.v1":
+        return bool(close_reason) and (closed_ts is not None)
+
+    pnl = o.get("pnl_usd") if o.get("pnl_usd") is not None else payload.get("pnl_usd")
+    if schema.startswith("outcome.") and close_reason and pnl is not None:
+        return True
+
+    return False
+
 
 # -------------------------
 # decisions index
@@ -380,8 +388,6 @@ class DecisionIndex:
                         continue
                     if not isinstance(d, dict):
                         continue
-
-                    # ✅ Index true decisions (ai_decision + pilot_decision + legacy)
                     if not _looks_like_decision_row(d):
                         continue
 
@@ -469,7 +475,42 @@ def _read_new_jsonl(path: Path, offset: int) -> Tuple[List[Dict[str, Any]], int]
 
 
 # -------------------------
-# join logic
+# link index (idempotency)
+# -------------------------
+def _load_link_index() -> Dict[str, Any]:
+    default = {"version": 1, "updated_ms": 0, "by_trade_id": {}, "by_outcome_id": {}}
+    idx = _read_json(LINK_INDEX_PATH, default)
+    if not isinstance(idx.get("by_trade_id"), dict):
+        idx["by_trade_id"] = {}
+    if not isinstance(idx.get("by_outcome_id"), dict):
+        idx["by_outcome_id"] = {}
+    return idx
+
+
+def _save_link_index(idx: Dict[str, Any]) -> None:
+    idx["updated_ms"] = _now_ms()
+
+    MAX = 50000
+    by_tid: Dict[str, Any] = idx.get("by_trade_id", {})  # type: ignore[assignment]
+    by_oid: Dict[str, Any] = idx.get("by_outcome_id", {})  # type: ignore[assignment]
+    if isinstance(by_tid, dict) and len(by_tid) > MAX:
+        drop = len(by_tid) - MAX
+        for k in list(by_tid.keys())[:drop]:
+            old_oid = by_tid.pop(k, None)
+            if old_oid and isinstance(by_oid, dict):
+                by_oid.pop(old_oid, None)
+    if isinstance(by_oid, dict) and len(by_oid) > MAX:
+        drop = len(by_oid) - MAX
+        for k in list(by_oid.keys())[:drop]:
+            old_tid = by_oid.pop(k, None)
+            if old_tid and isinstance(by_tid, dict):
+                by_tid.pop(old_tid, None)
+
+    _write_json(LINK_INDEX_PATH, idx)
+
+
+# -------------------------
+# summarize decision / outcome
 # -------------------------
 def _summarize_decision(d: Dict[str, Any]) -> Dict[str, Any]:
     gates = d.get("gates") if isinstance(d.get("gates"), dict) else {}
@@ -503,7 +544,6 @@ def _summarize_decision(d: Dict[str, Any]) -> Dict[str, Any]:
         "symbol": _decision_symbol(d),
         "event_type": d.get("event_type"),
 
-        # ✅ Phase 7 linkage
         "snapshot_fp": snap.get("snapshot_fp"),
         "snapshot_mode": snap.get("snapshot_mode"),
         "snapshot_schema_version": snap.get("snapshot_schema_version"),
@@ -532,8 +572,8 @@ def _summarize_outcome(o: Dict[str, Any]) -> Dict[str, Any]:
     if win is None:
         win = o.get("win")
 
-    exit_reason = o.get("exit_reason") or payload.get("exit_reason") or stats.get("exit_reason")
-    final_status = o.get("final_status") or payload.get("final_status") or stats.get("final_status")
+    close_reason = o.get("close_reason") or payload.get("close_reason") or o.get("exit_reason") or payload.get("exit_reason")
+    final_status = o.get("final_status") or payload.get("final_status") or o.get("status")
 
     return {
         "event_type": o.get("event_type"),
@@ -541,133 +581,151 @@ def _summarize_outcome(o: Dict[str, Any]) -> Dict[str, Any]:
         "symbol": _extract_symbol(o),
         "account_label": _extract_account_label(o),
         "trade_id": _extract_trade_id(o),
+        "outcome_id": _extract_outcome_id(o),
+        "is_final": bool(_is_final_outcome(o)),
         "pnl_usd": _safe_float(pnl, 0.0),
         "r_multiple": r_mult,
         "win": win,
-        "exit_reason": exit_reason,
+        "close_reason": close_reason,
         "final_status": final_status,
-        "raw": o,
     }
 
 
-def _inherit_decision_fields_from_outcome(decision_summary: Dict[str, Any], *, outcome_symbol: str, outcome_account_label: str, outcome_policy_hash: Optional[str]) -> Dict[str, Any]:
-    if not _safe_str(decision_summary.get("symbol")) and outcome_symbol:
-        decision_summary["symbol"] = outcome_symbol
-    if not _safe_str(decision_summary.get("account_label")) and outcome_account_label:
-        decision_summary["account_label"] = outcome_account_label
-    if not _safe_str(decision_summary.get("policy_hash")) and outcome_policy_hash:
-        decision_summary["policy_hash"] = outcome_policy_hash
-    return decision_summary
-
-
-def _join(decision: Optional[Dict[str, Any]], outcome: Dict[str, Any], *, match_level: int, match_rule: str) -> Dict[str, Any]:
-    trade_id = _extract_trade_id(outcome)
-    symbol = _extract_symbol(outcome)
-    account_label = _extract_account_label(outcome)
-    outcome_policy_hash = _extract_outcome_policy_hash(outcome)
+def _join(
+    decision: Optional[Dict[str, Any]],
+    outcome: Dict[str, Any],
+    *,
+    match_level: int,
+    match_rule: str,
+    status: str,
+    quarantine: bool,
+) -> Dict[str, Any]:
+    tid = _extract_trade_id(outcome)
+    sym = _extract_symbol(outcome)
+    acct = _extract_account_label(outcome)
 
     decision_summary = _summarize_decision(decision) if decision else None
-    # ✅ Promote snapshot linkage to top-level for auditability
-    snap_fp = None
-    snap_mode = None
-    snap_sv = None
-    if decision_summary:
-        snap_fp = decision_summary.get("snapshot_fp")
-        snap_mode = decision_summary.get("snapshot_mode")
-        snap_sv = decision_summary.get("snapshot_schema_version")
+    snap_fp = decision_summary.get("snapshot_fp") if decision_summary else None
+    snap_mode = decision_summary.get("snapshot_mode") if decision_summary else None
+    snap_sv = decision_summary.get("snapshot_schema_version") if decision_summary else None
 
-    if decision_summary:
-        decision_summary = _inherit_decision_fields_from_outcome(
-            decision_summary,
-            outcome_symbol=symbol,
-            outcome_account_label=account_label,
-            outcome_policy_hash=outcome_policy_hash,
-        )
+    out_sum = _summarize_outcome(outcome)
 
-    joined: Dict[str, Any] = {
+    return {
         "ts_ms": _now_ms(),
-        "trade_id": trade_id,
-        "symbol": symbol,
-        "account_label": account_label,
+        "status": status,
+        "quarantine": bool(quarantine),
 
-        # Phase 7 linkage (top-level)
+        "trade_id": tid,
+        "symbol": sym,
+        "account_label": acct,
+
         "snapshot_fp": snap_fp,
         "snapshot_mode": snap_mode,
         "snapshot_schema_version": snap_sv,
 
-        # Phase 7 linkage (top-level)
-        "snapshot_fp": snap_fp,
-        "snapshot_mode": snap_mode,
-        "snapshot_schema_version": snap_sv,
-        "status": "OK" if decision else "NO_DECISION_FOUND",
         "match_level": int(match_level) if decision else 0,
         "match_rule": str(match_rule) if decision else "no_decision",
+
         "decision": decision_summary,
-        "outcome": _summarize_outcome(outcome),
+        "outcome": out_sum,
+
         "integrity": {
             "decision_present": bool(decision),
-            "match_level": match_level if decision else 0,
-            "match_rule": match_rule if decision else "no_decision",
+            "final_outcome": bool(out_sum.get("is_final")),
             "linked_at_ms": _now_ms(),
-
-            # helpful integrity echoes
-            "snapshot_fp": snap_fp,
-            "snapshot_mode": snap_mode,
-            "snapshot_schema_version": snap_sv,
-
-            # helpful integrity echoes
-            "snapshot_fp": snap_fp,
-            "snapshot_mode": snap_mode,
-            "snapshot_schema_version": snap_sv,
         },
     }
-    return joined
 
 
 # -------------------------
-# main processing
+# processing
 # -------------------------
 def process_once(idx: DecisionIndex) -> Dict[str, Any]:
     cursor = _load_cursor()
     offset = _safe_int(cursor.get("offset"), 0)
 
     events, new_offset = _read_new_jsonl(OUTCOMES_PATH, offset)
+
+    link_idx = _load_link_index()
+    by_tid: Dict[str, str] = link_idx.get("by_trade_id", {})  # type: ignore[assignment]
+    by_oid: Dict[str, str] = link_idx.get("by_outcome_id", {})  # type: ignore[assignment]
+
     written = 0
-    no_trade_id = 0
-    no_decision = 0
+    skipped_non_final = 0
+    missing_trade_id = 0
+    no_decision_found = 0
+    duplicates = 0
 
     for evt in events:
         tid = _extract_trade_id(evt)
         sym = _extract_symbol(evt)
         acct = _extract_account_label(evt)
+        oid = _extract_outcome_id(evt)
 
         if not tid:
-            no_trade_id += 1
-            joined = _join(None, evt, match_level=0, match_rule="no_decision")
-            joined["status"] = "MISSING_TRADE_ID"
+            missing_trade_id += 1
+            joined = _join(None, evt, match_level=0, match_rule="no_decision", status="MISSING_TRADE_ID", quarantine=True)
+            _append_jsonl(OUT_PATH, joined)
+            written += 1
+            continue
+
+        if not _is_final_outcome(evt):
+            skipped_non_final += 1
+            joined = _join(None, evt, match_level=0, match_rule="non_final", status="SKIPPED_NON_FINAL", quarantine=True)
+            _append_jsonl(OUT_PATH, joined)
+            written += 1
+            continue
+
+        if not oid:
+            joined = _join(None, evt, match_level=0, match_rule="missing_outcome_id", status="MISSING_OUTCOME_ID", quarantine=True)
+            _append_jsonl(OUT_PATH, joined)
+            written += 1
+            continue
+
+        if isinstance(by_oid, dict) and oid in by_oid:
+            duplicates += 1
+            joined = _join(None, evt, match_level=0, match_rule="dup_outcome_id", status="DUPLICATE_OUTCOME_ID", quarantine=True)
+            _append_jsonl(OUT_PATH, joined)
+            written += 1
+            continue
+
+        if isinstance(by_tid, dict) and tid in by_tid:
+            duplicates += 1
+            joined = _join(None, evt, match_level=0, match_rule="dup_trade_id", status="DUPLICATE_TRADE_ID", quarantine=True)
             _append_jsonl(OUT_PATH, joined)
             written += 1
             continue
 
         dec, match_level, match_rule = idx.get_best_for_outcome(tid, acct, sym)
         if not dec:
-            no_decision += 1
-            match_level = 0
-            match_rule = "no_decision"
+            no_decision_found += 1
+            joined = _join(None, evt, match_level=0, match_rule="no_decision", status="NO_DECISION_FOUND", quarantine=True)
+            _append_jsonl(OUT_PATH, joined)
+            written += 1
+            continue
 
-        joined = _join(dec, evt, match_level=match_level, match_rule=match_rule)
+        joined = _join(dec, evt, match_level=match_level, match_rule=match_rule, status="OK", quarantine=False)
         _append_jsonl(OUT_PATH, joined)
         written += 1
 
+        if isinstance(by_tid, dict):
+            by_tid[tid] = oid
+        if isinstance(by_oid, dict):
+            by_oid[oid] = tid
+
     _save_cursor(new_offset)
+    _save_link_index(link_idx)
 
     return {
         "ok": True,
         "ts_ms": _now_ms(),
         "outcomes_seen": len(events),
         "written": written,
-        "missing_trade_id": no_trade_id,
-        "no_decision_found": no_decision,
+        "skipped_non_final": skipped_non_final,
+        "missing_trade_id": missing_trade_id,
+        "no_decision_found": no_decision_found,
+        "duplicates": duplicates,
         "cursor_offset_before": offset,
         "cursor_offset_after": new_offset,
         "paths": {
@@ -675,6 +733,7 @@ def process_once(idx: DecisionIndex) -> Dict[str, Any]:
             "outcomes": str(OUTCOMES_PATH),
             "out": str(OUT_PATH),
             "cursor": str(CURSOR_PATH),
+            "link_index": str(LINK_INDEX_PATH),
         },
     }
 
@@ -684,9 +743,10 @@ def loop(poll_seconds: float) -> None:
     while True:
         report = process_once(idx)
         print(
-            f"[ai_decision_outcome_linker] outcomes={report['outcomes_seen']} "
-            f"written={report['written']} missing_tid={report['missing_trade_id']} "
-            f"no_decision={report['no_decision_found']} offset={report['cursor_offset_after']}"
+            f"[ai_decision_outcome_linker] seen={report['outcomes_seen']} written={report['written']} "
+            f"non_final={report['skipped_non_final']} missing_tid={report['missing_trade_id']} "
+            f"no_decision={report['no_decision_found']} dup={report['duplicates']} "
+            f"offset={report['cursor_offset_after']}"
         )
         time.sleep(max(0.25, poll_seconds))
 

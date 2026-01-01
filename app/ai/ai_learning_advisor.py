@@ -145,3 +145,35 @@ def row_to_dict(r: AdvisoryRow) -> Dict[str, Any]:
         "recommendation": r.recommendation,
         "reasons": list(r.reasons),
     }
+
+
+from app.ai.ai_live_state_adapter import LiveAIState
+from app.ai.ai_evolution_engine import run_evolution_cycle
+
+def run_evolution_if_ready():
+    state = LiveAIState()
+    decisions = run_evolution_cycle(state)
+    return decisions
+
+
+
+from app.ai.capital_flow_engine import compute_capital_flows
+from app.ai.capital_flow_emitter import emit_capital_flows
+
+def run_capital_flow(evolution_decisions):
+    from app.ai.ai_policy_stats import load_policy_stats
+    stats = load_policy_stats()
+    flows = compute_capital_flows(evolution_decisions, stats)
+    emit_capital_flows(flows)
+
+
+
+from app.ai.capital_flow_engine import compute_capital_flows
+from app.ai.capital_flow_emitter import emit_capital_flows
+
+def run_capital_flow(evolution_decisions):
+    from app.ai.ai_policy_stats import load_policy_stats
+    stats = load_policy_stats()
+    flows = compute_capital_flows(evolution_decisions, stats)
+    emit_capital_flows(flows)
+

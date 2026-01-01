@@ -1,0 +1,79 @@
+﻿version: 1.0
+description: >
+  AI District Profiles for Flashback City.
+  Defines autonomy, learning behavior, risk limits,
+  and strategy permissions per subaccount.
+
+districts:
+
+  HQ:
+    role: treasury
+    autonomy: supervisory
+    learning_mode: passive
+    risk_profile: conservative
+    bootstrap: false
+    allowed_strategies: []
+    allowed_pairs: []
+    capital_flow: inbound_only
+
+  SCALP_01:
+    role: worker
+    autonomy: high
+    learning_mode: aggressive
+    risk_profile: micro
+    bootstrap: true
+    allowed_strategies:
+      - scalp_hf
+    allowed_pairs:
+      - BTCUSDT
+    regimes:
+      - range
+      - trend
+    max_concurrent_positions: 1
+    n_bucket_min: 500
+
+  SCALP_02:
+    role: worker
+    autonomy: high
+    learning_mode: aggressive
+    risk_profile: micro
+    bootstrap: true
+    allowed_strategies:
+      - scalp_hf
+    allowed_pairs:
+      - BTCUSDT
+    regimes:
+      - range
+    max_concurrent_positions: 1
+    n_bucket_min: 500
+
+  GRID_01:
+    role: worker
+    autonomy: medium
+    learning_mode: adaptive
+    risk_profile: moderate
+    bootstrap: false
+    allowed_strategies:
+      - grid
+    allowed_pairs:
+      - ETHUSDT
+    regimes:
+      - range
+    max_concurrent_positions: 3
+    n_bucket_min: 1000
+
+  DCA_01:
+    role: worker
+    autonomy: low
+    learning_mode: conservative
+    risk_profile: conservative
+    bootstrap: false
+    allowed_strategies:
+      - dca
+    allowed_pairs:
+      - BTCUSDT
+      - ETHUSDT
+    regimes:
+      - trend
+    max_concurrent_positions: 2
+    n_bucket_min: 2000

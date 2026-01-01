@@ -1,0 +1,21 @@
+﻿version: 1.0
+
+cloning_rules:
+
+  eligibility:
+    allowed_stages:
+      - active_to_scaled
+      - scaled_to_template
+    min_confidence: 0.75
+    max_active_clones: 3
+
+  clone_defaults:
+    starting_capital_ratio: 0.25
+    autonomy_level: supervised
+    allowed_pairs_limit: 1
+    learning_mode: accelerated
+
+  safeguards:
+    require_different_regime: true
+    block_same_district: true
+    enforce_drawdown_cap: true

@@ -1,0 +1,1214 @@
+# app/core/flashback_common.py
+# Flashback shared helpers: Bybit v5 HMAC, Telegram, account state, instruments, sizing utils.
+
+import os
+import time
+import hmac
+import hashlib
+import threading
+from collections import deque
+from decimal import Decimal, ROUND_DOWN
+from typing import Dict, Any, Tuple, List, Optional, Callable
+from urllib.parse import urlencode
+from pathlib import Path  # for heartbeat file handling
+
+import requests
+import orjson
+from dotenv import load_dotenv
+
+# NEW: notifier + subs for transfer notifications
+from app.core.notifier_bot import get_notifier
+from app.core.subs import all_subs as load_subs
+
+# Optional: WS-first market bus (orderbook + trades, fed by ws_switchboard)
+try:
+    from app.core import market_bus as _market_bus  # type: ignore
+except Exception:
+    _market_bus = None  # type: ignore
+
+# --------- Load .env ----------
+load_dotenv()
+
+# --------- Label / account context ----------
+ACCOUNT_LABEL: str = os.getenv("ACCOUNT_LABEL", "main").strip() or "main"
+
+# --------- Constants & Config ----------
+BYBIT_BASE = os.getenv("BYBIT_BASE", "https://api.bybit.com").rstrip("/")
+
+# WebSocket URLs (shared across bots)
+BYBIT_WS_PUBLIC_URL = os.getenv(
+    "BYBIT_WS_PUBLIC_URL", "wss://stream.bybit.com/v5/public"
+)
+BYBIT_WS_PRIVATE_URL = os.getenv(
+    "BYBIT_WS_PRIVATE_URL", "wss://stream.bybit.com/v5/private"
+)
+
+# ---------- DRY-RUN / equity fallbacks ----------
+def _truthy(v: str) -> bool:
+    return str(v).strip().lower() in ("1", "true", "yes", "y", "on")
+
+# Executor uses EXEC_DRY_RUN; we mirror that here to keep behavior consistent.
+EXEC_DRY_RUN: bool = _truthy(os.getenv("EXEC_DRY_RUN", "false"))
+
+# Optional hard override (always wins if set). Useful for deterministic tests.
+# Example: set EQUITY_OVERRIDE_USDT=250
+EQUITY_OVERRIDE_USDT_RAW: str = os.getenv("EQUITY_OVERRIDE_USDT", "").strip()
+
+# Default equity to use ONLY when EXEC_DRY_RUN=true and live fetch fails/returns 0.
+# Example: set DRY_EQUITY_USDT=1000
+try:
+    DRY_EQUITY_USDT: Decimal = Decimal(os.getenv("DRY_EQUITY_USDT", "1000").strip() or "1000")
+except Exception:
+    DRY_EQUITY_USDT = Decimal("1000")
+
+
+def _resolve_keys_for_purpose(
+    purpose: str,
+    label: Optional[str] = None,
+) -> Tuple[str, str]:
+    """
+    Resolve (key, secret) for a given purpose ("read" | "trade" | "transfer")
+    and optional ACCOUNT_LABEL.
+    """
+    lab = (label or ACCOUNT_LABEL or "main").strip()
+    lu = lab.upper()
+
+    if purpose == "read":
+        key_names = [
+            f"BYBIT_{lu}_READ_KEY",
+            "BYBIT_MAIN_READ_KEY",
+            "BYBIT_READ_KEY",
+            "BYBIT_API_KEY",
+        ]
+        sec_names = [
+            f"BYBIT_{lu}_READ_SECRET",
+            "BYBIT_MAIN_READ_SECRET",
+            "BYBIT_READ_SECRET",
+            "BYBIT_API_SECRET",
+        ]
+    elif purpose == "trade":
+        key_names = [
+            f"BYBIT_{lu}_TRADE_KEY",
+            "BYBIT_MAIN_TRADE_KEY",
+            "BYBIT_TRADE_KEY",
+            "BYBIT_API_KEY",
+        ]
+        sec_names = [
+            f"BYBIT_{lu}_TRADE_SECRET",
+            "BYBIT_MAIN_TRADE_SECRET",
+            "BYBIT_TRADE_SECRET",
+            "BYBIT_API_SECRET",
+        ]
+    elif purpose == "transfer":
+        key_names = [
+            f"BYBIT_{lu}_TRANSFER_KEY",
+            "BYBIT_MAIN_TRANSFER_KEY",
+            "BYBIT_TRANSFER_KEY",
+            "BYBIT_API_KEY",
+        ]
+        sec_names = [
+            f"BYBIT_{lu}_TRANSFER_SECRET",
+            "BYBIT_MAIN_TRANSFER_SECRET",
+            "BYBIT_TRANSFER_SECRET",
+            "BYBIT_API_SECRET",
+        ]
+    else:
+        raise ValueError(f"Unknown purpose for key resolution: {purpose!r}")
+
+    def _pick(names: List[str]) -> str:
+        for n in names:
+            v = os.getenv(n, "").strip()
+            if v:
+                return v
+        return ""
+
+    return _pick(key_names), _pick(sec_names)
+
+
+def get_api_keys(
+    label: Optional[str] = None,
+    purpose: str = "trade",
+) -> Tuple[str, str]:
+    """
+    Public helper for higher-level code to fetch keys for a given label/purpose.
+    """
+    return _resolve_keys_for_purpose(purpose, label=label)
+
+
+# Backwards-compatible module-level key constants
+KEY_READ, SEC_READ = _resolve_keys_for_purpose("read")
+KEY_TRADE, SEC_TRADE = _resolve_keys_for_purpose("trade")
+KEY_XFER, SEC_XFER = _resolve_keys_for_purpose("transfer")
+
+# Telegram (legacy basic sender; high-volume bots should use notifier_bot)
+TG_TOKEN_MAIN = os.getenv("TG_TOKEN_MAIN", "")
+TG_CHAT_MAIN = os.getenv("TG_CHAT_MAIN", "")
+TG_TOKEN_NOTIF = os.getenv("TG_TOKEN_NOTIF", TG_TOKEN_MAIN)
+TG_CHAT_NOTIF = os.getenv("TG_CHAT_NOTIF", TG_CHAT_MAIN)
+
+# TG spam control
+TG_MAX_MSGS_PER_30S = int(os.getenv("TG_MAX_MSGS_PER_30S", "8"))  # hard cap per process
+_TG_TIMES: deque = deque(maxlen=256)
+_TG_LOCK = threading.Lock()
+
+def _resolve_sub_tg(label: str) -> Tuple[str, str]:
+    """
+    Given an ACCOUNT_LABEL or known sub account context,
+    return (token, chat_id) if a sub-specific bot exists,
+    else return (TG_TOKEN_NOTIF, TG_CHAT_NOTIF).
+    """
+
+    label_clean = str(label).strip().lower()
+
+    # Try direct sub label pattern like "sub_3" or "sub3"
+    parts = label_clean.replace("-", "_").split("_")
+    sub_i = None
+
+    for p in parts:
+        if p.isdigit():
+            sub_i = p
+            break
+        if p.startswith("sub") and p[3:].isdigit():
+            sub_i = p[3:]
+            break
+
+    if sub_i:
+        tok_name = f"TG_TOKEN_SUB_{sub_i}"
+        chat_name = f"TG_CHAT_SUB_{sub_i}"
+
+        tok = os.getenv(tok_name, "").strip()
+        chat = os.getenv(chat_name, "").strip()
+
+        if tok and chat:
+            return tok, chat
+
+    # fallback to notifier/main
+    return TG_TOKEN_NOTIF, TG_CHAT_NOTIF
+
+
+# Policies
+MARGIN_MODE_MAIN = os.getenv("MARGIN_MODE_MAIN", "CROSS").upper()
+USE_MAX_LEVERAGE = os.getenv("USE_MAX_LEVERAGE", "true").lower() == "true"
+GLOBAL_BREAKER = {"on": os.getenv("GLOBAL_BREAKER", "false").lower() == "true"}
+
+# Tiers
+TIER_LEVELS = [
+    Decimal(x)
+    for x in os.getenv(
+        "TIER_LEVELS", "50,100,250,500,1000,2500,5000,10000,25000"
+    ).split(",")
+]
+
+TIER1_SIZE_CAP_PCT = Decimal(os.getenv("TIER1_SIZE_CAP_PCT", "30.0"))
+TIER2_SIZE_CAP_PCT = Decimal(os.getenv("TIER2_SIZE_CAP_PCT", "22.5"))
+TIER3_SIZE_CAP_PCT = Decimal(os.getenv("TIER3_SIZE_CAP_PCT", "15.0"))
+
+TIER1_MAX_CONC = int(os.getenv("TIER1_MAX_CONC", "1"))
+TIER2_MAX_CONC = int(os.getenv("TIER2_MAX_CONC", "2"))
+TIER3_MAX_CONC = int(os.getenv("TIER3_MAX_CONC", "3"))
+
+# MMR guard
+MMR_TRIM_TRIGGER = Decimal(os.getenv("MMR_TRIM_TRIGGER", "75.0"))
+MMR_TRIM_PCT = Decimal(os.getenv("MMR_TRIM_PCT", "33.0"))
+MMR_TRIM_MAX_ROUNDS = int(os.getenv("MMR_TRIM_MAX_ROUNDS", "2"))
+MMR_BREAKER_ON_FAIL = os.getenv("MMR_BREAKER_ON_FAIL", "true").lower() == "true"
+
+# Exit ladder / reachability
+ATR_PERIOD = int(os.getenv("ATR_PERIOD", "14"))
+ATR_MULT = Decimal(os.getenv("ATR_MULT", "1.0"))
+R_MIN_TICKS = int(os.getenv("R_MIN_TICKS", "3"))
+TP5_MAX_ATR_MULT = Decimal(os.getenv("TP5_MAX_ATR_MULT", "3.0"))
+TP5_MAX_PCT = Decimal(os.getenv("TP5_MAX_PCT", "6.0"))
+
+# TP spacing controls (updated default: 3x gaps)
+TP_SPACING_MODE = os.getenv("TP_SPACING_MODE", "geometric").lower()  # geometric | linear
+TP_BASE_MULT_ATR = Decimal(os.getenv("TP_BASE_MULT_ATR", "0.5"))
+TP_SPACING_FACTOR = Decimal(
+    os.getenv("TP_SPACING_FACTOR", "3.0")
+)  # each gap = prev_gap * 3.0
+TP_MIN_TICKS = int(os.getenv("TP_MIN_TICKS", "3"))
+TP_TAG_PREFIX = os.getenv("TP_TAG_PREFIX", "FBTP_")  # orderLinkId prefix
+
+# Drip/Sweep
+DRIP_PCT = Decimal(os.getenv("DRIP_PCT", "10"))
+DRIP_MIN_USD = Decimal(os.getenv("DRIP_MIN_USD", "0"))
+MAIN_BAL_FLOOR_USD = Decimal(os.getenv("MAIN_BAL_FLOOR_USD", "0"))
+SUB_UIDS_ROUND_ROBIN = os.getenv("SUB_UIDS_ROUND_ROBIN", "")
+SWEEP_ALLOCATION = os.getenv("SWEEP_ALLOCATION", "60:MAIN,25:FUNDING,15:SUBS")
+SWEEP_CUTOFF_TZ = os.getenv("SWEEP_CUTOFF_TZ", "Europe/London")
+SWEEP_CUTOFF_HHMM = os.getenv("SWEEP_CUTOFF_HHMM", "23:59")
+
+HTTP_TIMEOUT = float(os.getenv("HTTP_TIMEOUT", "12"))
+RETRY_BACKOFFS = [0.5, 1.0, 2.0]  # seconds
+
+# Heartbeat file for bot liveness tracking
+HEARTBEAT_FILE = os.getenv("HEARTBEAT_FILE", ".state/heartbeats.json")
+_HEARTBEAT_LOCK = threading.Lock()
+
+# Error de-duplication state for alert_bot_error
+_ERROR_LAST: Dict[str, Tuple[str, float]] = {}
+
+# ---------- Public session headers (helps avoid some 403/CDN tantrums) ----------
+_PUBLIC_HEADERS = {
+    "User-Agent": os.getenv(
+        "HTTP_UA",
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Flashback/1.0 (+paper-mode)",
+    ),
+    "Accept": "application/json,text/plain,*/*",
+    "Connection": "keep-alive",
+}
+
+# ---------- Instruments cache (PAPER must not depend on Bybit) ----------
+# Persisted cache path
+_STATE_DIR = Path("state")
+_STATE_DIR.mkdir(parents=True, exist_ok=True)
+_INSTR_CACHE_PATH = _STATE_DIR / "instruments_cache.json"
+
+# In-memory cache
+_INSTR_CACHE: Dict[str, Dict[str, Decimal]] = {}
+
+# Minimal fallback map for common linear perps (safe defaults; will be overwritten by cache/REST when available)
+_DEFAULT_INSTRUMENTS: Dict[str, Dict[str, str]] = {
+    "BTCUSDT": {"tick": "0.10", "step": "0.001", "min_notional": "5"},
+    "ETHUSDT": {"tick": "0.01", "step": "0.001", "min_notional": "5"},
+    "SOLUSDT": {"tick": "0.001", "step": "0.01", "min_notional": "5"},
+    "BNBUSDT": {"tick": "0.01", "step": "0.01", "min_notional": "5"},
+    "XRPUSDT": {"tick": "0.0001", "step": "1", "min_notional": "5"},
+    "ADAUSDT": {"tick": "0.0001", "step": "1", "min_notional": "5"},
+}
+
+
+def _load_instr_cache() -> None:
+    global _INSTR_CACHE
+    if not _INSTR_CACHE_PATH.exists():
+        return
+    try:
+        raw = _INSTR_CACHE_PATH.read_text("utf-8", errors="ignore")
+        js = orjson.loads(raw) if raw else {}
+        if not isinstance(js, dict):
+            return
+        out: Dict[str, Dict[str, Decimal]] = {}
+        for sym, d in js.items():
+            if not isinstance(d, dict):
+                continue
+            try:
+                out[str(sym)] = {
+                    "tick": Decimal(str(d.get("tick", "0.01"))),
+                    "step": Decimal(str(d.get("step", "0.001"))),
+                    "min_notional": Decimal(str(d.get("min_notional", "5"))),
+                }
+            except Exception:
+                continue
+        if out:
+            _INSTR_CACHE.update(out)
+    except Exception:
+        return
+
+
+def _save_instr_cache() -> None:
+    try:
+        js: Dict[str, Dict[str, str]] = {}
+        for sym, d in _INSTR_CACHE.items():
+            js[str(sym)] = {
+                "tick": str(d.get("tick", Decimal("0.01"))),
+                "step": str(d.get("step", Decimal("0.001"))),
+                "min_notional": str(d.get("min_notional", Decimal("5"))),
+            }
+        _INSTR_CACHE_PATH.write_text(orjson.dumps(js).decode("utf-8"), encoding="utf-8")
+    except Exception:
+        return
+
+
+# Load cache at import time
+_load_instr_cache()
+
+
+# --------- Telegram (legacy simple sender, now throttled) ----------
+def _tg_rate_limited() -> bool:
+    """
+    Simple global rate limit:
+      - sliding 30s window
+      - at most TG_MAX_MSGS_PER_30S sends per process
+    """
+    if TG_MAX_MSGS_PER_30S <= 0:
+        return True
+    now = time.time()
+    window = 30.0
+    with _TG_LOCK:
+        while _TG_TIMES and (now - _TG_TIMES[0]) > window:
+            _TG_TIMES.popleft()
+        if len(_TG_TIMES) >= TG_MAX_MSGS_PER_30S:
+            return True
+        _TG_TIMES.append(now)
+        return False
+
+
+def send_tg(text: str, *, label: str = None, main: bool = False) -> None:
+    """
+    Best-effort Telegram sender:
+      - Supports subaccount bot tokens based on label
+      - Falls back to default notifier or main bot
+      - Rate limited
+      - Never raises (network/TG issues are swallowed)
+    """
+
+    # Determine token/chat based on label
+    token = None
+    chat = None
+
+    # 1) If a specific subaccount label is provided
+    if label:
+        # normalize label to look for sub index
+        label_clean = str(label).strip().lower()
+
+        # Try patterns like:
+        #   "sub1", "sub_1", "sub01", "sub_01"
+        # or numeric trailing patterns
+        sub_i = None
+
+        # test direct numeric
+        if label_clean.isdigit():
+            sub_i = label_clean
+
+        # test "subX" or "sub_X"
+        if sub_i is None:
+            parts = label_clean.replace("-", "_").split("_")
+            for p in parts:
+                if p.startswith("sub") and p[3:].isdigit():
+                    sub_i = p[3:]
+                    break
+
+        # if we found a sub index, look for env vars
+        if sub_i:
+            tok_name = f"TG_TOKEN_SUB_{sub_i}"
+            chat_name = f"TG_CHAT_SUB_{sub_i}"
+            tok_env = os.getenv(tok_name, "").strip()
+            chat_env = os.getenv(chat_name, "").strip()
+            if tok_env and chat_env:
+                token = tok_env
+                chat = chat_env
+
+    # 2) If no subaccount token found (or no label)
+    if not token or not chat:
+        if main:
+            token = TG_TOKEN_MAIN
+            chat = TG_CHAT_MAIN
+        else:
+            token = TG_TOKEN_NOTIF or TG_TOKEN_MAIN
+            chat = TG_CHAT_NOTIF or TG_CHAT_MAIN
+
+    # Must have token/chat
+    if not token or not chat:
+        return
+
+    # Rate limit
+    if _tg_rate_limited():
+        return
+
+    # Send
+    try:
+        requests.post(
+            f"https://api.telegram.org/bot{token}/sendMessage",
+            json={"chat_id": chat, "text": text, "disable_web_page_preview": True},
+            timeout=6,
+        )
+    except Exception:
+        return
+
+
+def alert_bot_error(bot_name: str, error: Any, severity: str = "WARN") -> None:
+    """
+    Lightweight, shared error → Telegram helper for bots.
+
+    Anti-spam:
+      - deduplicates identical (bot_name, severity, error) for 60s
+      - still subject to global TG rate limiting
+    """
+
+    try:
+        msg_text = str(error)
+        key = f"{bot_name}:{severity}"
+        now = time.time()
+
+        prev = _ERROR_LAST.get(key)
+        if prev is not None:
+            last_msg, last_ts = prev
+            if last_msg == msg_text and (now - last_ts) < 60.0:
+                return
+
+        _ERROR_LAST[key] = (msg_text, now)
+        msg = f"⚠️ [{bot_name}] ({severity}) {msg_text}"
+        send_tg(msg)
+    except Exception:
+        return
+
+
+def record_heartbeat(bot_name: str) -> None:
+    """
+    Record a lightweight heartbeat for a bot into HEARTBEAT_FILE.
+    """
+    try:
+        path = Path(HEARTBEAT_FILE)
+        path.parent.mkdir(parents=True, exist_ok=True)
+
+        with _HEARTBEAT_LOCK:
+            if path.exists():
+                try:
+                    raw = path.read_bytes()
+                    data = orjson.loads(raw) if raw else {}
+                    if not isinstance(data, dict):
+                        data = {}
+                except Exception:
+                    data = {}
+            else:
+                data = {}
+
+            data[str(bot_name)] = int(time.time())
+            path.write_bytes(orjson.dumps(data))
+    except Exception:
+        return
+
+
+def build_ws_auth_payload(api_key: str, api_secret: str) -> Dict[str, Any]:
+    """
+    Build Bybit v5 private WebSocket auth payload.
+    """
+    if not api_key or not api_secret:
+        raise RuntimeError("Missing API key/secret for WS auth")
+
+    expires = int((time.time() + 1) * 1000)
+    msg = f"GET/realtime{expires}"
+    sig = hmac.new(
+        api_secret.encode("utf-8"),
+        msg.encode("utf-8"),
+        hashlib.sha256,
+    ).hexdigest()
+
+    return {
+        "op": "auth",
+        "args": [api_key, expires, sig],
+    }
+
+
+def build_ws_auth_payload_main() -> Dict[str, Any]:
+    """
+    Convenience wrapper for the CURRENT ACCOUNT_LABEL trading key.
+    """
+    key, secret = _resolve_keys_for_purpose("trade")
+    return build_ws_auth_payload(key, secret)
+
+
+_TIME_OFFSET_MS = 0
+_LAST_SYNC_TS = 0.0
+_SYNC_LOCK = threading.Lock()
+SYNC_INTERVAL_SEC = 300  # 5 minutes
+
+
+def _now_ms() -> int:
+    return int(time.time() * 1000)
+
+
+def _server_ms_fallback() -> int:
+    try:
+        r = requests.get(BYBIT_BASE + "/v5/market/time", timeout=HTTP_TIMEOUT, headers=_PUBLIC_HEADERS)
+        r.raise_for_status()
+        js = r.json()
+        res = js.get("result", {}) or {}
+        if "timeNano" in res:
+            return int(int(res["timeNano"]) / 1_000_000)
+        if "timeSecond" in res:
+            return int(res["timeSecond"]) * 1000
+    except Exception:
+        pass
+    return _now_ms()
+
+
+def sync_time(force: bool = False) -> None:
+    global _TIME_OFFSET_MS, _LAST_SYNC_TS
+    with _SYNC_LOCK:
+        now = time.time()
+        if not force and (now - _LAST_SYNC_TS) < SYNC_INTERVAL_SEC:
+            return
+        srv = _server_ms_fallback()
+        loc = _now_ms()
+        _TIME_OFFSET_MS = srv - loc
+        _LAST_SYNC_TS = now
+
+
+def _ts() -> str:
+    sync_time(False)
+    return str(_now_ms() + _TIME_OFFSET_MS)
+
+
+def _sign(secret: str, payload: str) -> str:
+    return hmac.new(secret.encode(), payload.encode(), hashlib.sha256).hexdigest()
+
+
+def _headers(
+    key: str,
+    secret: str,
+    *,
+    query: str = "",
+    body: str = "",
+) -> Dict[str, str]:
+    """
+    Bybit v5 HMAC: sign (timestamp + api_key + recv_window + (body or query)).
+    """
+    ts = _ts()
+    rw = "20000"
+    payload = ts + key + rw + (body if body else query)
+    sig = _sign(secret, payload)
+    return {
+        "X-BAPI-API-KEY": key,
+        "X-BAPI-TIMESTAMP": ts,
+        "X-BAPI-RECV-WINDOW": rw,
+        "X-BAPI-SIGN": sig,
+        "X-BAPI-SIGN-TYPE": "2",
+        "Content-Type": "application/json",
+        "User-Agent": _PUBLIC_HEADERS.get("User-Agent", "Flashback/1.0"),
+        "Accept": _PUBLIC_HEADERS.get("Accept", "application/json"),
+    }
+
+
+def _check_json_ok(resp_json: Dict[str, Any], url: str) -> Dict[str, Any]:
+    if "retCode" in resp_json:
+        code = resp_json.get("retCode", 0)
+        if code != 0:
+            msg = resp_json.get("retMsg", "unknown error")
+            raise requests.HTTPError(f"Bybit retCode {code}: {msg} ({url})")
+    return resp_json
+
+
+def _with_retries(fn: Callable[[], requests.Response]) -> requests.Response:
+    """
+    Generic HTTP retry wrapper.
+    Also detects Bybit retCode 10002 and triggers sync_time().
+    """
+    last_exc: Optional[Exception] = None
+    for _i, backoff in enumerate([0.0] + RETRY_BACKOFFS):
+        if backoff:
+            time.sleep(backoff)
+        try:
+            r = fn()
+            try:
+                js = r.json()
+                if isinstance(js, dict) and js.get("retCode") == 10002:
+                    sync_time(True)
+                    continue
+            except Exception:
+                pass
+            r.raise_for_status()
+            return r
+        except requests.HTTPError as e:
+            last_exc = e
+            try:
+                js = e.response.json()
+                if js.get("retCode") == 10002:
+                    sync_time(True)
+                    continue
+            except Exception:
+                pass
+        except Exception as e:
+            last_exc = e
+    if last_exc:
+        raise last_exc
+    raise RuntimeError("request failed without exception (unexpected)")
+
+
+def bybit_get(
+    path: str,
+    params: Optional[Dict[str, Any]] = None,
+    key: Optional[str] = None,
+    secret: Optional[str] = None,
+    auth: bool = True,
+) -> Dict[str, Any]:
+    """
+    Authenticated GET with correct v5 signing.
+
+    If key/secret are not provided, uses the resolved READ keys
+    for the current ACCOUNT_LABEL.
+    """
+    params = params or {}
+
+    # If linear category but missing discriminator, default settleCoin
+    if params.get("category") == "linear" and not any(
+        k in params for k in ("symbol", "settleCoin", "baseCoin")
+    ):
+        params["settleCoin"] = "USDT"
+
+    if auth:
+        if not key or not secret:
+            key, secret = _resolve_keys_for_purpose("read")
+
+        url_holder: Dict[str, str] = {"url": BYBIT_BASE + path}
+
+        def _call() -> requests.Response:
+            if params:
+                qs = urlencode(sorted(params.items()))
+                url = f"{BYBIT_BASE}{path}?{qs}"
+            else:
+                qs = ""
+                url = f"{BYBIT_BASE}{path}"
+
+            url_holder["url"] = url
+            headers = _headers(key, secret, query=qs)
+            return requests.get(url, headers=headers, timeout=HTTP_TIMEOUT)
+
+        r = _with_retries(_call)
+        url_used = url_holder["url"]
+    else:
+        def _call_no_auth() -> requests.Response:
+            return requests.get(
+                f"{BYBIT_BASE}{path}", params=params, timeout=HTTP_TIMEOUT, headers=_PUBLIC_HEADERS
+            )
+
+        r = _with_retries(_call_no_auth)
+        url_used = f"{BYBIT_BASE}{path}"
+
+    try:
+        js = r.json()
+    except Exception:
+        raise requests.HTTPError(f"Non-JSON response from Bybit: {url_used}")
+    return _check_json_ok(js, url_used)
+
+
+def bybit_post(
+    path: str,
+    body: Optional[Dict[str, Any]] = None,
+    key: Optional[str] = None,
+    secret: Optional[str] = None,
+) -> Dict[str, Any]:
+    """
+    Authenticated POST:
+      - Signs the exact JSON body string used in the request.
+      - Uses resolved TRADE keys for the current ACCOUNT_LABEL by default.
+    """
+    body = body or {}
+    url = f"{BYBIT_BASE}{path}"
+
+    if not key or not secret:
+        key, secret = _resolve_keys_for_purpose("trade")
+
+    def _call() -> requests.Response:
+        data = orjson.dumps(body).decode()
+        headers = _headers(key, secret, body=data)
+        return requests.post(url, data=data, headers=headers, timeout=HTTP_TIMEOUT)
+
+    r = _with_retries(_call)
+
+    try:
+        js = r.json()
+    except Exception:
+        raise requests.HTTPError(f"Non-JSON response from Bybit: {url}")
+    return _check_json_ok(js, url)
+
+
+def get_equity_usdt() -> Decimal:
+    """
+    Robust unified-account equity fetcher.
+
+    DRY-RUN behavior:
+      - If EQUITY_OVERRIDE_USDT is set → always returns that.
+      - If EXEC_DRY_RUN=true and live fetch fails/returns 0 → returns DRY_EQUITY_USDT.
+    """
+    if EQUITY_OVERRIDE_USDT_RAW:
+        try:
+            v = Decimal(EQUITY_OVERRIDE_USDT_RAW)
+            return v if v > 0 else Decimal("0")
+        except Exception:
+            pass
+
+    try:
+        res = bybit_get("/v5/account/wallet-balance", {"accountType": "UNIFIED"})
+    except Exception:
+        if EXEC_DRY_RUN:
+            return DRY_EQUITY_USDT if DRY_EQUITY_USDT > 0 else Decimal("0")
+        return Decimal("0")
+
+    total = Decimal("0")
+    lists = res.get("result", {}).get("list", []) or []
+    for acc in lists:
+        for coin in acc.get("coin", []) or []:
+            if coin.get("coin") != "USDT":
+                continue
+            raw = coin.get("equity")
+            if raw is None:
+                continue
+            try:
+                val = Decimal(str(raw).strip())
+            except Exception:
+                continue
+            if val < 0:
+                continue
+            total += val
+
+    if total < 0:
+        total = Decimal("0")
+
+    if total <= 0 and EXEC_DRY_RUN:
+        return DRY_EQUITY_USDT if DRY_EQUITY_USDT > 0 else Decimal("0")
+
+    return total
+
+
+def get_mmr_pct() -> Decimal:
+    """
+    Robust MMR% fetcher.
+
+    DRY-RUN:
+      - Must NOT depend on private Bybit endpoints.
+      - Always returns 0.
+    """
+    if EXEC_DRY_RUN:
+        return Decimal("0")
+
+    try:
+        res = bybit_get("/v5/account/wallet-balance", {"accountType": "UNIFIED"})
+    except Exception:
+        return Decimal("0")
+
+    lst = res.get("result", {}).get("list", []) or []
+    if not lst:
+        return Decimal("0")
+    try:
+        return Decimal(str(lst[0].get("marginRatio", "0"))) * Decimal("100")
+    except Exception:
+        return Decimal("0")
+
+
+
+def list_open_positions(
+    category: str = "linear", settle_coin: str = "USDT"
+) -> List[Dict[str, Any]]:
+    """
+    List open positions for the given category.
+
+    IMPORTANT:
+      - In EXEC_DRY_RUN, PAPER training must not depend on Bybit private endpoints.
+        So we return [] to avoid 403s and keep the executor alive.
+    """
+    if EXEC_DRY_RUN:
+        return []
+
+    params: Dict[str, Any] = {"category": category}
+    if category == "linear":
+        params["settleCoin"] = settle_coin
+
+    res = bybit_get("/v5/position/list", params)
+    rows = res.get("result", {}).get("list", []) or []
+    out: List[Dict[str, Any]] = []
+    for p in rows:
+        try:
+            if Decimal(str(p.get("size", "0"))) > 0:
+                out.append(p)
+        except Exception:
+            pass
+    return out
+
+
+def list_open_orders(symbol: Optional[str] = None) -> List[dict]:
+    # DRY-RUN: paper must not depend on private endpoints.
+    if EXEC_DRY_RUN:
+        return []
+
+    params: Dict[str, Any] = {"category": "linear"}
+    if symbol:
+        params["symbol"] = symbol
+    else:
+        params["settleCoin"] = "USDT"
+
+    r = bybit_get("/v5/order/realtime", params)
+    return r.get("result", {}).get("list", []) or []
+
+
+def list_symbol_tp_orders(symbol: str, side_now: str) -> List[dict]:
+    """Return open reduce-only limit orders (TPs) for symbol and current side."""
+    opp = "Sell" if side_now.lower() == "buy" else "Buy"
+    out: List[dict] = []
+    for o in list_open_orders(symbol):
+        try:
+            if (
+                o.get("orderType") == "Limit"
+                and str(o.get("reduceOnly", "False")).lower() == "true"
+                and o.get("side") == opp
+            ):
+                out.append(o)
+        except Exception:
+            pass
+    return out
+
+
+def get_ticks(symbol: str) -> Tuple[Decimal, Decimal, Decimal]:
+    """
+    Return (tick, step, min_notional).
+
+    Design:
+      - PAPER/EXEC_DRY_RUN must not hard-depend on Bybit instruments endpoint.
+      - We use:
+          1) in-memory cache
+          2) persisted cache state/instruments_cache.json
+          3) default fallback map for common symbols
+          4) best-effort REST fetch (public), then cache it
+
+    If REST 403s, we silently fall back (and keep training running).
+    """
+    sym = str(symbol).upper().strip()
+    hit = _INSTR_CACHE.get(sym)
+    if hit:
+        return hit["tick"], hit["step"], hit["min_notional"]
+
+    # Default fallback (safe)
+    if sym in _DEFAULT_INSTRUMENTS:
+        try:
+            d = _DEFAULT_INSTRUMENTS[sym]
+            tick = Decimal(d["tick"])
+            step = Decimal(d["step"])
+            mn = Decimal(d.get("min_notional", "5"))
+            _INSTR_CACHE[sym] = {"tick": tick, "step": step, "min_notional": mn}
+            _save_instr_cache()
+            # In dry-run, stop here. No API begging.
+            if EXEC_DRY_RUN:
+                return tick, step, mn
+        except Exception:
+            pass
+
+    # In EXEC_DRY_RUN, do not crash the executor due to instruments endpoint.
+    # Try REST only if we don't have any fallback.
+    try:
+        r = bybit_get(
+            "/v5/market/instruments-info",
+            {"category": "linear", "symbol": sym},
+            auth=False,
+        )
+        it = (r.get("result", {}) or {}).get("list", [{}])
+        it = it[0] if it else {}
+        tick = Decimal(str(((it.get("priceFilter") or {}).get("tickSize") or "0.01")))
+        step = Decimal(str(((it.get("lotSizeFilter") or {}).get("qtyStep") or "0.001")))
+        min_notional = Decimal("5")
+        _INSTR_CACHE[sym] = {"tick": tick, "step": step, "min_notional": min_notional}
+        _save_instr_cache()
+        return tick, step, min_notional
+    except Exception:
+        # Final fallback: generic (keeps sim alive)
+        tick = Decimal("0.01")
+        step = Decimal("0.001")
+        min_notional = Decimal("5")
+        _INSTR_CACHE[sym] = {"tick": tick, "step": step, "min_notional": min_notional}
+        _save_instr_cache()
+        return tick, step, min_notional
+
+
+def last_price(symbol: str) -> Decimal:
+    """Best-effort public last price.
+    DRY_RUN must not depend on Bybit REST.
+    """
+    if EXEC_DRY_RUN:
+        return Decimal("0")
+    try:
+        r = bybit_get(
+            "/v5/market/tickers",
+            {"category": "linear", "symbol": symbol},
+            auth=False,
+        )
+        lst = (r.get("result", {}) or {}).get("list", []) or []
+        if not lst:
+            return Decimal("0")
+        return Decimal(str(lst[0].get("lastPrice", "0")))
+    except Exception:
+        return Decimal("0")
+
+
+
+def best_bid_ask_ws_first(symbol: str) -> Tuple[Optional[Decimal], Optional[Decimal]]:
+    if _market_bus is None:
+        return None, None
+    try:
+        bid, ask = _market_bus.best_bid_ask(symbol)
+        bid_dec = Decimal(str(bid)) if bid is not None else None
+        ask_dec = Decimal(str(ask)) if ask is not None else None
+        return bid_dec, ask_dec
+    except Exception:
+        return None, None
+
+
+def mid_price_ws_first(symbol: str) -> Optional[Decimal]:
+    if _market_bus is None:
+        return None
+    try:
+        m = _market_bus.mid_price(symbol)
+        return Decimal(str(m)) if m is not None else None
+    except Exception:
+        return None
+
+
+def spread_bps_ws(symbol: str) -> Optional[Decimal]:
+    if _market_bus is None:
+        return None
+    try:
+        s = _market_bus.spread_bps(symbol)
+        return Decimal(str(s)) if s is not None else None
+    except Exception:
+        return None
+
+
+def last_price_ws_first(symbol: str) -> Decimal:
+    """WS-first last price.
+    In EXEC_DRY_RUN, never fall back to REST.
+    """
+    ws_mid = mid_price_ws_first(symbol)
+    if ws_mid is not None and ws_mid > 0:
+        return ws_mid
+    if EXEC_DRY_RUN:
+        return Decimal("0")
+    return last_price(symbol)
+
+
+def qty_from_pct(symbol: str, equity_usdt: Decimal, pct_notional: Decimal) -> Decimal:
+    """
+    Compute order qty from a notional % of equity.
+
+    - Uses WS-first price if available.
+    - Quantizes down to qty step.
+    - Enforces a minimal notional check (best-effort).
+    - Returns Decimal("0") if sizing cannot be computed safely.
+    """
+    sym = str(symbol or "").strip().upper()
+    if not sym:
+        raise ValueError("symbol required")
+
+    try:
+        eq = Decimal(str(equity_usdt))
+    except Exception:
+        raise ValueError("equity_usdt must be Decimal-like")
+    if eq <= 0:
+        return Decimal("0")
+
+    try:
+        pct = Decimal(str(pct_notional))
+    except Exception:
+        raise ValueError("pct_notional must be Decimal-like")
+    if pct <= 0:
+        return Decimal("0")
+
+    notional = (eq * pct) / Decimal("100")
+    if notional <= 0:
+        return Decimal("0")
+
+    px = Decimal("0")
+    try:
+        px = last_price_ws_first(sym)
+    except Exception:
+        px = Decimal("0")
+
+    if px <= 0:
+        try:
+            px = last_price(sym)
+        except Exception:
+            px = Decimal("0")
+
+    if px <= 0:
+        return Decimal("0")
+
+    tick, step, min_notional = get_ticks(sym)
+
+    raw_qty = notional / px
+    qty = qdown(raw_qty, step)
+
+    try:
+        if qty * px < min_notional:
+            return Decimal("0")
+    except Exception:
+        pass
+
+    if qty <= 0:
+        return Decimal("0")
+    return qty
+
+
+
+def _kline(symbol: str, interval: str, limit: int) -> List[List[str]]:
+    r = bybit_get(
+        "/v5/market/kline",
+        {"category": "linear", "symbol": symbol, "interval": interval, "limit": str(limit)},
+        auth=False,
+    )
+    return list(reversed((r.get("result", {}) or {}).get("list", []) or []))
+
+
+def atr14(symbol: str, interval: str = "240", limit: int = 100) -> Decimal:
+    rows = _kline(symbol, interval, limit)
+    if len(rows) < 15:
+        return Decimal("0")
+    trs: List[Decimal] = []
+    prev_close = Decimal(str(rows[0][4]))
+    for i in range(1, len(rows)):
+        high = Decimal(str(rows[i][2]))
+        low = Decimal(str(rows[i][3]))
+        close = Decimal(str(rows[i][4]))
+        tr = max(
+            high - low,
+            abs(high - prev_close),
+            abs(low - prev_close),
+        )
+        trs.append(tr)
+        prev_close = close
+    if len(trs) < 14:
+        return Decimal("0")
+    return sum(trs[-14:]) / Decimal("14")
+
+
+def qdown(x: Decimal, step: Decimal) -> Decimal:
+    if step <= 0:
+        return x
+    return (x / step).quantize(Decimal("0"), rounding=ROUND_DOWN) * step
+
+
+def psnap(x: Decimal, tick: Decimal) -> Decimal:
+    if tick <= 0:
+        return x
+    return (x / tick).quantize(Decimal("0"), rounding=ROUND_DOWN) * tick
+
+
+def pct(val: Decimal, p: Decimal) -> Decimal:
+    return val * p / Decimal(100)
+
+
+def tier_from_equity(eq: Decimal) -> Tuple[int, int]:
+    level = 1
+    for i, th in enumerate(TIER_LEVELS, start=1):
+        level = i
+        if eq < th:
+            break
+    if level <= 3:
+        return 1, level
+    elif level <= 6:
+        return 2, level
+    else:
+        return 3, level
+
+
+def cap_pct_for_tier(tier: int) -> Decimal:
+    return {1: TIER1_SIZE_CAP_PCT, 2: TIER2_SIZE_CAP_PCT, 3: TIER3_SIZE_CAP_PCT}[tier]
+
+
+def max_conc_for_tier(tier: int) -> int:
+    return {1: TIER1_MAX_CONC, 2: TIER2_MAX_CONC, 3: TIER3_MAX_CONC}[tier]
+
+
+def set_cross_margin(symbol: str) -> None:
+    try:
+        bybit_post(
+            "/v5/position/switch-isolated",
+            {"category": "linear", "symbol": symbol, "tradeMode": 0},
+        )
+    except Exception:
+        pass
+
+
+def set_symbol_leverage(symbol: str, lev: int) -> None:
+    try:
+        bybit_post(
+            "/v5/position/set-leverage",
+            {
+                "category": "linear",
+                "symbol": symbol,
+                "buyLeverage": str(lev),
+                "sellLeverage": str(lev),
+            },
+        )
+    except Exception:
+        pass
+
+
+def symbol_max_leverage_default(symbol: str) -> int:
+    return 25 if USE_MAX_LEVERAGE else 5
+
+
+def place_market_entry(
+    symbol: str,
+    side: str,
+    qty: Decimal,
+    leverage: Optional[int] = None,
+) -> Dict[str, Any]:
+    lev = leverage if leverage is not None else symbol_max_leverage_default(symbol)
+    set_cross_margin(symbol)
+    set_symbol_leverage(symbol, lev)
+    body = {
+        "category": "linear",
+        "symbol": symbol,
+        "side": "Buy" if side.upper() == "LONG" else "Sell",
+        "orderType": "Market",
+        "qty": str(qty),
+        "positionIdx": 0,
+    }
+    return bybit_post("/v5/order/create", body)
+
+
+def reduce_only_market(symbol: str, side: str, qty: Decimal) -> Dict[str, Any]:
+    opp = "Sell" if side.lower() == "buy" else "Buy"
+    body = {
+        "category": "linear",
+        "symbol": symbol,
+        "side": opp,
+        "orderType": "Market",
+        "qty": str(qty),
+        "reduceOnly": True,
+        "positionIdx": 0,
+    }
+    return bybit_post("/v5/order/create", body)
+
+
+def set_stop_loss(symbol: str, sl_price: Decimal) -> None:
+    bybit_post(
+        "/v5/position/trading-stop",
+        {
+            "category": "linear",
+            "symbol": symbol,
+            "stopLoss": str(sl_price),
+            "slTriggerBy": "LastPrice",
+        },
+    )
+
+
+def cancel_all(symbol: str) -> None:
+    bybit_post("/v5/order/cancel-all", {"category": "linear", "symbol": symbol})
+
+
+def place_reduce_tp(
+    symbol: str,
+    side_now: str,
+    qty: Decimal,
+    price: Decimal,
+    *,
+    link_id: Optional[str] = None,
+) -> Dict[str, Any]:
+    tp_side = "Sell" if side_now.lower() == "buy" else "Buy"
+    body = {
+        "category": "linear",
+        "symbol": symbol,
+        "side": tp_side,
+        "orderType": "Limit",
+        "qty": str(qty),
+        "price": str(price),
+        "reduceOnly": True,
+    }
+    if link_id:
+        body["orderLinkId"] = link_id
+    return bybit_post("/v5/order/create", body)
+
+
+def _base_tp_delta(symbol: str, entry_px: Decimal) -> Decimal:
+    tick, _, _ = get_ticks(symbol)
+    a = atr14(symbol, interval="60", limit=120)
+    min_by_ticks = tick * TP_MIN_TICKS
+    return max(a * TP_BASE_MULT_ATR, min_by_ticks)
+
+
+def calc_tp_prices(symbol: str, side: str, entry_px: Decimal) -> List[Decimal]:
+    tick, _, _ = get_ticks(symbol)
+    base_gap = _base_tp_delta(symbol, entry_px)
+
+    if TP_SPACING_MODE == "linear":
+        gaps = [base_gap] * 5
+    else:
+        gaps = []

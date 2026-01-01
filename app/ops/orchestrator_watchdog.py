@@ -8,6 +8,7 @@ import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+
 ROOT = Path(__file__).resolve().parents[2]
 STATE = ROOT / "state"
 LOGDIR = STATE / "orchestrator_logs"
@@ -22,8 +23,10 @@ WINDOW_SEC = 10 * 60             # rolling window for MAX_RESTARTS
 BACKOFF_MIN = 2.0
 BACKOFF_MAX = 60.0
 
+
 def _now_ms() -> int:
     return int(time.time() * 1000)
+
 
 def _load_json(p: Path) -> dict:
     try:
@@ -33,8 +36,10 @@ def _load_json(p: Path) -> dict:
     except Exception:
         return {}
 
+
 def _write_json(p: Path, d: dict) -> None:
-    p.write_text(json.dumps(d, indent=2), encoding="utf-8")
+    p.write_text(json.dumps(d, indent=2, sort_keys=True), encoding="utf-8")
+
 
 def _pid_alive(pid: Optional[int]) -> bool:
     if not isinstance(pid, int) or pid <= 0:
@@ -44,6 +49,7 @@ def _pid_alive(pid: Optional[int]) -> bool:
         return str(pid) in (r.stdout or "")
     except Exception:
         return False
+
 
 def _load_manifest_rows() -> list[dict[str, Any]]:
     if not MANIFEST.exists():
@@ -59,6 +65,7 @@ def _load_manifest_rows() -> list[dict[str, Any]]:
             out.append(r)
     return out
 
+
 def _should_run(row: dict[str, Any]) -> bool:
     enabled = bool(row.get("enabled", True))
     enable_ai_stack = bool(row.get("enable_ai_stack", True))
@@ -66,20 +73,26 @@ def _should_run(row: dict[str, Any]) -> bool:
     mode_ok = mode not in ("", "OFF", "DISABLED", "NONE")
     return bool(enabled and enable_ai_stack and mode_ok)
 
+
 def _backoff_for(restart_count: int) -> float:
     # 0->2,1->4,2->8... capped
     b = BACKOFF_MIN * (2 ** max(0, restart_count))
     return float(min(max(b, BACKOFF_MIN), BACKOFF_MAX))
 
+
 def _prune_history_ms(history: list[int], now_ms: int) -> list[int]:
     cutoff = now_ms - (WINDOW_SEC * 1000)
     return [x for x in history if isinstance(x, int) and x >= cutoff]
+
 
 def _start_supervisor(label: str) -> dict:
     STATE.mkdir(parents=True, exist_ok=True)
     LOGDIR.mkdir(parents=True, exist_ok=True)
 
     env = os.environ.copy()
+    env["PYTHONUTF8"] = "1"
+    env["PYTHONIOENCODING"] = "utf-8"
+    env["PYTHONLEGACYWINDOWSSTDIO"] = "0"
     env["ACCOUNT_LABEL"] = label
 
     cmd = [sys.executable, "-m", "app.bots.supervisor_ai_stack"]
@@ -101,7 +114,6 @@ def _start_supervisor(label: str) -> dict:
             creationflags=subprocess.CREATE_NEW_PROCESS_GROUP if os.name == "nt" else 0,
         )
 
-    # give it a moment to crash loudly
     time.sleep(0.25)
     pid = int(p.pid)
     alive = _pid_alive(pid)
@@ -115,8 +127,19 @@ def _start_supervisor(label: str) -> dict:
         "stderr_log": str(err_log),
     }
 
+
+def _kill_pid(pid: Optional[int]) -> None:
+    if not isinstance(pid, int) or pid <= 0:
+        return
+    try:
+        subprocess.run(["taskkill", "/PID", str(pid), "/F"], capture_output=True, text=True)
+    except Exception:
+        pass
+
+
 def main() -> int:
     STATE.mkdir(parents=True, exist_ok=True)
+    LOGDIR.mkdir(parents=True, exist_ok=True)
 
     rows = _load_manifest_rows()
     only = (os.getenv("ORCH_ONLY_LABELS") or "").strip()
@@ -135,8 +158,11 @@ def main() -> int:
     checked: List[str] = []
     restarted: List[str] = []
     blocked: List[str] = []
+    alive_labels: List[str] = []
+    skipped_backoff: List[str] = []
 
-    # Build expected labels from manifest
+    now = _now_ms()
+
     for r in rows:
         label = str(r.get("account_label") or "").strip()
         if not label:
@@ -148,45 +174,142 @@ def main() -> int:
 
         checked.append(label)
 
-        # existing supervisor from orch_state (may be stale if previous watchdog didn't update it)
+        # existing supervisor from orch_state
         pinfo = procs.get(label) if isinstance(procs.get(label), dict) else {}
-        pid = pinfo.get("pid")
+        pid_val = pinfo.get("pid")
         try:
-            pid_int = int(pid) if pid is not None else None
+            pid_int = int(pid_val) if pid_val is not None else None
         except Exception:
             pid_int = None
 
-        alive = _pid_alive(pid_int)
+        is_alive = _pid_alive(pid_int)
 
-        # watchdog per-label state
         st = labels_state.get(label) if isinstance(labels_state.get(label), dict) else {}
-        now = _now_ms()
         hist = st.get("restart_history_ms") if isinstance(st.get("restart_history_ms"), list) else []
         hist = [int(x) for x in hist if isinstance(x, int) or (isinstance(x, str) and x.isdigit())]
         hist = _prune_history_ms(hist, now)
 
         restart_count = int(st.get("restart_count") or 0)
+        last_restart_ts = int(st.get("last_restart_ts_ms") or 0)
         blocked_flag = bool(st.get("blocked")) if "blocked" in st else False
         blocked_reason = st.get("blocked_reason")
 
-        # If we have too many restarts in window, block hard.
+        # too many restarts -> block
         if (len(hist) >= MAX_RESTARTS) or (restart_count >= MAX_RESTARTS):
             blocked_flag = True
             blocked_reason = blocked_reason or "too_many_restarts"
-        # KILL_ON_BLOCK: blocked means STOP the process (best-effort)
-        try:
-            _pid = int(pid) if pid is not None else None
-        except Exception:
-            _pid = None
-        
-        if _pid:
-            try:
-                import subprocess
-                subprocess.run(["taskkill", "/PID", str(_pid), "/F"], capture_output=True, text=True)
-            except Exception:
-                pass
-        
-        # Ensure our watchdog view reflects blocked as not alive
-        alive = False
-        pid = None
-        blocked.append(label)
+
+        if blocked_flag:
+            # If blocked, ensure process is dead
+            if is_alive:
+                _kill_pid(pid_int)
+            procs[label] = {
+                **(pinfo if isinstance(pinfo, dict) else {}),
+                "pid": None,
+                "alive": False,
+                "blocked": True,
+                "blocked_reason": blocked_reason,
+                "last_checked_ts_ms": now,
+            }
+            labels_state[label] = {
+                **(st if isinstance(st, dict) else {}),
+                "blocked": True,
+                "blocked_reason": blocked_reason,
+                "restart_history_ms": hist,
+                "restart_count": restart_count,
+                "last_checked_ts_ms": now,
+                "last_restart_ts_ms": last_restart_ts,
+            }
+            blocked.append(label)
+            continue
+
+        if is_alive:
+            procs[label] = {
+                **(pinfo if isinstance(pinfo, dict) else {}),
+                "pid": pid_int,
+                "alive": True,
+                "blocked": False,
+                "last_checked_ts_ms": now,
+            }
+            labels_state[label] = {
+                **(st if isinstance(st, dict) else {}),
+                "blocked": False,
+                "blocked_reason": None,
+                "restart_history_ms": hist,
+                "restart_count": restart_count,
+                "last_checked_ts_ms": now,
+                "last_restart_ts_ms": last_restart_ts,
+            }
+            alive_labels.append(label)
+            continue
+
+        # dead -> respect backoff
+        backoff_sec = _backoff_for(restart_count)
+        if last_restart_ts and (now - last_restart_ts) < int(backoff_sec * 1000):
+            skipped_backoff.append(label)
+            procs[label] = {
+                **(pinfo if isinstance(pinfo, dict) else {}),
+                "pid": None,
+                "alive": False,
+                "blocked": False,
+                "backoff_sec": backoff_sec,
+                "last_checked_ts_ms": now,
+            }
+            labels_state[label] = {
+                **(st if isinstance(st, dict) else {}),
+                "blocked": False,
+                "blocked_reason": None,
+                "restart_history_ms": hist,
+                "restart_count": restart_count,
+                "last_checked_ts_ms": now,
+                "last_restart_ts_ms": last_restart_ts,
+            }
+            continue
+
+        # restart
+        info = _start_supervisor(label)
+        restarted.append(label)
+
+        hist = _prune_history_ms(hist + [now], now)
+        restart_count = restart_count + 1
+
+        procs[label] = {
+            **(pinfo if isinstance(pinfo, dict) else {}),
+            **info,
+            "blocked": False,
+            "blocked_reason": None,
+            "restart_count": restart_count,
+            "backoff_sec": _backoff_for(restart_count),
+            "last_checked_ts_ms": now,
+        }
+
+        labels_state[label] = {
+            **(st if isinstance(st, dict) else {}),
+            "blocked": False,
+            "blocked_reason": None,
+            "restart_history_ms": hist,
+            "restart_count": restart_count,
+            "last_restart_ts_ms": now,
+            "last_checked_ts_ms": now,
+        }
+
+    orch_out = {"ts_ms": now, "procs": procs}
+    wd_out = {"ts_ms": now, "labels": labels_state, "checked": checked}
+
+    _write_json(ORCH_STATE, orch_out)
+    _write_json(WATCHDOG_STATE, wd_out)
+
+    print(
+        f"[watchdog] checked={len(checked)} alive={len(alive_labels)} restarted={len(restarted)} "
+        f"blocked={len(blocked)} backoff_skips={len(skipped_backoff)}"
+    )
+    if restarted:
+        print("[watchdog] restarted:", ", ".join(restarted[:50]))
+    if blocked:
+        print("[watchdog] blocked:", ", ".join(blocked[:50]))
+
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

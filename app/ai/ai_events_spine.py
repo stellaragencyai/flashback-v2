@@ -1362,20 +1362,38 @@ def build_outcome_record(
     trade_id: str,
     symbol: str,
     account_label: str,
-    strategy: str,
-    pnl_usd: float,
+    strategy: str = "",
+    pnl_usd: float = 0.0,
     r_multiple: Optional[float] = None,
     win: Optional[bool] = None,
     exit_reason: Optional[str] = None,
     extra: Optional[Dict[str, Any]] = None,
+    # --- backward-compat inputs (legacy producers) ---
+    strategy_name: Optional[str] = None,
+    timeframe: Optional[str] = None,
+    # swallow anything else without exploding the pipeline
+    **_ignored: Any,
 ) -> OutcomeRecord:
+    """
+    Backward-compatible OutcomeRecord builder.
+
+    Canonical fields:
+      - strategy (preferred)
+    Compatibility:
+      - strategy_name -> strategy (only if strategy not provided)
+      - timeframe is stored top-level and also echoed into payload.extra["timeframe"]
+      - extra dict is preserved
+      - unknown kwargs are ignored safely
+    """
+    strat = _safe_str(strategy) or _safe_str(strategy_name) or "unknown"
+
     payload: OutcomeRecord = {
         "event_type": "outcome_record",
         "ts": _now_ms(),
         "trade_id": trade_id,
         "symbol": symbol,
         "account_label": account_label,
-        "strategy": strategy,
+        "strategy": strat,
         "payload": {
             "pnl_usd": float(pnl_usd),
             "r_multiple": float(r_multiple) if r_multiple is not None else None,
@@ -1384,13 +1402,21 @@ def build_outcome_record(
         },
     }
 
-    if extra:
-        payload["payload"]["extra"] = extra
+    # Optional timeframe
+    tf = _normalize_timeframe(timeframe)
+    if tf is not None:
+        payload["timeframe"] = tf
+
+    # Preserve/merge extra
+    ex = dict(extra or {})
+    if tf is not None and "timeframe" not in ex:
+        ex["timeframe"] = tf
+
+    if ex:
+        payload["payload"]["extra"] = ex
 
     _stamp_policy(payload)  # type: ignore[arg-type]
     return payload
-
-
 def _env_bool(name: str, default: str = "true") -> bool:
     raw = str(os.getenv(name, default)).strip().lower()
     return raw in ("1", "true", "yes", "y", "on")

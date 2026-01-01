@@ -86,6 +86,7 @@ from app.sim.paper_broker import PaperBroker  # type: ignore
 # ✅ NEW: canonical policy gate + audit log
 from app.ai.ai_scoreboard_gatekeeper_v1 import scoreboard_gate_decide
 from app.ai.ai_executor_gate import ai_gate_decide, load_setup_policy, resolve_policy_cfg_for_strategy
+from app.core.ai_decision_stub_emitter import ensure_default_ai_decision
 
 log = get_logger("executor_v2")
 
@@ -1777,46 +1778,11 @@ async def handle_strategy_signal(strat_name: str, strat_cfg: Dict[str, Any], sig
 
         trade_id = str(order_id)
 
-        try:
-            if isinstance(pilot_row, dict):
-                pilot_row2 = dict(pilot_row)
-                pilot_row2["trade_id"] = trade_id
-                pilot_row2["client_trade_id"] = client_trade_id
-                pilot_row2["source_trade_id"] = source_trade_id
-                _append_decision(pilot_row2)
-        except Exception:
-            pass
-
-        emit_ai_decision(
-            trade_id=trade_id,
-            client_trade_id=client_trade_id,
-            source_trade_id=source_trade_id,
-            symbol=symbol,
-            account_label=account_label,
-            sub_uid=sub_uid,
-            strategy_id=strat_id,
-            strategy_name=strat_cfg.get("name", strat_name),
-            timeframe=tf_norm,
-            side=str(side),
-            mode=trade_mode,
-            allow=True,
-            decision_code=effective_code,
-            reason=effective_reason,
-            ai_score=features_payload.get("ai_score"),
-            size_multiplier=float(size_multiplier_applied) if size_multiplier_applied != 1.0 else None,
-            extra={
-                "stage": "post_entry",
-                "order_id": trade_id,
-                "join_key": "orderId",
-                "decision_enforced": bool(EXEC_ENFORCE_DECISIONS),
-                "pilot_emitted": bool(pilot_row),
-                "enforced_code": effective_code,
-                "enforced_reason": effective_reason,
-                "enforced_size_multiplier": float(size_multiplier_applied),
-                "label_tf": tf_norm,
-                "label_setup_type": setup_type_norm,
-            },
-        )
+        if isinstance(pilot_row, dict):
+            pilot_row2 = dict(pilot_row)
+            pilot_row2["trade_id"] = trade_id
+            pilot_row2["client_trade_id"] = client_trade_id
+            pilot_row2["source_trade_id"] = source_trade_id
 
         features_payload["trade_id"] = trade_id
         features_payload["order_id"] = trade_id
@@ -1862,6 +1828,23 @@ async def handle_strategy_signal(strat_name: str, strat_cfg: Dict[str, Any], sig
             publish_ai_event(setup_event)
             setup_logged = True
             bound.info("✅ LIVE setup_context emitted trade_id(orderId)=%s client_trade_id=%s source_trade_id=%s symbol=%s", trade_id, client_trade_id, source_trade_id, symbol)
+            # --- Integrity: ensure at least one decision exists for this trade (DEFAULT_OPEN fallback) ---
+            try:
+                ensure_default_ai_decision(
+                    trade_id=trade_id,
+                    account_label=account_label,
+                    symbol=symbol,
+                    mode=str(trade_mode) if 'trade_mode' in locals() else None,
+                    snapshot_fp=snapshot_fp if 'snapshot_fp' in locals() else None,
+                    snapshot_mode=snapshot_mode if 'snapshot_mode' in locals() else None,
+                    snapshot_schema_version=snapshot_schema_version if 'snapshot_schema_version' in locals() else None,
+                    size_multiplier=1.0,
+                    allow=True,
+                    reason="DEFAULT_OPEN_missing_decision",
+                )
+            except Exception:
+                pass
+
         except Exception as e:
             pass  # auto-fix: empty except block
         except Exception as e:
@@ -1991,6 +1974,23 @@ async def handle_strategy_signal(strat_name: str, strat_cfg: Dict[str, Any], sig
             publish_ai_event(setup_event)
             setup_logged = True
             bound.info("✅ PAPER setup_context emitted trade_id=%s source_trade_id=%s symbol=%s", trade_id, source_trade_id, symbol)
+            # --- Integrity: ensure at least one decision exists for this trade (DEFAULT_OPEN fallback) ---
+            try:
+                ensure_default_ai_decision(
+                    trade_id=trade_id,
+                    account_label=account_label,
+                    symbol=symbol,
+                    mode=str(trade_mode) if 'trade_mode' in locals() else None,
+                    snapshot_fp=snapshot_fp if 'snapshot_fp' in locals() else None,
+                    snapshot_mode=snapshot_mode if 'snapshot_mode' in locals() else None,
+                    snapshot_schema_version=snapshot_schema_version if 'snapshot_schema_version' in locals() else None,
+                    size_multiplier=1.0,
+                    allow=True,
+                    reason="DEFAULT_OPEN_missing_decision",
+                )
+            except Exception:
+                pass
+
         except Exception as e:
             pass  # auto-fix: empty except block
         except Exception as e:

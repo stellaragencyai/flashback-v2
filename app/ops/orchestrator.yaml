@@ -1,0 +1,11 @@
+﻿mode: LIVE
+
+only_labels:
+  - flashback01
+  - flashback02
+  - flashback03
+
+processes:
+  supervisor:
+    cmd: python -m app.bots.supervisor_ai_stack
+    restart: true

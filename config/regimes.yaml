@@ -1,0 +1,28 @@
+﻿version: 1.0
+
+regimes:
+
+  trending:
+    description: Sustained directional movement
+    volatility: medium
+    structure: directional
+
+  ranging:
+    description: Mean-reverting price action
+    volatility: low
+    structure: sideways
+
+  volatile:
+    description: Large candles, wide spreads
+    volatility: high
+    structure: chaotic
+
+  momentum_burst:
+    description: Short-lived explosive moves
+    volatility: high
+    structure: impulse
+
+  low_liquidity:
+    description: Thin books, unstable fills
+    volatility: variable
+    structure: fragile

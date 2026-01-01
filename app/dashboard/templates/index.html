@@ -1,0 +1,122 @@
+﻿<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>Flashback Orchestrator Dashboard</title>
+    <style>
+        body {
+            background: #0e1117;
+            color: #e6edf3;
+            font-family: Inter, system-ui, sans-serif;
+            margin: 0;
+            padding: 24px;
+        }
+
+        h1 {
+            margin-bottom: 16px;
+        }
+
+        table {
+            width: 100%;
+            border-collapse: collapse;
+            background: #161b22;
+        }
+
+        th, td {
+            padding: 10px 12px;
+            border-bottom: 1px solid #30363d;
+            text-align: left;
+            font-size: 14px;
+        }
+
+        th {
+            background: #1f242c;
+            position: sticky;
+            top: 0;
+            z-index: 1;
+        }
+
+        tr:hover {
+            background: #1c2128;
+        }
+
+        .pill {
+            padding: 2px 8px;
+            border-radius: 999px;
+            font-size: 12px;
+            font-weight: 600;
+        }
+
+        .ok { background: #238636; }
+        .warn { background: #9e6a03; }
+        .bad { background: #da3633; }
+        .muted { opacity: 0.6; }
+    </style>
+</head>
+<body>
+
+<h1>Flashback Orchestrator</h1>
+
+<table id="fleet">
+    <thead>
+        <tr>
+            <th>Account</th>
+            <th>Status</th>
+            <th>Strategy</th>
+            <th>Trades</th>
+            <th>Win Rate</th>
+            <th>Avg Return</th>
+            <th>Confidence</th>
+            <th>Risk</th>
+            <th>Last Update</th>
+        </tr>
+    </thead>
+    <tbody></tbody>
+</table>
+
+<script>
+async function refresh() {
+    const res = await fetch('/api/state');
+    const data = await res.json();
+
+    const tbody = document.querySelector('#fleet tbody');
+    tbody.innerHTML = '';
+
+    const rows = data.rows || {};
+
+    Object.values(rows).forEach(r => {
+        const tr = document.createElement('tr');
+
+        tr.innerHTML = `
+            <td><strong>${r.account_label}</strong></td>
+            <td>
+                <span class="pill ${r.online ? 'ok' : 'bad'}">
+                    ${r.phase}
+                </span>
+            </td>
+            <td class="muted">${r.strategy_name || '—'}</td>
+            <td>${r.total_trades}</td>
+            <td>${r.win_rate_pct ?? '—'}</td>
+            <td>${r.avg_return_pct ?? '—'}</td>
+            <td>${r.confidence_score ?? '—'}</td>
+            <td>
+                <span class="pill ${
+                    r.risk_state === 'ok' ? 'ok' :
+                    r.risk_state === 'warning' ? 'warn' : 'bad'
+                }">
+                    ${r.risk_state}
+                </span>
+            </td>
+            <td>${new Date(r.last_updated_ms).toLocaleTimeString()}</td>
+        `;
+
+        tbody.appendChild(tr);
+    });
+}
+
+refresh();
+setInterval(refresh, 2000);
+</script>
+
+</body>
+</html>

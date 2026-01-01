@@ -1,0 +1,97 @@
+﻿.city-root {
+  min-height: 100vh;
+  background: radial-gradient(circle at top, #f8fafc, #e5e7eb);
+  padding: 32px;
+  font-family: Inter, system-ui, sans-serif;
+  color: #0f172a;
+}
+
+.city-header {
+  margin-bottom: 20px;
+}
+
+.city-events {
+  background: white;
+  padding: 16px 20px;
+  border-radius: 16px;
+  box-shadow: 0 10px 25px rgba(0,0,0,0.06);
+  margin-bottom: 28px;
+}
+
+.city-events h3 {
+  margin-bottom: 8px;
+}
+
+.city-events ul {
+  padding-left: 18px;
+  color: #334155;
+}
+
+.city-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+  gap: 24px;
+}
+
+.district-card {
+  background: white;
+  border-radius: 18px;
+  padding: 20px;
+  box-shadow: 0 15px 35px rgba(0,0,0,0.08);
+  position: relative;
+}
+
+.district-status {
+  width: 14px;
+  height: 14px;
+  border-radius: 50%;
+  position: absolute;
+  top: 18px;
+  right: 18px;
+}
+
+.district-role {
+  font-size: 13px;
+  color: #64748b;
+  margin-bottom: 16px;
+}
+
+.district-metrics {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 12px;
+  margin-bottom: 14px;
+}
+
+.district-metrics span {
+  font-size: 11px;
+  color: #64748b;
+}
+
+.infra-label {
+  font-size: 11px;
+  margin-top: 10px;
+  margin-bottom: 4px;
+  color: #475569;
+}
+
+.power-bar {
+  height: 8px;
+  background: #e5e7eb;
+  border-radius: 8px;
+  overflow: hidden;
+}
+
+.power-fill {
+  height: 100%;
+  background: linear-gradient(90deg, #22c55e, #eab308, #ef4444);
+}
+
+.traffic {
+  height: 8px;
+  border-radius: 8px;
+}
+
+.traffic.low { background: #22c55e; }
+.traffic.medium { background: #eab308; }
+.traffic.high { background: #ef4444; }

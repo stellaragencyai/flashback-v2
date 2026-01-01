@@ -1,7 +1,11 @@
-# app/core/flashback_common.py
+﻿# app/core/flashback_common.py
 # Flashback shared helpers: Bybit v5 HMAC, Telegram, account state, instruments, sizing utils.
 
 import os
+
+def is_paper_trading() -> bool:
+    return os.getenv("PAPER_TRADING", "").strip().lower() in ("1","true","yes","on")
+
 import time
 import hmac
 import hashlib
@@ -418,7 +422,7 @@ def send_tg(text: str, *, label: str = None, main: bool = False) -> None:
 
 def alert_bot_error(bot_name: str, error: Any, severity: str = "WARN") -> None:
     """
-    Lightweight, shared error → Telegram helper for bots.
+    Lightweight, shared error â†’ Telegram helper for bots.
 
     Anti-spam:
       - deduplicates identical (bot_name, severity, error) for 60s
@@ -437,7 +441,7 @@ def alert_bot_error(bot_name: str, error: Any, severity: str = "WARN") -> None:
                 return
 
         _ERROR_LAST[key] = (msg_text, now)
-        msg = f"⚠️ [{bot_name}] ({severity}) {msg_text}"
+        msg = f"âš ï¸ [{bot_name}] ({severity}) {msg_text}"
         send_tg(msg)
     except Exception:
         return
@@ -616,6 +620,10 @@ def _with_retries(fn: Callable[[], requests.Response]) -> requests.Response:
 
 
 def bybit_get(
+    # === HARD PAPER MODE SAFETY LOCK ===
+# DISABLED (syntax repair):     if os.getenv("PAPER_TRADING", "").lower() in ("1","true","yes","on"):
+# DISABLED (syntax repair):         raise RuntimeError("LIVE BYBIT REST BLOCKED — PAPER_TRADING ENABLED")
+    # === END SAFETY LOCK ===
     path: str,
     params: Optional[Dict[str, Any]] = None,
     key: Optional[str] = None,
@@ -708,8 +716,8 @@ def get_equity_usdt() -> Decimal:
     Robust unified-account equity fetcher.
 
     DRY-RUN behavior:
-      - If EQUITY_OVERRIDE_USDT is set → always returns that.
-      - If EXEC_DRY_RUN=true and live fetch fails/returns 0 → returns DRY_EQUITY_USDT.
+      - If EQUITY_OVERRIDE_USDT is set â†’ always returns that.
+      - If EXEC_DRY_RUN=true and live fetch fails/returns 0 â†’ returns DRY_EQUITY_USDT.
     """
     if EQUITY_OVERRIDE_USDT_RAW:
         try:

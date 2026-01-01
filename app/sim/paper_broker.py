@@ -59,8 +59,10 @@ log = get_logger("paper_broker")
 # ----------------------------
 Side = Literal["long", "short"]
 
+
 @dataclass
 class PaperPosition:
+    # ---- REQUIRED (no defaults) ----
     trade_id: str
     symbol: str
     side: Side
@@ -69,12 +71,14 @@ class PaperPosition:
     risk_usd: float
     stop_price: float
     take_profit_price: float
-
     setup_type: Optional[str]
     timeframe: Optional[str]
     ai_profile: Optional[str]
-
     opened_ms: int
+
+    # ---- OPTIONAL (defaults last) ----
+    client_trade_id: Optional[str] = None
+    source_trade_id: Optional[str] = None
     closed_ms: Optional[int] = None
     exit_price: Optional[float] = None
     exit_reason: Optional[str] = None
@@ -127,6 +131,7 @@ def _load_strategy_for_label(account_label: str) -> Dict[str, Any]:
 _POSITIONS_BUS_PATH: Path = ROOT / "state" / "positions_bus.json"
 _POSITIONS_BUS_PATH.parent.mkdir(parents=True, exist_ok=True)
 
+
 def _safe_read_json(path: Path) -> Any:
     if not path.exists():
         return None
@@ -135,15 +140,19 @@ def _safe_read_json(path: Path) -> Any:
     except Exception:
         return None
 
+
 def _safe_write_json(path: Path, obj: Any) -> None:
     try:
         path.write_text(json.dumps(obj, indent=2, sort_keys=True), encoding="utf-8")
     except Exception as e:
         log.warning("Failed to write %s: %r", path, e)
 
+
 def _paper_position_to_bus_row(account_label: str, pos: PaperPosition) -> Dict[str, Any]:
     return {
         "trade_id": str(pos.trade_id),
+        "client_trade_id": (str(pos.client_trade_id) if pos.client_trade_id else None),
+        "source_trade_id": (str(pos.source_trade_id) if pos.source_trade_id else None),
         "symbol": str(pos.symbol),
         "account_label": str(account_label),
         "side": "Buy" if pos.side == "long" else "Sell",
@@ -162,6 +171,7 @@ def _paper_position_to_bus_row(account_label: str, pos: PaperPosition) -> Dict[s
         "timeframe": pos.timeframe,
         "ai_profile": pos.ai_profile,
     }
+
 
 def _publish_positions_bus(account_label: str, open_positions: List[PaperPosition]) -> None:
     now_ms = _now_ms()
@@ -190,7 +200,18 @@ def _publish_positions_bus(account_label: str, open_positions: List[PaperPositio
 
 
 # ----------------------------
-# AI event (setup) publish (optional)
+# JSONL fail-soft writer
+# ----------------------------
+def _append_jsonl_bytesafe(path: Path, row: dict) -> None:
+    try:
+        with path.open("ab") as f:
+            f.write(json.dumps(row, ensure_ascii=False).encode("utf-8") + b"\n")
+    except Exception:
+        pass
+
+
+# ----------------------------
+# AI event (setup) publish
 # ----------------------------
 def _maybe_publish_setup_context(
     *,
@@ -206,6 +227,7 @@ def _maybe_publish_setup_context(
 ) -> None:
     try:
         from app.ai.ai_events_spine import build_setup_context, publish_ai_event  # type: ignore
+
         evt = build_setup_context(
             trade_id=trade_id,
             symbol=symbol,
@@ -223,6 +245,21 @@ def _maybe_publish_setup_context(
 
 
 # ----------------------------
+# setup_context publish guard + diagnostics
+# ----------------------------
+_SETUP_CTX_FAIL_PATH = ROOT / "state" / "ai_events" / "setup_context.write_failures.jsonl"
+_SETUP_CTX_FAIL_PATH.parent.mkdir(parents=True, exist_ok=True)
+_PUBLISHED_SETUP_TRADE_IDS = set()  # in-process idempotency
+
+
+# ----------------------------
+# Outcome writer diagnostics
+# ----------------------------
+_OUTCOME_WRITE_FAIL_PATH = ROOT / "state" / "ai_events" / "outcomes.v1.write_failures.jsonl"
+_OUTCOME_WRITE_FAIL_PATH.parent.mkdir(parents=True, exist_ok=True)
+
+
+# ----------------------------
 # Outcome writer (v1) (fail-soft, signature-adaptive)
 # ----------------------------
 def _maybe_write_outcome_v1_from_close(
@@ -230,6 +267,8 @@ def _maybe_write_outcome_v1_from_close(
     account_label: str,
     strategy: str,
     trade_id: str,
+    client_trade_id: Optional[str],
+    source_trade_id: Optional[str],
     symbol: str,
     side: Side,
     qty: float,
@@ -248,7 +287,12 @@ def _maybe_write_outcome_v1_from_close(
 ) -> None:
     try:
         from app.ai.outcome_writer import write_outcome_from_paper_close  # type: ignore
-    except Exception:
+    except Exception as e:
+        log.warning("[paper_broker] outcomes.v1 writer import failed: %r", e)
+        _append_jsonl_bytesafe(
+            _OUTCOME_WRITE_FAIL_PATH,
+            {"event_type": "outcome_writer_import_failed", "ts_ms": _now_ms(), "error": repr(e)},
+        )
         return
 
     fn = write_outcome_from_paper_close  # type: ignore
@@ -262,6 +306,8 @@ def _maybe_write_outcome_v1_from_close(
         "account_label": account_label,
         "strategy": strategy,
         "trade_id": trade_id,
+        "client_trade_id": client_trade_id,
+        "source_trade_id": source_trade_id,
         "symbol": symbol,
         "entry_side": "Buy" if side == "long" else "Sell",
         "entry_qty": float(qty),
@@ -275,8 +321,8 @@ def _maybe_write_outcome_v1_from_close(
         "close_reason": str(close_reason),
         "pnl_usd": float(pnl_usd),
         "r_multiple": r_multiple,
-        "setup_type": setup_type,
-        "timeframe": timeframe,
+        "setup_type": (setup_type or ""),
+        "timeframe": (timeframe or ""),
         "ai_profile": ai_profile,
     }
 
@@ -305,7 +351,27 @@ def _maybe_write_outcome_v1_from_close(
         fn(**call_kwargs)  # type: ignore
         log.info("[paper_broker] ✅ outcomes.v1 wrote trade_id=%s", trade_id)
     except Exception as e:
-        log.warning("[paper_broker] outcomes.v1 writer failed: %r", e)
+        log.exception(
+            "[paper_broker] outcomes.v1 writer failed trade_id=%s account=%s symbol=%s setup_type=%s timeframe=%s",
+            trade_id,
+            account_label,
+            symbol,
+            payload.get("setup_type"),
+            payload.get("timeframe"),
+        )
+        _append_jsonl_bytesafe(
+            _OUTCOME_WRITE_FAIL_PATH,
+            {
+                "event_type": "outcome_writer_failed",
+                "ts_ms": _now_ms(),
+                "trade_id": trade_id,
+                "account_label": account_label,
+                "symbol": symbol,
+                "error": repr(e),
+                "payload": payload,
+                "call_kwargs": call_kwargs,
+            },
+        )
 
 
 # ----------------------------
@@ -359,7 +425,10 @@ class PaperBroker:
             )
             log.info(
                 "Loaded existing paper ledger for %s (equity=%.2f, open=%d, closed=%d)",
-                account_label, state.equity, len(state.open_positions), len(state.closed_trades)
+                account_label,
+                state.equity,
+                len(state.open_positions),
+                len(state.closed_trades),
             )
             broker = cls(state, state_path)
             _publish_positions_bus(account_label, state.open_positions)
@@ -383,7 +452,9 @@ class PaperBroker:
         _publish_positions_bus(account_label, state.open_positions)
         log.info(
             "Created new paper ledger for %s (starting_equity=%.2f, risk_pct=%.4f)",
-            account_label, starting_equity, risk_pct
+            account_label,
+            starting_equity,
+            risk_pct,
         )
         return broker
 
@@ -438,7 +509,7 @@ class PaperBroker:
         features: Dict[str, Any],
         extra: Optional[Dict[str, Any]] = None,
         trade_id: Optional[str] = None,
-        log_setup: bool = False,
+        log_setup: bool = False,  # kept for compatibility; invariant is always-on
     ) -> PaperPosition:
         if entry_price <= 0 or stop_price <= 0:
             raise ValueError("entry_price and stop_price must be > 0")
@@ -472,18 +543,45 @@ class PaperBroker:
         trade_id_final = trade_id or self._generate_trade_id(symbol)
         now = _now_ms()
 
-        if log_setup:
-            _maybe_publish_setup_context(
-                trade_id=trade_id_final,
-                symbol=symbol,
-                account_label=self._state.account_label,
-                strategy=self._state.strategy_name,
-                features=features_ext,
-                setup_type=setup_type,
-                timeframe=timeframe,
-                ai_profile=self._state.ai_profile,
-                extra=extra,
-            )
+        # Canonical invariant: setup_context must be emitted once per trade open (PAPER/LEARN_DRY)
+        if trade_id_final not in _PUBLISHED_SETUP_TRADE_IDS:
+            try:
+                _maybe_publish_setup_context(
+                    trade_id=trade_id_final,
+                    symbol=symbol,
+                    account_label=self._state.account_label,
+                    strategy=self._state.strategy_name,
+                    features=features_ext,
+                    setup_type=setup_type,
+                    timeframe=timeframe,
+                    ai_profile=self._state.ai_profile,
+                    extra=extra,
+                )
+                _PUBLISHED_SETUP_TRADE_IDS.add(trade_id_final)
+            except Exception as e:
+                _append_jsonl_bytesafe(
+                    _SETUP_CTX_FAIL_PATH,
+                    {
+                        "event_type": "setup_context_write_failed",
+                        "ts_ms": _now_ms(),
+                        "trade_id": trade_id_final,
+                        "account_label": self._state.account_label,
+                        "symbol": symbol,
+                        "error": repr(e),
+                    },
+                )
+
+        # continuity defaults (never None if we can avoid it)
+        client_tid = (
+            str(extra.get("client_trade_id"))
+            if isinstance(extra, dict) and extra.get("client_trade_id")
+            else trade_id_final
+        )
+        source_tid = (
+            str(extra.get("source_trade_id"))
+            if isinstance(extra, dict) and extra.get("source_trade_id")
+            else trade_id_final
+        )
 
         pos = PaperPosition(
             trade_id=trade_id_final,
@@ -498,14 +596,24 @@ class PaperBroker:
             timeframe=timeframe,
             ai_profile=self._state.ai_profile,
             opened_ms=now,
+            client_trade_id=client_tid,
+            source_trade_id=source_tid,
         )
+
         self._state.open_positions.append(pos)
         self._save()
         _publish_positions_bus(self._state.account_label, self._state.open_positions)
 
         log.info(
             "[paper_broker] OPEN %s %s side=%s size=%.4f entry=%.4f sl=%.4f tp=%.4f risk_usd=%.2f",
-            self._state.account_label, symbol, side, size_val, entry_price, stop_price, take_profit_price, risk_amount
+            self._state.account_label,
+            symbol,
+            side,
+            size_val,
+            entry_price,
+            stop_price,
+            take_profit_price,
+            risk_amount,
         )
         return pos
 
@@ -542,6 +650,8 @@ class PaperBroker:
             account_label=self._state.account_label,
             strategy=self._state.strategy_name,
             trade_id=pos.trade_id,
+            client_trade_id=pos.client_trade_id,
+            source_trade_id=pos.source_trade_id,
             symbol=pos.symbol,
             side=pos.side,
             qty=pos.size,
@@ -561,7 +671,14 @@ class PaperBroker:
 
         log.info(
             "[paper_broker] CLOSE %s %s side=%s exit=%.4f pnl=%.2f R=%s reason=%s equity=%.2f",
-            self._state.account_label, pos.symbol, pos.side, exit_price, pnl, str(r_mult), exit_reason, self._state.equity
+            self._state.account_label,
+            pos.symbol,
+            pos.side,
+            exit_price,
+            pnl,
+            str(r_mult),
+            exit_reason,
+            self._state.equity,
         )
 
     def update_price(self, symbol: str, price: float) -> None:

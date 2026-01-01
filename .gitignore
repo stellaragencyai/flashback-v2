@@ -77,3 +77,14 @@ signals/*.jsonl
 tree.txt
 filesizes.txt
 
+# --- Flashback state / dumps (do NOT commit) ---
+state__pre_parquet_migration/
+state/
+logs/
+*.log
+*.zip
+*.sqlite
+*.db
+*.jsonl
+*.jsonl.*
+snapshot_packs/

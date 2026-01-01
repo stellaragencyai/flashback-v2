@@ -546,3 +546,30 @@ def classify(*args, **kwargs):
         "classify() expected (signal, strat_id:str) or (signal, features:dict); "
         f"got args={args}, kwargs={kwargs}"
     )
+# =========================
+# Optional GPU inference utilities
+# =========================
+try:
+    import torch
+    from app.ai.gpu_runtime import configure_gpu
+    from app.ai.torch_compile import maybe_compile
+
+    _RUNTIME, _DEVICE = configure_gpu()
+except Exception:
+    torch = None
+    _DEVICE = "cpu"
+# =========================
+# =========================
+# GPU-ready classification hook (ML slot)
+# =========================
+def gpu_inference_hook(features):
+    """
+    Placeholder for future ML inference.
+    Safe no-op today.
+    """
+    if torch and _DEVICE == "cuda":
+        with torch.inference_mode():
+            # ML model will live here later
+            pass
+    return None
+# =========================

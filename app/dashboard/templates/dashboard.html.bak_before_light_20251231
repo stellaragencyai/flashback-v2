@@ -1,0 +1,91 @@
+﻿<!DOCTYPE html>
+<html>
+<head>
+  <title>Flashback Trading Cockpit</title>
+  <style>
+    body{font-family:Segoe UI;background:#0d1117;color:#e6edf3;margin:0;padding:20px}
+    h1{margin-bottom:20px}
+    .grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(360px,1fr));gap:16px}
+    .card{background:#161b22;border-radius:12px;padding:16px;box-shadow:0 0 0 1px #30363d}
+    .header{display:flex;justify-content:space-between;align-items:center;margin-bottom:10px}
+    .acct{font-size:18px;font-weight:600}
+    .sub{font-size:12px;color:#8b949e;margin-top:2px}
+    .status{font-size:12px;padding:4px 8px;border-radius:20px}
+    .idle{background:#30363d}
+    .active{background:#238636}
+    .warn{background:#f85149}
+    .metric{display:flex;justify-content:space-between;margin:4px 0;font-size:14px}
+    .badge{display:inline-block;padding:4px 8px;border-radius:6px;font-size:12px;background:#21262d;margin-right:6px}
+    .ok{color:#3fb950}
+    .bad{color:#f85149}
+    .muted{color:#8b949e}
+    .footer{margin-top:10px;font-size:12px;color:#8b949e}
+  </style>
+</head>
+<body>
+  <h1>🧠 Flashback Trading Cockpit</h1>
+
+  <div class="grid">
+    {% for r in rows %}
+    {% set status_class = "idle" %}
+    {% if r.enabled and r.online %}
+      {% set status_class = "active" %}
+    {% elif r.enabled and not r.online %}
+      {% set status_class = "warn" %}
+    {% endif %}
+
+    <div class="card">
+      <div class="header">
+        <div>
+          <div class="acct">{{ r.account_label }}</div>
+          <div class="sub muted">
+            {{ r.strategy_name or "unknown" }}{% if r.strategy_version %} ({{ r.strategy_version }}){% endif %}
+          </div>
+        </div>
+        <div class="status {{ status_class }}">
+          {% if r.enabled and r.online %}RUNNING{% elif r.enabled and not r.online %}STALE/DOWN{% else %}DISABLED{% endif %}
+        </div>
+      </div>
+
+      <div class="metric"><span>Phase</span><span>{{ r.phase }}</span></div>
+      <div class="metric"><span>Open Trade</span><span>{{ "YES" if r.open_trade else "NO" }}</span></div>
+
+      <div class="metric"><span>Total Trades</span><span>{{ r.total_trades }}</span></div>
+      <div class="metric"><span>Win Rate</span>
+        <span>
+          {% if r.win_rate_pct is not none %}
+            {{ r.win_rate_pct }}%
+          {% else %}
+            <span class="muted">n/a</span>
+          {% endif %}
+        </span>
+      </div>
+
+      <div class="metric"><span>Cumulative Return</span>
+        <span>
+          {% if r.cumulative_return_pct is not none %}
+            {% if r.cumulative_return_pct >= 0 %}<span class="ok">{{ r.cumulative_return_pct }}%</span>{% else %}<span class="bad">{{ r.cumulative_return_pct }}%</span>{% endif %}
+          {% else %}
+            <span class="muted">n/a</span>
+          {% endif %}
+        </span>
+      </div>
+
+      <div style="margin-top:8px">
+        <span class="badge">Risk: {{ r.risk_state }}</span>
+        <span class="badge">ML: {{ "READY" if r.ml_ready else "NO" }}</span>
+        <span class="badge">Regime: {{ r.regime or "n/a" }}</span>
+      </div>
+
+      <div class="footer">
+        HB: {% if r.last_heartbeat_ms %}{{ r.last_heartbeat_ms }}{% else %}n/a{% endif %}
+        | Updated: {{ r.last_updated_ms }}
+        | Errors: {{ r.error_count }}
+      </div>
+    </div>
+    {% endfor %}
+  </div>
+
+  <script>setTimeout(()=>location.reload(),4000)</script>
+</body>
+</html>

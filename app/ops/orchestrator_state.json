@@ -1,0 +1,12 @@
+{
+  "timestamp": "2025-12-27T23:11:07.550136",
+  "processes": {
+    "supervisor": {
+      "cmd": "python -m app.bots.supervisor_ai_stack",
+      "alive": false,
+      "pid": 24092,
+      "uptime_sec": 5,
+      "restart_count": 1665
+    }
+  }
+}

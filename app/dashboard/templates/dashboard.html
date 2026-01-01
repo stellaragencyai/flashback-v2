@@ -1,0 +1,531 @@
+﻿<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>Flashback Trading Cockpit</title>
+  <style>
+    :root{
+      --bg: #ffffff;
+      --text: #0f172a;
+      --muted: #64748b;
+      --card: #ffffff;
+      --border: #e2e8f0;
+      --shadow: 0 1px 2px rgba(15, 23, 42, 0.06), 0 10px 30px rgba(15, 23, 42, 0.06);
+
+      --green: #16a34a;
+      --red: #dc2626;
+      --yellow: #f59e0b;
+      --gray: #64748b;
+
+      --chip: #f1f5f9;
+      --chipText: #334155;
+
+      --blue: #2563eb;
+      --blueSoft: rgba(37,99,235,.12);
+      --greenSoft: rgba(22,163,74,.12);
+      --redSoft: rgba(220,38,38,.12);
+      --yellowSoft: rgba(245,158,11,.14);
+      --graySoft: rgba(100,116,139,.12);
+    }
+
+    *{box-sizing:border-box}
+    body{
+      font-family: "Segoe UI", system-ui, -apple-system, Arial, sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      margin: 0;
+      padding: 22px;
+    }
+
+    .topbar{
+      display:flex;
+      align-items:flex-start;
+      justify-content:space-between;
+      gap: 16px;
+      margin-bottom: 14px;
+    }
+
+    h1{
+      margin: 0;
+      font-size: 18px;
+      font-weight: 750;
+      letter-spacing: .2px;
+    }
+
+    .subhead{
+      margin: 6px 0 0 0;
+      color: var(--muted);
+      font-size: 13px;
+      display:flex;
+      gap: 10px;
+      flex-wrap: wrap;
+      align-items:center;
+    }
+
+    .btn{
+      display:inline-flex;
+      align-items:center;
+      gap: 8px;
+      padding: 8px 12px;
+      border: 1px solid var(--border);
+      background: #fff;
+      border-radius: 10px;
+      font-size: 12px;
+      color: var(--chipText);
+      font-weight: 650;
+      cursor: default;
+      box-shadow: 0 1px 0 rgba(15, 23, 42, 0.04);
+      white-space: nowrap;
+    }
+
+    .summary{
+      display:grid;
+      grid-template-columns: repeat(4, minmax(210px, 1fr));
+      gap: 12px;
+      margin-bottom: 16px;
+    }
+
+    .sCard{
+      background: var(--card);
+      border: 1px solid var(--border);
+      border-radius: 14px;
+      padding: 12px 14px;
+      box-shadow: var(--shadow);
+      min-height: 72px;
+      display:flex;
+      justify-content:space-between;
+      align-items:flex-start;
+      gap: 10px;
+    }
+
+    .sK{ color: var(--muted); font-size: 12px; font-weight: 650; }
+    .sV{ margin-top: 6px; font-size: 20px; font-weight: 800; letter-spacing:.2px; }
+
+    .grid{
+      display:grid;
+      grid-template-columns:repeat(3, minmax(360px, 1fr));
+      gap: 14px;
+    }
+
+    @media (max-width: 1180px){
+      .summary{ grid-template-columns: repeat(2, minmax(220px, 1fr)); }
+      .grid{ grid-template-columns:repeat(2, minmax(340px, 1fr)); }
+    }
+    @media (max-width: 820px){
+      .summary{ grid-template-columns: 1fr; }
+      .grid{ grid-template-columns: 1fr; }
+    }
+
+    .card{
+      background: var(--card);
+      border: 1px solid var(--border);
+      border-radius: 16px;
+      padding: 14px;
+      box-shadow: var(--shadow);
+      position: relative;
+      overflow:hidden;
+    }
+
+    /* left accent strip driven by state_color */
+    .card::before{
+      content:"";
+      position:absolute;
+      left:0; top:0; bottom:0;
+      width: 6px;
+      background: var(--graySoft);
+    }
+    .card.green::before{ background: rgba(22,163,74,.85); }
+    .card.yellow::before{ background: rgba(245,158,11,.90); }
+    .card.red::before{ background: rgba(220,38,38,.85); }
+    .card.gray::before{ background: rgba(100,116,139,.55); }
+
+    .header{
+      display:flex;
+      justify-content:space-between;
+      align-items:flex-start;
+      gap: 10px;
+      margin-bottom: 10px;
+      padding-left: 6px;
+    }
+
+    .acctWrap{ display:flex; gap: 10px; align-items:center; }
+
+    .avatar{
+      width: 34px; height: 34px;
+      border-radius: 10px;
+      background: #0f172a;
+      color: #fff;
+      display:flex;
+      align-items:center;
+      justify-content:center;
+      font-weight: 900;
+      font-size: 12px;
+      letter-spacing:.4px;
+      flex: 0 0 auto;
+    }
+
+    .acctName{
+      font-size: 14px;
+      font-weight: 900;
+      line-height: 1.15;
+    }
+
+    .acctMeta{
+      margin-top: 3px;
+      font-size: 12px;
+      color: var(--muted);
+      display:flex;
+      gap: 8px;
+      align-items:center;
+      flex-wrap: wrap;
+    }
+
+    .badge{
+      font-size: 11px;
+      font-weight: 900;
+      border-radius: 999px;
+      padding: 3px 10px;
+      border: 1px solid var(--border);
+      background: var(--chip);
+      color: var(--chipText);
+      text-transform: uppercase;
+      letter-spacing: .35px;
+      white-space: nowrap;
+    }
+
+    .badge.green{ background: var(--greenSoft); border-color: rgba(22,163,74,.25); color: var(--green); }
+    .badge.red{ background: var(--redSoft); border-color: rgba(220,38,38,.25); color: var(--red); }
+    .badge.yellow{ background: var(--yellowSoft); border-color: rgba(245,158,11,.35); color: #92400e; }
+    .badge.gray{ background: var(--graySoft); border-color: rgba(100,116,139,.25); color: var(--gray); }
+
+    .twoCols{
+      display:grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 10px;
+      margin: 10px 0 10px 0;
+      padding-left: 6px;
+    }
+
+    .mini{
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      padding: 10px 12px;
+      background: #fff;
+    }
+
+    .miniK{ font-size: 12px; color: var(--muted); font-weight: 650; }
+    .miniV{ margin-top: 6px; font-size: 18px; font-weight: 900; }
+
+    .tabs{
+      display:grid;
+      grid-template-columns: repeat(3, 1fr);
+      gap: 8px;
+      margin: 10px 0;
+      padding-left: 6px;
+    }
+    .tab{
+      text-align:center;
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      padding: 7px 8px;
+      font-size: 12px;
+      color: var(--chipText);
+      background: #f8fafc;
+      font-weight: 800;
+      user-select:none;
+    }
+    .tab.active{
+      background: #fff;
+      box-shadow: 0 1px 0 rgba(15, 23, 42, 0.04);
+    }
+
+    .triple{
+      display:grid;
+      grid-template-columns: repeat(3, 1fr);
+      gap: 10px;
+      margin: 10px 0;
+      padding-left: 6px;
+    }
+    .stat{
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      padding: 10px 12px;
+      background: #fff;
+    }
+    .statK{ font-size: 12px; color: var(--muted); font-weight: 650; }
+    .statV{ margin-top: 6px; font-size: 14px; font-weight: 900; }
+    .pos{ color: var(--green); }
+    .neg{ color: var(--red); }
+
+    .bar{
+      height: 8px;
+      border-radius: 999px;
+      background: #eef2f7;
+      overflow:hidden;
+      margin-top: 8px;
+      border: 1px solid var(--border);
+    }
+    .fill{
+      height: 100%;
+      width: 0%;
+      background: var(--blue);
+    }
+    .barLabel{
+      display:flex;
+      justify-content:space-between;
+      margin-top: 8px;
+      font-size: 12px;
+      color: var(--muted);
+      font-weight: 650;
+      padding-left: 6px;
+    }
+
+    .chips{
+      display:flex;
+      flex-wrap: wrap;
+      gap: 6px;
+      margin-top: 10px;
+      padding-left: 6px;
+    }
+
+    .chip{
+      display:inline-flex;
+      align-items:center;
+      gap: 6px;
+      padding: 5px 10px;
+      border-radius: 999px;
+      border: 1px solid var(--border);
+      background: var(--chip);
+      font-size: 12px;
+      color: var(--chipText);
+      font-weight: 800;
+      white-space: nowrap;
+      max-width: 100%;
+    }
+
+    .footer{
+      margin-top: 10px;
+      font-size: 12px;
+      color: var(--muted);
+      display:flex;
+      justify-content:space-between;
+      gap: 10px;
+      flex-wrap: wrap;
+      padding-left: 6px;
+    }
+
+    .mono{ font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace; }
+  </style>
+</head>
+
+<body>
+  <div class="topbar">
+    <div>
+      <h1>Flashback Trading Cockpit</h1>
+      <div class="subhead">
+        <span>Auto-refresh every 4s.</span>
+        <span>Yes, it is aggressive.</span>
+        <span>No, you don’t get a “pause” button.</span>
+        <span class="chip">Cards: {{ rows|length }}</span>
+      </div>
+    </div>
+    <div class="btn">Global Dashboard</div>
+  </div>
+
+  {# ------------------------------------------------------------ #}
+  {# Summary tiles computed from rows (truth-first, fail-soft).     #}
+  {# ------------------------------------------------------------ #}
+  {% set ns = namespace(total_equity=0.0, avail=0.0, unreal=0.0, acct_count=0) %}
+  {% for r in rows %}
+    {% if r.account_label and r.account_label not in ["components","version","updatedms","updated_ms","meta","schema_version"] %}
+      {% set ns.acct_count = ns.acct_count + 1 %}
+    {% endif %}
+    {% if r.total_balance is not none %}
+      {% set ns.total_equity = ns.total_equity + (r.total_balance or 0.0) %}
+    {% endif %}
+    {% if r.available_balance is not none %}
+      {% set ns.avail = ns.avail + (r.available_balance or 0.0) %}
+    {% endif %}
+    {# We don’t have true unrealized PnL yet. Use 24h truth pnl as a proxy. #}
+    {% if r.ltm_pnl_24h is not none %}
+      {% set ns.unreal = ns.unreal + (r.ltm_pnl_24h or 0.0) %}
+    {% endif %}
+  {% endfor %}
+
+  <div class="summary">
+    <div class="sCard">
+      <div>
+        <div class="sK">Total Equity</div>
+        <div class="sV">${{ "%.2f"|format(ns.total_equity) }}</div>
+      </div>
+    </div>
+    <div class="sCard">
+      <div>
+        <div class="sK">Available Balance</div>
+        <div class="sV">${{ "%.2f"|format(ns.avail) }}</div>
+      </div>
+    </div>
+    <div class="sCard">
+      <div>
+        <div class="sK">“Unrealized” PnL (proxy: 24h)</div>
+        <div class="sV {% if ns.unreal >= 0 %}pos{% else %}neg{% endif %}">
+          ${{ "%.2f"|format(ns.unreal) }}
+        </div>
+      </div>
+    </div>
+    <div class="sCard">
+      <div>
+        <div class="sK">Total Accounts</div>
+        <div class="sV">{{ ns.acct_count }}</div>
+      </div>
+    </div>
+  </div>
+
+  {# ------------------------------------------------------------ #}
+  {# IMPORTANT: Jinja does not support lambda in sort keys.         #}
+  {# We render in deterministic status order, then sort by label.   #}
+  {# ------------------------------------------------------------ #}
+  {% set status_order = ["RUNNING","ONLINE","STALE","DEGRADED","OFFLINE","DOWN","DISABLED","UNKNOWN"] %}
+  {% set base_rows = rows|sort(attribute="account_label") %}
+
+  <div class="grid">
+    {% for st in status_order %}
+      {% for r in base_rows %}
+        {% set status = ((r.status or "UNKNOWN")|upper) %}
+        {% if status == st %}
+
+          {# ------------------------------------------------------------ #}
+          {# Per-card deterministic display values (fail-soft).            #}
+          {# ------------------------------------------------------------ #}
+          {% set acct = (r.account_label or "unknown") %}
+          {% set color = (r.state_color or "gray") %}
+          {% set strat = (r.strategy_name or "unknown") %}
+          {% set mode = (r.automation_mode or "unknown") %}
+          {% set role = (r.role or "") %}
+          {% set ai = (r.ai_profile or "") %}
+
+          {# Avatar: MA for main, else FB01..FB10 #}
+          {% if acct == "main" %}
+            {% set avatar = "MA" %}
+            {% set acct_name = "Main Trading Account" %}
+          {% else %}
+            {% set digits = acct|replace("flashback","") %}
+            {% set digits = digits|replace("_","") %}
+            {% if digits|length == 1 %}
+              {% set digits = "0" ~ digits %}
+            {% endif %}
+            {% set avatar = "FB" ~ digits %}
+            {% set acct_name = acct %}
+          {% endif %}
+
+          <div class="card {{ color }}">
+            <div class="header">
+              <div class="acctWrap">
+                <div class="avatar">{{ avatar|upper }}</div>
+                <div>
+                  <div class="acctName">{{ acct_name }}</div>
+                  <div class="acctMeta">
+                    <span class="chip">{{ mode }}</span>
+                    <span class="chip">Strategy: {{ strat }}</span>
+                    {% if role %}<span class="chip">Role: {{ role }}</span>{% endif %}
+                    {% if ai %}<span class="chip">AI: {{ ai }}</span>{% endif %}
+                  </div>
+                </div>
+              </div>
+
+              <div class="badge {{ color }}">{{ status }}</div>
+            </div>
+
+            <div class="twoCols">
+              <div class="mini">
+                <div class="miniK">Total Equity</div>
+                <div class="miniV">${{ "%.2f"|format(r.total_balance or 0.0) }}</div>
+              </div>
+              <div class="mini">
+                <div class="miniK">Available Balance</div>
+                <div class="miniV">${{ "%.2f"|format(r.available_balance or 0.0) }}</div>
+              </div>
+            </div>
+
+            <div class="tabs">
+              <div class="tab active">7 Days</div>
+              <div class="tab">30 Days</div>
+              <div class="tab">1 Year</div>
+            </div>
+
+            <div class="triple">
+              <div class="stat">
+                <div class="statK">Trades</div>
+                <div class="statV">{{ r.total_trades or 0 }}</div>
+              </div>
+              <div class="stat">
+                <div class="statK">PnL (24h)</div>
+                <div class="statV {% if (r.ltm_pnl_24h or 0.0) >= 0 %}pos{% else %}neg{% endif %}">
+                  ${{ "%.2f"|format(r.ltm_pnl_24h or 0.0) }}
+                </div>
+              </div>
+              <div class="stat">
+                <div class="statK">Win Rate</div>
+                <div class="statV">{{ "%.2f"|format(r.win_rate_pct or 0.0) }}%</div>
+              </div>
+            </div>
+
+            {# Risk bar: prefer manifest risk_pct; else integrity_score as stability proxy #}
+            {% set risk_pct = r.risk_pct %}
+            {% if risk_pct is none %}
+              {% set risk_pct = (r.integrity_score or 0) %}
+            {% endif %}
+            {% set w = risk_pct %}
+            {% if w < 0 %}{% set w = 0 %}{% endif %}
+            {% if w > 100 %}{% set w = 100 %}{% endif %}
+
+            <div class="barLabel">
+              <span>Risk Level</span>
+              <span>{{ "%.1f"|format(risk_pct or 0.0) }}%</span>
+            </div>
+            <div class="bar">
+              <div class="fill" style="width: {{ w }}%"></div>
+            </div>
+
+            <div class="chips">
+              <span class="chip">Integrity: {{ r.integrity_score or 0 }}/100</span>
+              <span class="chip">Join: {{ "%.2f"|format(r.join_pct or 0.0) }}%</span>
+              <span class="chip">Unknown: {{ "%.2f"|format(r.unknown_pct or 0.0) }}%</span>
+              <span class="chip">Buckets: {{ r.n_buckets if r.n_buckets is not none else "—" }}</span>
+              <span class="chip">LTM Trades: {{ r.ltm_trades_24h or 0 }}</span>
+
+              {% if r.ready_for_full_auto %}
+                <span class="chip">Ready: YES</span>
+              {% else %}
+                <span class="chip">Ready: NO</span>
+              {% endif %}
+
+              {% if r.cull_recommended %}
+                <span class="chip">Cull: YES</span>
+              {% else %}
+                <span class="chip">Cull: NO</span>
+              {% endif %}
+
+              {% if r.integrity_alerts and (r.integrity_alerts|length > 0) %}
+                <span class="chip">Alerts: {{ r.integrity_alerts|join(", ") }}</span>
+              {% else %}
+                <span class="chip">Alerts: none</span>
+              {% endif %}
+            </div>
+
+            <div class="footer">
+              <div>Truth: <span class="mono">{{ r.truth_source or "none" }}</span></div>
+              <div>Freshness: <span class="mono">{{ r.freshness_sec if r.freshness_sec is not none else "—" }}</span>s</div>
+            </div>
+          </div>
+
+        {% endif %}
+      {% endfor %}
+    {% endfor %}
+  </div>
+
+  <script>
+    setTimeout(()=>location.reload(), 4000);
+  </script>
+</body>
+</html>
