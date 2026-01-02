@@ -1,44 +1,43 @@
 ﻿#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Flashback â€” AI Stack Supervisor v3.2 (Ops Truth + worker telemetry bundle)
+Flashback — AI Stack Supervisor v3.3 (Hardened validator + log-safe STOP messages)
 
-Bundle upgrades (v3.2):
-1) Writes supervisor status into state/ops_snapshot.json (best-effort)
-2) Writes per-worker status entries (alive/dead, pid, exitcode)
-3) Tracks restart counts + last restart reason per worker
-4) Rate-limits WARN/ERROR alerts to avoid spam during crash loops
-5) Publishes a compact stack summary (enabled/running/dead)
-
-Keeps:
-- Windows spawn-safe: ZERO side effects at import time.
-- HARD GATE config validation before starting stack
-- Canonical WS launch: app.bots.ws_switchboard only
-- Multiprocessing worker supervision + restarts
+Changes (v3.3):
+1) HARD GATE validator import is robust:
+   - try package import (app.tools.validate_config)
+   - fallback to running validate_config.py by file path (subprocess)
+2) STOP messages are ASCII-only to avoid Windows cp1252 logging crashes
+3) Workers: supports BOTH sync + async entry functions (fixes "coroutine was never awaited")
+4) Keeps: ops_snapshot writes, per-worker telemetry, restart tracking, rate-limited alerts
 """
 
 from __future__ import annotations
 
+import asyncio
+import inspect
 import multiprocessing as mp
 import os
 import signal
+import subprocess
 import sys
 import time
 from pathlib import Path
-from typing import Callable, Dict, Optional, List, Tuple, Any
+from typing import Any, Callable, Dict, List, Optional
 
 # --- PHASE8_IMPORT_PATH_SHIM ---
 import os as _os
 import sys as _sys
 from pathlib import Path as _Path
+
 _ROOT = _Path(__file__).resolve().parents[2]
 if str(_ROOT) not in _sys.path:
     _sys.path.insert(0, str(_ROOT))
-# Force UTF-8 so logs/emoji do not crash on Windows cp1252
-_os.environ.setdefault('PYTHONUTF8','1')
-_os.environ.setdefault('PYTHONIOENCODING','utf-8')
-# --- END PHASE8_IMPORT_PATH_SHIM ---
 
+# Best-effort env defaults (NOTE: does NOT retroactively change sys.stdout encoding)
+_os.environ.setdefault("PYTHONUTF8", "1")
+_os.environ.setdefault("PYTHONIOENCODING", "utf-8")
+# --- END PHASE8_IMPORT_PATH_SHIM ---
 
 
 # ---------------------------------------------------------------------------
@@ -59,6 +58,16 @@ def _get_logger():
             logger_.addHandler(handler)
         logger_.setLevel(logging.INFO)
         return logger_
+
+
+def _ascii_safe(s: str) -> str:
+    """
+    Avoid Windows cp1252 stdout crashes from emoji/unicode in logging.
+    """
+    try:
+        return s.encode("ascii", errors="replace").decode("ascii", errors="ignore")
+    except Exception:
+        return "MESSAGE_ENCODING_ERROR"
 
 
 # ---------------------------------------------------------------------------
@@ -136,13 +145,14 @@ def _load_common(log):
             return None
 
         def send_tg(msg: str) -> None:
-            log.info("[TG Fallback] %s", msg)
+            log.info("[TG Fallback] %s", _ascii_safe(msg))
 
         def alert_bot_error(bot_name: str, msg: str, level: str = "ERROR") -> None:
+            safe = _ascii_safe(msg)
             if level.upper() in ("WARN", "WARNING"):
-                log.warning("[%s] %s", bot_name, msg)
+                log.warning("[%s] %s", bot_name, safe)
             else:
-                log.error("[%s] %s", bot_name, msg)
+                log.error("[%s] %s", bot_name, safe)
 
         return record_heartbeat, send_tg, alert_bot_error
 
@@ -188,37 +198,73 @@ def _file_first_bool_alias(env_file_vars: Dict[str, str], primary_name: str, ali
 
 
 # ---------------------------------------------------------------------------
-# HARD GATE: Config validation
+# HARD GATE: Config validation (robust import + file fallback)
 # ---------------------------------------------------------------------------
 
-def _hard_gate_validate_config(log, send_tg) -> bool:
-    try:
-        from app.tools.validate_config import main as validate_config_main  # type: ignore
-    except Exception as e:
-        msg = f"STOP Config validator import failed: {e}. Refusing to start AI stack."
-        log.error(msg)
-        try:
-            send_tg(msg)
-        except Exception:
-            pass
-        return False
+def _run_validator_by_path(root: Path, log) -> int:
+    """
+    Fallback: run validate_config.py by file path.
+    Returns process return code.
+    """
+    candidate = root / "app" / "tools" / "validate_config.py"
+    if not candidate.exists():
+        log.error("STOP Config validation missing: %s", candidate)
+        return 2
 
     try:
-        rc = validate_config_main()
+        p = subprocess.run([sys.executable, str(candidate)], cwd=str(root), capture_output=True, text=True)
+        out = _ascii_safe(p.stdout or "")
+        err = _ascii_safe(p.stderr or "")
+        if out.strip():
+            log.info("validate_config.py stdout:\n%s", out.strip())
+        if err.strip():
+            log.warning("validate_config.py stderr:\n%s", err.strip())
+        return int(p.returncode or 0)
+    except Exception as e:
+        log.error("STOP Config validator subprocess failed: %s", _ascii_safe(repr(e)))
+        return 3
+
+
+def _hard_gate_validate_config(root: Path, log, send_tg) -> bool:
+    try:
+        from app.tools.validate_config import main as validate_config_main  # type: ignore
+        rc = int(validate_config_main() or 0)
         if rc != 0:
             msg = f"STOP Config validation FAILED (rc={rc}). Refusing to start AI stack."
-            log.error(msg)
+            log.error(_ascii_safe(msg))
             try:
                 send_tg(msg)
             except Exception:
                 pass
             return False
 
-        log.info("Config validation PASS âœ…")
+        log.info("Config validation PASS")
         return True
+
+    except ModuleNotFoundError as e:
+        msg = f"STOP Config validator import failed: {e}. Trying file-path fallback."
+        log.warning(_ascii_safe(msg))
+        try:
+            send_tg(msg)
+        except Exception:
+            pass
+
+        rc = _run_validator_by_path(root, log)
+        if rc != 0:
+            msg2 = f"STOP Config validation FAILED via file fallback (rc={rc}). Refusing to start AI stack."
+            log.error(_ascii_safe(msg2))
+            try:
+                send_tg(msg2)
+            except Exception:
+                pass
+            return False
+
+        log.info("Config validation PASS (file fallback)")
+        return True
+
     except Exception as e:
         msg = f"STOP Config validator crashed: {e}. Refusing to start AI stack."
-        log.error(msg)
+        log.error(_ascii_safe(msg))
         try:
             send_tg(msg)
         except Exception:
@@ -276,7 +322,7 @@ def _label_ai_stack_allowed(root: Path, log, label: str) -> bool:
 
 
 # ---------------------------------------------------------------------------
-# Dynamic import helpers
+# Dynamic import + entry helpers (supports sync + async)
 # ---------------------------------------------------------------------------
 
 def _import_first(log, mod_names: List[str]):
@@ -288,8 +334,49 @@ def _import_first(log, mod_names: List[str]):
             return module
         except Exception as e:
             last_err = e
-            log.warning("Import failed: %s (%s)", m, e)
+            log.warning("Import failed: %s (%s)", m, _ascii_safe(str(e)))
     raise ImportError(f"All imports failed: {mod_names}. Last error: {last_err}")
+
+
+def _run_entry_callable(log, bot_name: str, fn: Callable[..., Any]) -> None:
+    """
+    Run a worker entry callable that might be:
+      - normal sync function
+      - async function (coroutinefunction)
+      - sync function that returns a coroutine
+    """
+    try:
+        if inspect.iscoroutinefunction(fn):
+            log.info("%s entry: async %s()", bot_name, getattr(fn, "__name__", "callable"))
+            asyncio.run(fn())
+            return
+
+        ret = fn()
+        if inspect.iscoroutine(ret):
+            log.info("%s entry: %s() returned coroutine -> asyncio.run()", bot_name, getattr(fn, "__name__", "callable"))
+            asyncio.run(ret)
+            return
+
+        return
+    except RuntimeError as e:
+        # If an event loop is already running (rare in spawned worker),
+        # fall back to creating a new loop explicitly.
+        msg = _ascii_safe(str(e))
+        log.warning("%s entry: runtime loop issue: %s", bot_name, msg)
+        loop = asyncio.new_event_loop()
+        try:
+            asyncio.set_event_loop(loop)
+            if inspect.iscoroutinefunction(fn):
+                loop.run_until_complete(fn())
+            else:
+                ret2 = fn()
+                if inspect.iscoroutine(ret2):
+                    loop.run_until_complete(ret2)
+        finally:
+            try:
+                loop.close()
+            except Exception:
+                pass
 
 
 def _call_entry(log, module, bot_name: str) -> None:
@@ -297,7 +384,7 @@ def _call_entry(log, module, bot_name: str) -> None:
         fn = getattr(module, fn_name, None)
         if callable(fn):
             log.info("%s entry: %s.%s()", bot_name, module.__name__, fn_name)
-            fn()
+            _run_entry_callable(log, bot_name, fn)
             return
     raise AttributeError(f"{module.__name__} has no callable main/loop/run")
 
@@ -310,10 +397,10 @@ def _run_ws_switchboard() -> None:
     log = _get_logger()
     _, _, alert_bot_error = _load_common(log)
     try:
-        mod = _import_first(log, ["app.bots.ws_switchboard"])
-        _call_entry(log, mod, "ws_switchboard")
+        mod = _import_first(log, ["app.core.ws_switchboard"])
+        _call_entry(log, mod, "main")
     except Exception as e:
-        alert_bot_error("ws_switchboard", f"import/runtime error: {e}", "ERROR")
+        alert_bot_error("main", f"import/runtime error: {e}", "ERROR")
 
 
 def _run_tp_sl_manager() -> None:
@@ -395,7 +482,6 @@ class WorkerSpec:
         self.enabled = enabled
         self.target = target
         self.process: Optional[mp.Process] = None
-        # telemetry
         self.restart_count: int = 0
         self.last_restart_ms: int = 0
         self.last_exitcode: Optional[int] = None
@@ -434,36 +520,6 @@ def _should_alert(last_alert_ms: int, min_interval_sec: int) -> bool:
     return (_now_ms() - last_alert_ms) >= int(min_interval_sec * 1000)
 
 
-
-# --- TELEMETRY_V0_2 ---
-def _telemetry_mode():
-    import os
-    return os.getenv("FLASHBACK_MODE", "DRY")
-
-def _telemetry_emit_fleet(account_label, enabled, running, dead):
-    try:
-        from app.ops.ops_state import write_component_status
-        write_component_status(
-            component="fleet_summary",
-            account_label=account_label,
-            ok=(len(dead) == 0),
-            details={
-                "mode": _telemetry_mode(),
-                "enabled_workers": enabled,
-                "running_workers": running,
-                "dead_workers": dead,
-                "counts": {
-                    "enabled": len(enabled),
-                    "running": len(running),
-                    "dead": len(dead),
-                },
-            },
-        )
-    except Exception:
-        pass
-# --- END TELEMETRY_V0_2 ---
-
-
 # ---------------------------------------------------------------------------
 # Supervisor core
 # ---------------------------------------------------------------------------
@@ -471,7 +527,6 @@ def _telemetry_emit_fleet(account_label, enabled, running, dead):
 def _start_worker(log, spec: WorkerSpec) -> None:
     if spec.process is not None and spec.process.is_alive():
         return
-
     log.info("Starting worker %s ...", spec.name)
     p = mp.Process(target=spec.target, name=f"fb_{spec.name}", daemon=False)
     p.start()
@@ -513,13 +568,17 @@ def _supervisor_loop(root: Path, account_label: str, poll_seconds: int, env_file
     log = _get_logger()
     record_heartbeat, send_tg, alert_bot_error = _load_common(log)
 
-    # alert throttle
     alert_min_sec = int(os.getenv("AI_STACK_ALERT_MIN_INTERVAL_SEC", "20") or "20")
     last_alert_ms = 0
 
     log.info("BOOT | ROOT=%s | ACCOUNT_LABEL=%s | poll=%ss", root, account_label, poll_seconds)
-if (Path(_ROOT / "state" / "KILL_SWITCH").exists()):
-    raise SystemExit("KILL SWITCH ACTIVE")
+
+    kill_switch_path = Path(_ROOT) / "state" / "KILL_SWITCH"
+    if kill_switch_path.exists():
+        msg = f"STOP KILL SWITCH ACTIVE: {kill_switch_path}"
+        log.error(_ascii_safe(msg))
+        _ops_write("supervisor_ai_stack", account_label, False, {"phase": "blocked", "reason": "kill_switch"})
+        raise SystemExit(msg)
 
     specs = _build_worker_specs(env_file_vars)
 
@@ -536,21 +595,15 @@ if (Path(_ROOT / "state" / "KILL_SWITCH").exists()):
 
     log.info("AI Stack Supervisor starting for ACCOUNT_LABEL=%s (poll=%ss)", account_label, poll_seconds)
 
-    # ops snapshot: supervisor boot
     _ops_write(
         component="supervisor_ai_stack",
         account_label=account_label,
         ok=True,
-        details={
-            "phase": "boot",
-            "poll_seconds": poll_seconds,
-            "note": "supervisor online",
-        },
+        details={"phase": "boot", "poll_seconds": poll_seconds, "note": "supervisor online"},
     )
-    # DISABLED (indentation repair): _telemetry_emit_fleet(account_label, enabled_names, running_names, dead_names)
 
     try:
-        send_tg(f"ðŸ§© AI Stack Supervisor online (label={account_label}, poll={poll_seconds}s)")
+        send_tg(f"AI Stack Supervisor online (label={account_label}, poll={poll_seconds}s)")
     except Exception:
         pass
 
@@ -565,29 +618,25 @@ if (Path(_ROOT / "state" / "KILL_SWITCH").exists()):
         running_names: List[str] = []
         dead_names: List[str] = []
 
+        if kill_switch_path.exists():
+            msg = f"STOP KILL SWITCH ACTIVE: {kill_switch_path}"
+            log.error(_ascii_safe(msg))
+            _ops_write("supervisor_ai_stack", account_label, False, {"phase": "blocked", "reason": "kill_switch"})
+            raise SystemExit(msg)
+
         for name, spec in specs.items():
             if spec.enabled:
                 enabled_names.append(name)
 
-            # enforce disabled workers are stopped
             if not spec.enabled:
                 if spec.process is not None and spec.process.is_alive():
                     log.info("Worker %s disabled -> stopping.", name)
                     _stop_worker(log, spec)
-
-                # write per-worker ops state
-                _ops_write(
-                    component=f"worker_{name}",
-                    account_label=account_label,
-                    ok=True,
-                    details={"enabled": False, "state": "disabled"},
-                )
+                _ops_write(f"worker_{name}", account_label, True, {"enabled": False, "state": "disabled"})
                 continue
 
-            # enabled worker: ensure running
             alive = (spec.process is not None and spec.process.is_alive())
             if not alive:
-                # if it existed, record exitcode + restart telemetry
                 if spec.process is not None:
                     spec.last_exitcode = spec.process.exitcode
                     spec.restart_count += 1
@@ -606,7 +655,6 @@ if (Path(_ROOT / "state" / "KILL_SWITCH").exists()):
 
                 _start_worker(log, spec)
 
-            # refresh alive status after possible restart
             alive = (spec.process is not None and spec.process.is_alive())
             pid = spec.process.pid if spec.process is not None else None
             if alive:
@@ -614,12 +662,11 @@ if (Path(_ROOT / "state" / "KILL_SWITCH").exists()):
             else:
                 dead_names.append(name)
 
-            # write per-worker ops state
             _ops_write(
-                component=f"worker_{name}",
-                account_label=account_label,
-                ok=bool(alive),
-                details={
+                f"worker_{name}",
+                account_label,
+                bool(alive),
+                {
                     "enabled": True,
                     "alive": bool(alive),
                     "pid": pid,
@@ -630,23 +677,18 @@ if (Path(_ROOT / "state" / "KILL_SWITCH").exists()):
                 },
             )
 
-        # supervisor summary in ops snapshot
         ok_stack = (len(dead_names) == 0)
         _ops_write(
-            component="supervisor_ai_stack",
-            account_label=account_label,
-            ok=ok_stack,
-            details={
+            "supervisor_ai_stack",
+            account_label,
+            ok_stack,
+            {
                 "phase": "running",
                 "poll_seconds": poll_seconds,
                 "enabled": enabled_names,
                 "running": running_names,
                 "dead": dead_names,
-                "counts": {
-                    "enabled": len(enabled_names),
-                    "running": len(running_names),
-                    "dead": len(dead_names),
-                },
+                "counts": {"enabled": len(enabled_names), "running": len(running_names), "dead": len(dead_names)},
             },
         )
 
@@ -654,7 +696,6 @@ if (Path(_ROOT / "state" / "KILL_SWITCH").exists()):
 
 
 def main() -> None:
-    # Make spawn behavior deterministic on Windows.
     try:
         mp.set_start_method("spawn", force=False)
     except RuntimeError:
@@ -663,7 +704,6 @@ def main() -> None:
     log = _get_logger()
     root = _resolve_root()
 
-    # Only MainProcess should do dotenv + boot gating.
     if mp.current_process().name != "MainProcess":
         return
 
@@ -674,10 +714,9 @@ def main() -> None:
 
     record_heartbeat, send_tg, _ = _load_common(log)
 
-    # 1) Gate by subaccounts.yaml if present
     if not _label_ai_stack_allowed(root, log, account_label):
         msg = f"AI Stack Supervisor disabled for label={account_label} by config/subaccounts.yaml"
-        log.info(msg)
+        log.info(_ascii_safe(msg))
         _ops_write("supervisor_ai_stack", account_label, False, {"phase": "disabled", "reason": "subaccounts.yaml gate"})
         try:
             send_tg(f"STOP {msg}")
@@ -685,12 +724,10 @@ def main() -> None:
             pass
         return
 
-    # 2) HARD gate by config validator
-    if not _hard_gate_validate_config(log, send_tg):
+    if not _hard_gate_validate_config(root, log, send_tg):
         _ops_write("supervisor_ai_stack", account_label, False, {"phase": "blocked", "reason": "config validation failed"})
         return
 
-    # 3) Supervisor loop
     try:
         _supervisor_loop(root, account_label, poll_seconds, env_file_vars)
     except KeyboardInterrupt:
@@ -698,8 +735,8 @@ def main() -> None:
         record_heartbeat("supervisor_ai_stack_stopped")
         _ops_write("supervisor_ai_stack", account_label, False, {"phase": "stopped", "reason": "KeyboardInterrupt"})
     except Exception as e:
-        log.exception("supervisor_ai_stack fatal error: %s", e)
-        _ops_write("supervisor_ai_stack", account_label, False, {"phase": "fatal", "error": str(e)})
+        log.exception("supervisor_ai_stack fatal error: %s", _ascii_safe(str(e)))
+        _ops_write("supervisor_ai_stack", account_label, False, {"phase": "fatal", "error": _ascii_safe(str(e))})
         raise
 
 

@@ -1,21 +1,25 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Flashback — WS Switchboard v5.2 (label-safe buses)
+Flashback — WS Switchboard v5.3
 
-Fix:
-- Avoid multi-process collisions on Windows by writing label-specific buses:
-    state/orderbook_bus_<ACCOUNT_LABEL>.json
-    state/trades_bus_<ACCOUNT_LABEL>.json
-    state/public_trades_<ACCOUNT_LABEL>.jsonl
-    state/ws_executions_<ACCOUNT_LABEL>.jsonl
+What changed vs v5.2:
+1) WS ONLINE notification is now Phase-7 notifier based:
+   - Uses app.core.notifier_bot.tg_send (per-subaccount tokens supported)
+   - Also sends a main/global notification
+2) Writes a deterministic WS online truth marker:
+   - state/ws_online/<account_label>.json
+   - Dashboard can consume this to show a green ONLINE button without "estimating"
+3) Resets WS ready flags on close
+   - Optional re-notify on reconnect via WS_ONLINE_RENOTIFY_ON_RECONNECT=true
 
-- Backwards compat:
-    If ACCOUNT_LABEL == "main", mirror writes to legacy:
-      state/orderbook_bus.json
-      state/trades_bus.json
-      state/public_trades.jsonl
-      state/ws_executions.jsonl
+Retains:
+- Self-rotating WS logs (public_trades.jsonl, ws_executions.jsonl)
+- Strategy-driven public symbols
+- Delta-safe positions merge
+- Always-valid buses even when empty
+- Windows-safe atomic writes
+- positions_bus touch loop to avoid false stale alarms
 """
 
 from __future__ import annotations
@@ -31,7 +35,6 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 import websocket  # type: ignore
-import requests
 
 from app.core.logger import get_logger
 
@@ -58,108 +61,20 @@ _ws_public_ready = False
 _already_notified = False
 
 
-# -------------------------
-# Telegram sending (NO circular imports)
-# -------------------------
-
-TG_HTTP_TIMEOUT = float(os.getenv("TG_HTTP_TIMEOUT", "6"))
-
-def _tg_env_pair_for_label(account_label: str, main: bool = False) -> Tuple[str, str]:
-    """
-    Map label -> (token, chat_id).
-    Uses the same env keys as notifier_bot.py.
-
-    main/master:
-      TG_TOKEN_MAIN / TG_CHAT_MAIN
-
-    subs:
-      flashback01 -> TG_TOKEN_SUB_1 / TG_CHAT_SUB_1
-      ...
-      flashback10 -> TG_TOKEN_SUB_10 / TG_CHAT_SUB_10
-    """
-    if main:
-        return os.getenv("TG_TOKEN_MAIN", ""), os.getenv("TG_CHAT_MAIN", "")
-
-    lab = (account_label or "").strip().lower()
-    if lab == "main":
-        return os.getenv("TG_TOKEN_MAIN", ""), os.getenv("TG_CHAT_MAIN", "")
-
-    # flashback01..flashback10 mapping
-    if lab.startswith("flashback") and len(lab) == len("flashback00"):
-        suffix = lab.replace("flashback", "")
-        if suffix.isdigit():
-            n = int(suffix)
-            if 1 <= n <= 10:
-                return os.getenv(f"TG_TOKEN_SUB_{n}", ""), os.getenv(f"TG_CHAT_SUB_{n}", "")
-
-    # fallback: main channel
-    return os.getenv("TG_TOKEN_MAIN", ""), os.getenv("TG_CHAT_MAIN", "")
+def _now_ms() -> int:
+    return int(time.time() * 1000)
 
 
-def _tg_send_raw(text: str, account_label: str, also_main: bool = False) -> None:
-    """
-    Fire-and-forget Telegram send, import-safe.
-    Will NOT crash the process if Telegram flakes or env is missing.
-    """
-    def _send_one(token: str, chat_id: str, msg: str) -> None:
-        if not token or not chat_id:
-            return
-        url = f"https://api.telegram.org/bot{token}/sendMessage"
-        try:
-            requests.post(
-                url,
-                json={"chat_id": chat_id, "text": msg, "disable_web_page_preview": True},
-                timeout=TG_HTTP_TIMEOUT,
-            )
-        except Exception as e:
-            LOG.debug("[TG] send failed: %r", e)
-
-    # per-label send
-    token, chat_id = _tg_env_pair_for_label(account_label, main=False)
-    _send_one(token, chat_id, text)
-
-    # optional also send to main/master
-    if also_main:
-        mtoken, mchat = _tg_env_pair_for_label(account_label, main=True)
-        _send_one(mtoken, mchat, text)
-
-
-def _maybe_get_equity_usdt_safe() -> str:
-    """
-    Attempt to fetch equity using existing project helper if it can be imported safely.
-    If circular import exists elsewhere, this will fail safely and return 'unknown'.
-    """
+def _safe_float(x: Any) -> float:
     try:
-        from app.core.flashback_common import get_equity_usdt  # type: ignore
-        bal = get_equity_usdt()
-        return str(bal)
+        return float(x)
     except Exception:
-        return "unknown"
+        return 0.0
 
 
-def _maybe_send_online_notification(account_label: str) -> None:
-    """
-    Once both private & public WS streams are connected,
-    send a Telegram notification via the subaccount bot (if configured),
-    and optionally also via the global/master bot.
-    This only runs once per process start.
-    """
-    global _ws_private_ready, _ws_public_ready, _already_notified
-
-    if _already_notified:
-        return
-    if not (_ws_private_ready and _ws_public_ready):
-        return
-
-    balance = _maybe_get_equity_usdt_safe()
-
-    msg_sub = f"🚀 WS ONLINE — {account_label}\n💰 Balance: {balance} USDT"
-    msg_main = f"📡 {account_label} is ONLINE — balance ≈ {balance} USDT"
-
-    _tg_send_raw(msg_sub, account_label, also_main=False)
-    _tg_send_raw(msg_main, account_label, also_main=True)
-
-    _already_notified = True
+def _env_bool(name: str, default: str = "false") -> bool:
+    raw = os.getenv(name, default)
+    return str(raw).strip().lower() in ("1", "true", "yes", "y", "on")
 
 
 # ---------------------------------------------------------------------------
@@ -173,23 +88,14 @@ except Exception:
 STATE_DIR: Path = ROOT / "state"
 STATE_DIR.mkdir(parents=True, exist_ok=True)
 
-ACCOUNT_LABEL: str = (os.getenv("ACCOUNT_LABEL", "main").strip() or "main")
-IS_MAIN: bool = (ACCOUNT_LABEL == "main")
-
-# Shared positions bus (label-blocked inside JSON) is OK to keep shared
 POSITIONS_BUS_PATH: Path = STATE_DIR / "positions_bus.json"
+ORDERBOOK_BUS_PATH: Path = STATE_DIR / "orderbook_bus.json"
+TRADES_BUS_PATH: Path = STATE_DIR / "trades_bus.json"
+PUBLIC_TRADES_PATH: Path = STATE_DIR / "public_trades.jsonl"
+EXECUTIONS_PATH: Path = STATE_DIR / "ws_executions.jsonl"
 
-# Label-specific buses to avoid collisions
-ORDERBOOK_BUS_PATH: Path = STATE_DIR / f"orderbook_bus_{ACCOUNT_LABEL}.json"
-TRADES_BUS_PATH: Path = STATE_DIR / f"trades_bus_{ACCOUNT_LABEL}.json"
-PUBLIC_TRADES_PATH: Path = STATE_DIR / f"public_trades_{ACCOUNT_LABEL}.jsonl"
-EXECUTIONS_PATH: Path = STATE_DIR / f"ws_executions_{ACCOUNT_LABEL}.jsonl"
-
-# Legacy paths (mirrored for main only)
-LEGACY_ORDERBOOK_BUS_PATH: Path = STATE_DIR / "orderbook_bus.json"
-LEGACY_TRADES_BUS_PATH: Path = STATE_DIR / "trades_bus.json"
-LEGACY_PUBLIC_TRADES_PATH: Path = STATE_DIR / "public_trades.jsonl"
-LEGACY_EXECUTIONS_PATH: Path = STATE_DIR / "ws_executions.jsonl"
+WS_ONLINE_DIR: Path = STATE_DIR / "ws_online"
+WS_ONLINE_DIR.mkdir(parents=True, exist_ok=True)
 
 TRADES_BUS_MAX_PER_SYMBOL: int = int(os.getenv("TRADES_BUS_MAX_PER_SYMBOL", "200"))
 
@@ -215,53 +121,6 @@ WS_RECONNECT_MAX_SEC: float = float(os.getenv("WS_RECONNECT_MAX_SEC", "30"))
 WS_DEBUG_ORDERBOOK: bool = os.getenv("WS_DEBUG_ORDERBOOK", "false").strip().lower() in ("1", "true", "yes", "y")
 WS_DEBUG_ORDERBOOK_EVERY: int = int(os.getenv("WS_DEBUG_ORDERBOOK_EVERY", "200"))
 _WS_ORDERBOOK_SEEN: int = 0
-
-
-def _now_ms() -> int:
-    return int(time.time() * 1000)
-
-
-def _safe_float(x: Any) -> float:
-    try:
-        return float(x)
-    except Exception:
-        return 0.0
-
-
-def _env_bool(name: str, default: str = "false") -> bool:
-    raw = os.getenv(name, default)
-    return str(raw).strip().lower() in ("1", "true", "yes", "y", "on")
-
-
-def normalize_position(raw: dict, account_label: str) -> dict:
-    symbol = str(raw.get("symbol", "")).upper()
-    side = str(raw.get("side", "")).title()
-
-    size = _safe_float(raw.get("size", 0))
-    avg = _safe_float(raw.get("avgPrice", raw.get("entryPrice", 0)))
-
-    sl_raw = raw.get("stopLoss") or raw.get("stopLossPrice") or raw.get("slPrice") or 0
-    stop_loss = _safe_float(sl_raw)
-
-    sub_uid = (
-        raw.get("sub_uid")
-        or raw.get("subAccountId")
-        or raw.get("accountId")
-        or raw.get("subId")
-        or ""
-    )
-    sub_uid = str(sub_uid)
-
-    return {
-        "symbol": symbol,
-        "side": side,
-        "size": size,
-        "avgPrice": avg,
-        "stopLoss": stop_loss,
-        "sub_uid": sub_uid,
-        "account_label": account_label,
-        "category": "linear",
-    }
 
 
 # -------------------------
@@ -303,31 +162,10 @@ def _atomic_write_json(path: Path, payload: Dict[str, Any]) -> None:
             pass
 
 
-def _atomic_write_json_mirror_main(path: Path, payload: Dict[str, Any]) -> None:
-    """
-    Write to label-specific path, and mirror to legacy path for main only.
-    """
-    _atomic_write_json(path, payload)
-    if IS_MAIN:
-        if path == ORDERBOOK_BUS_PATH:
-            _atomic_write_json(LEGACY_ORDERBOOK_BUS_PATH, payload)
-        elif path == TRADES_BUS_PATH:
-            _atomic_write_json(LEGACY_TRADES_BUS_PATH, payload)
-
-
 def _append_jsonl(path: Path, row: Dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("a", encoding="utf-8") as f:
         f.write(json.dumps(row, separators=(",", ":"), ensure_ascii=False) + "\n")
-
-
-def _append_jsonl_mirror_main(path: Path, row: Dict[str, Any]) -> None:
-    _append_jsonl(path, row)
-    if IS_MAIN:
-        if path == PUBLIC_TRADES_PATH:
-            _append_jsonl(LEGACY_PUBLIC_TRADES_PATH, row)
-        elif path == EXECUTIONS_PATH:
-            _append_jsonl(LEGACY_EXECUTIONS_PATH, row)
 
 
 def _load_json(path: Path) -> Dict[str, Any]:
@@ -344,18 +182,11 @@ def _load_json(path: Path) -> Dict[str, Any]:
 def _ensure_bus_files_exist() -> None:
     try:
         if not ORDERBOOK_BUS_PATH.exists():
-            _atomic_write_json_mirror_main(ORDERBOOK_BUS_PATH, {"version": 1, "updated_ms": 0, "symbols": {}})
+            _atomic_write_json(ORDERBOOK_BUS_PATH, {"version": 1, "updated_ms": 0, "symbols": {}})
         if not TRADES_BUS_PATH.exists():
-            _atomic_write_json_mirror_main(TRADES_BUS_PATH, {"version": 1, "updated_ms": 0, "symbols": {}})
+            _atomic_write_json(TRADES_BUS_PATH, {"version": 1, "updated_ms": 0, "symbols": {}})
         if not POSITIONS_BUS_PATH.exists():
             _atomic_write_json(POSITIONS_BUS_PATH, {"version": 2, "updated_ms": 0, "labels": {}})
-
-        # For main, ensure legacy also exists (some older monitors might check existence)
-        if IS_MAIN:
-            if not LEGACY_ORDERBOOK_BUS_PATH.exists():
-                _atomic_write_json(LEGACY_ORDERBOOK_BUS_PATH, {"version": 1, "updated_ms": 0, "symbols": {}})
-            if not LEGACY_TRADES_BUS_PATH.exists():
-                _atomic_write_json(LEGACY_TRADES_BUS_PATH, {"version": 1, "updated_ms": 0, "symbols": {}})
     except Exception as e:
         LOG.error("Failed ensuring bus files exist: %s", e)
 
@@ -379,6 +210,7 @@ def _ensure_label_block(existing: Dict[str, Any], account_label: str) -> Dict[st
 
 def _touch_positions_bus_forever(interval_sec: int, account_label: str, stop_event: threading.Event) -> None:
     LOG.info("Starting positions_bus touch loop (interval=%ss)", interval_sec)
+
     while not stop_event.is_set():
         try:
             existing = _load_json(POSITIONS_BUS_PATH)
@@ -395,6 +227,116 @@ def _touch_positions_bus_forever(interval_sec: int, account_label: str, stop_eve
 
 
 # -------------------------
+# WS ONLINE truth marker + Telegram
+# -------------------------
+
+def _write_ws_online_marker(account_label: str, balance: Any) -> None:
+    """
+    Deterministic truth source for dashboard + ops.
+    """
+    payload = {
+        "version": 1,
+        "account_label": account_label,
+        "ts_ms": _now_ms(),
+        "balance": balance,
+        "ws_private_ready": bool(_ws_private_ready),
+        "ws_public_ready": bool(_ws_public_ready),
+    }
+    path = WS_ONLINE_DIR / f"{account_label}.json"
+    _atomic_write_json(path, payload)
+
+
+def _maybe_send_online_notification(account_label: str) -> None:
+    """
+    Once both private & public WS streams are connected, send:
+      - per-subaccount Telegram: channel=account_label
+      - global/main Telegram: channel="main"
+    Also writes a WS online marker file for dashboard truth.
+
+    This only runs once per process start (unless WS_ONLINE_RENOTIFY_ON_RECONNECT=true).
+    """
+    global _ws_private_ready, _ws_public_ready, _already_notified
+
+    if _already_notified:
+        return
+
+    if not (_ws_private_ready and _ws_public_ready):
+        return
+
+    # Lazy imports to avoid circular import landmines.
+    get_equity_usdt = None
+    tg_send = None
+    try:
+        from app.core.flashback_common import get_equity_usdt as _geu  # type: ignore
+        get_equity_usdt = _geu
+    except Exception as e:
+        LOG.debug("Lazy import failed: get_equity_usdt: %r", e)
+
+    try:
+        from app.core.notifier_bot import tg_send as _tg_send  # type: ignore
+        tg_send = _tg_send
+    except Exception as e:
+        LOG.debug("Lazy import failed: tg_send: %r", e)
+
+    # Attempt to fetch balance for the current label
+    balance: Any = "unknown"
+    if callable(get_equity_usdt):
+        try:
+            balance = get_equity_usdt()
+        except Exception:
+            balance = "unknown"
+
+    # Write truth marker first (so even if TG fails, dashboard can still show online)
+    try:
+        _write_ws_online_marker(account_label, balance)
+    except Exception as e:
+        LOG.debug("WS online marker write failed: %r", e)
+
+    if not callable(tg_send):
+        LOG.warning("tg_send unavailable (notifier_bot import failed). WS online TG notify skipped.")
+        _already_notified = True
+        return
+
+    # Subaccount channel
+    try:
+        tg_send(
+            f"🚀 WS ONLINE — {account_label}\n💰 Balance: {balance} USDT",
+            channel=account_label,
+            level="info",
+        )
+    except Exception as e:
+        LOG.debug("Subaccount TG send failed: %r", e)
+
+    # Global/main channel
+    try:
+        tg_send(
+            f"📡 {account_label} is ONLINE — balance ≈ {balance} USDT",
+            channel="main",
+            level="info",
+        )
+    except Exception as e:
+        LOG.debug("Main TG send failed: %r", e)
+
+    _already_notified = True
+
+
+def _reset_ws_ready(which: str) -> None:
+    """
+    Reset readiness flags on WS close.
+    If WS_ONLINE_RENOTIFY_ON_RECONNECT=true, allow re-notify on a future reconnect.
+    """
+    global _ws_private_ready, _ws_public_ready, _already_notified
+
+    if which == "private":
+        _ws_private_ready = False
+    elif which == "public":
+        _ws_public_ready = False
+
+    if _env_bool("WS_ONLINE_RENOTIFY_ON_RECONNECT", "false"):
+        _already_notified = False
+
+
+# -------------------------
 # Log rotation (self-healing)
 # -------------------------
 
@@ -408,6 +350,13 @@ def _file_size_mb(path: Path) -> float:
 
 
 def _rotate_file(path: Path, keep: int) -> bool:
+    """
+    Rotate:
+      foo.jsonl -> foo.jsonl.1
+      foo.jsonl.1 -> foo.jsonl.2 ... up to keep
+    Then create empty foo.jsonl.
+    Returns True if rotated, False if not.
+    """
     try:
         if not path.exists():
             return False
@@ -623,6 +572,37 @@ def _build_ws_auth_payload(api_key: str, api_secret: str) -> Dict[str, Any]:
 # PRIVATE WS
 # -------------------------
 
+def normalize_position(raw: dict, account_label: str) -> dict:
+    symbol = str(raw.get("symbol", "")).upper()
+    side = str(raw.get("side", "")).title()
+
+    size = _safe_float(raw.get("size", 0))
+    avg = _safe_float(raw.get("avgPrice", raw.get("entryPrice", 0)))
+
+    sl_raw = raw.get("stopLoss") or raw.get("stopLossPrice") or raw.get("slPrice") or 0
+    stop_loss = _safe_float(sl_raw)
+
+    sub_uid = (
+        raw.get("sub_uid")
+        or raw.get("subAccountId")
+        or raw.get("accountId")
+        or raw.get("subId")
+        or ""
+    )
+    sub_uid = str(sub_uid)
+
+    return {
+        "symbol": symbol,
+        "side": side,
+        "size": size,
+        "avgPrice": avg,
+        "stopLoss": stop_loss,
+        "sub_uid": sub_uid,
+        "account_label": account_label,
+        "category": "linear",
+    }
+
+
 def _handle_private_message(msg: Dict[str, Any], account_label: str) -> None:
     if msg.get("op") == "auth":
         success = msg.get("success")
@@ -707,7 +687,7 @@ def _handle_private_message(msg: Dict[str, Any], account_label: str) -> None:
             "account_label": account_label,
             "data": [row for row in data if isinstance(row, dict)],
         }
-        _append_jsonl_mirror_main(EXECUTIONS_PATH, line)
+        _append_jsonl(EXECUTIONS_PATH, line)
         return
 
 
@@ -747,6 +727,7 @@ def _run_private_ws(
 
     def on_close(ws: websocket.WebSocketApp, status_code: Any, msg: Any) -> None:  # type: ignore
         LOG.warning("[PRIVATE] WS closed: code=%s msg=%s", status_code, msg)
+        _reset_ws_ready("private")
 
     while not stop_event.is_set():
         try:
@@ -823,7 +804,7 @@ def _handle_public_message(msg: Dict[str, Any]) -> None:
         existing["version"] = 1
         existing["updated_ms"] = now_ms
 
-        _atomic_write_json_mirror_main(ORDERBOOK_BUS_PATH, existing)
+        _atomic_write_json(ORDERBOOK_BUS_PATH, existing)
         return
 
     if topic.startswith("publicTrade."):
@@ -841,7 +822,7 @@ def _handle_public_message(msg: Dict[str, Any]) -> None:
             if not isinstance(t, dict):
                 continue
             clean_trades.append(t)
-            _append_jsonl_mirror_main(PUBLIC_TRADES_PATH, {"version": 1, "received_ms": now_ms, "symbol": symbol, "trade": t})
+            _append_jsonl(PUBLIC_TRADES_PATH, {"version": 1, "received_ms": now_ms, "symbol": symbol, "trade": t})
 
         if not clean_trades:
             return
@@ -870,7 +851,7 @@ def _handle_public_message(msg: Dict[str, Any]) -> None:
         existing["version"] = 1
         existing["updated_ms"] = now_ms
 
-        _atomic_write_json_mirror_main(TRADES_BUS_PATH, existing)
+        _atomic_write_json(TRADES_BUS_PATH, existing)
         return
 
 
@@ -914,6 +895,7 @@ def _run_public_ws(
 
     def on_close(ws: websocket.WebSocketApp, status_code: Any, msg: Any) -> None:  # type: ignore
         LOG.warning("[PUBLIC] WS closed: code=%s msg=%s", status_code, msg)
+        _reset_ws_ready("public")
 
     while not stop_event.is_set():
         try:
@@ -979,7 +961,7 @@ def main() -> None:
 
     touch_interval = int(os.getenv("WS_POSITIONS_BUS_TOUCH_SEC", "5"))
 
-    LOG.info("Starting WS Switchboard v5.2 (label-safe)")
+    LOG.info("Starting WS Switchboard v5.3")
     LOG.info("ACCOUNT_LABEL        : %s", account_label)
     LOG.info("WS_ENABLE_PRIVATE    : %s", enable_private)
     LOG.info("WS_ENABLE_PUBLIC     : %s", enable_public)

@@ -512,7 +512,7 @@
         </div>
 
         {# Risk bar: prefer manifest risk_pct; else integrity_score as stability proxy #}
-        {% set risk_pct = r.risk_pct %}
+        {% set risk_pct = r.get(risk_pct, 0) %}
         {% if risk_pct is none %}
           {% set risk_pct = (r.integrity_score or 0) %}
         {% endif %}

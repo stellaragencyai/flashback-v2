@@ -1,31 +1,24 @@
-﻿import yaml
-from pathlib import Path
+﻿from pathlib import Path
+import re
 
-_AI_PROFILE_CACHE = None
+p = Path(r"app\core\ai_profile.py")
+s = p.read_text(encoding="utf-8", errors="ignore")
 
-def load_ai_profiles():
-    global _AI_PROFILE_CACHE
-    if _AI_PROFILE_CACHE is None:
-        path = Path('config/ai_profiles.yaml')
-        with open(path, 'r', encoding='utf-8') as f:
-            _AI_PROFILE_CACHE = yaml.safe_load(f)
-    return _AI_PROFILE_CACHE
-
-def get_district_profile(district_id: str) -> dict:
-    profiles = load_ai_profiles()
-    return profiles['districts'].get(district_id)
-
+if re.search(r"^\s*def\s+get_current_ai_profile\s*\(", s, flags=re.M):
+    print("OK: get_current_ai_profile already exists (no patch).")
+else:
+    shim = r"""
 
 # ---------------------------------------------------------------------------
 # COMPAT SHIM (2026-01-01): expected by ai_action_router and legacy callers
 # ---------------------------------------------------------------------------
 
 def get_current_ai_profile(account_label: str = "main") -> dict:
-    """Return the active AI profile for a given account_label.
+    \"\"\"Return the active AI profile for a given account_label.
 
     This is a backward-compatible API. Newer code may expose a differently named
     function. We try common candidates and fall back safely.
-    """
+    \"\"\"
     # Try common modern function names first (if your codebase renamed it).
     candidates = [
         "get_active_ai_profile",
@@ -63,3 +56,10 @@ def get_current_ai_profile(account_label: str = "main") -> dict:
         "enabled": True,
         "notes": "compat fallback (no profile resolver found)",
     }
+"""
+    # Ensure file ends with newline before append
+    if not s.endswith("\n"):
+        s += "\n"
+    s += shim
+    p.write_text(s, encoding="utf-8")
+    print("OK: appended compat shim get_current_ai_profile() to ai_profile.py")
