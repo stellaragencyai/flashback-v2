@@ -70,16 +70,32 @@ except Exception:
 STATE_DIR: Path = ROOT / "state"
 STATE_DIR.mkdir(parents=True, exist_ok=True)
 
-EXEC_BUS_PATH: Path = STATE_DIR / "ws_executions.jsonl"
-CURSOR_PATH: Path = STATE_DIR / "trade_outcome_recorder.cursor"
+def _env_path(name: str, default: str) -> Path:
+    v = os.getenv(name)
+    s = (v or "").strip()
+    p = Path(s) if s else Path(default)
+    if not p.is_absolute():
+        p = STATE_DIR / p
+    return p
 
-AI_EVENTS_DIR: Path = STATE_DIR / "ai_events"
+
+# Paths (env-overridable for per-account isolation)
+# EXEC path precedence:
+# 1) EXEC_BUS_PATH
+# 2) EXECUTIONS_BUS_PATH
+# 3) EXECUTIONS_PATH
+# 4) default state/ws_executions.jsonl
+_default_exec = _env_path("EXECUTIONS_PATH", "ws_executions.jsonl")
+_default_exec = _env_path("EXECUTIONS_BUS_PATH", str(_default_exec))
+EXEC_BUS_PATH: Path = _env_path("EXEC_BUS_PATH", str(_default_exec))
+
+CURSOR_PATH: Path = _env_path("TRADE_OUTCOME_CURSOR_PATH", "trade_outcome_recorder.cursor")
+
+AI_EVENTS_DIR: Path = _env_path("AI_EVENTS_DIR", "ai_events")
 AI_EVENTS_DIR.mkdir(parents=True, exist_ok=True)
 
 PENDING_SETUPS_PATH: Path = AI_EVENTS_DIR / "pending_setups.json"
 PENDING_SETUPS_LOCK: Path = PENDING_SETUPS_PATH.with_suffix(PENDING_SETUPS_PATH.suffix + ".lock")
-
-
 # ---------------------------------------------------------------------------
 # Heartbeat + alert helpers
 # ---------------------------------------------------------------------------

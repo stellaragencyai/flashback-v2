@@ -195,6 +195,23 @@ except Exception:
 STATE_DIR: Path = ROOT / "state"
 STATE_DIR.mkdir(parents=True, exist_ok=True)
 
+# ---------------------------------------------------------------------------
+# Bus paths (env-overridable for per-account isolation)
+# Defaults:
+#   - main -> legacy shared filenames (back-compat)
+#   - non-main -> labeled filenames (per-account truth)
+# ---------------------------------------------------------------------------
+def _env_path(name: str, default: str) -> Path:
+    v = os.getenv(name)
+    if v:
+        return Path(v)
+    return STATE_DIR / default
+
+def _is_main(label: str) -> bool:
+    return (label or "").lower() in ("main", "primary")
+
+# NOTE: ACCOUNT_LABEL is already loaded below in this module; we reference it after it's set.
+# We set placeholders here; later we re-bind these after ACCOUNT_LABEL is resolved.
 POSITIONS_BUS_PATH: Path = STATE_DIR / "positions_bus.json"
 ORDERBOOK_BUS_PATH: Path = STATE_DIR / "orderbook_bus.json"
 TRADES_BUS_PATH: Path = STATE_DIR / "trades_bus.json"
@@ -1030,6 +1047,28 @@ def main() -> None:
         if not api_key or not api_secret:
             LOG.error(
                 "Missing Bybit API keys for PRIVATE WS for ACCOUNT_LABEL=%s. "
+
+# ---------------------------------------------------------------------------
+# Bind per-account bus paths now that ACCOUNT_LABEL is known
+# ---------------------------------------------------------------------------
+if _is_main(ACCOUNT_LABEL):
+    POSITIONS_BUS_PATH = _env_path("POSITIONS_BUS_PATH", "positions_bus.json")
+    ORDERBOOK_BUS_PATH = _env_path("ORDERBOOK_BUS_PATH", "orderbook_bus.json")
+    TRADES_BUS_PATH    = _env_path("TRADES_BUS_PATH",    "trades_bus.json")
+else:
+    POSITIONS_BUS_PATH = _env_path("POSITIONS_BUS_PATH", f"positions_bus_{ACCOUNT_LABEL}.json")
+    ORDERBOOK_BUS_PATH = _env_path("ORDERBOOK_BUS_PATH", f"orderbook_bus_{ACCOUNT_LABEL}.json")
+    TRADES_BUS_PATH    = _env_path("TRADES_BUS_PATH",    f"trades_bus_{ACCOUNT_LABEL}.json")
+
+PUBLIC_TRADES_PATH = _env_path("PUBLIC_TRADES_PATH", f"public_trades_{ACCOUNT_LABEL}.jsonl")
+# EXECUTIONS path precedence:
+# 1) EXEC_BUS_PATH (systemd / per-instance)
+# 2) EXECUTIONS_BUS_PATH (alias)
+# 3) EXECUTIONS_PATH (legacy override)
+# 4) default per-account name
+_default_exec = _env_path("EXECUTIONS_PATH", f"ws_executions_{ACCOUNT_LABEL}.jsonl")
+EXECUTIONS_PATH = _env_path("EXECUTIONS_BUS_PATH", str(_default_exec))
+EXECUTIONS_PATH = _env_path("EXEC_BUS_PATH", str(EXECUTIONS_PATH))
                 "Tried BYBIT_MAIN_WEBSOCKET_KEY/SECRET, BYBIT_API_KEY/SECRET, BYBIT_MAIN_API_KEY/SECRET (main) "
                 "or BYBIT_<LABEL>_API_KEY/SECRET (subs).",
                 account_label,
