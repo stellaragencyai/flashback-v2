@@ -1,0 +1,398 @@
+version: 8
+notes: "v8:\n  - OPTION A LOCKED:\n      * flashback07 = Sniper07_ETH (ETHUSDT only)\n\
+  \      * flashback08 = Sniper08_SOL (SOLUSDT only)\n      * flashback09 = Sniper09_FARTCOIN\
+  \ (FARTCOINUSDT only)\n    Snipers are single-symbol, max_concurrent_positions=1,\
+  \ risk_pct=0.25, ai_profile=sniper_v1.\n  - Canonical strategy intent lives ONLY\
+  \ here (symbols/timeframes/setup_types/risk/exit/mode/ai_profile).\n  - risk_pct\
+  \ is the only risk field (risk_per_trade_pct removed).\n  - Subaccount operational\
+  \ toggles live in config/subaccounts.yaml.\n"
+subaccounts:
+- sub_uid: 524630315
+  account_label: flashback01
+  strategy_name: Sub1_Trend
+  role: trend_follow
+  enabled: true
+  symbols:
+  - BTCUSDT
+  - ETHUSDT
+  - SOLUSDT
+  - XRPUSDT
+  - ADAUSDT
+  - LINKUSDT
+  - INJUSDT
+  - OPUSDT
+  - AVAXUSDT
+  - DOGEUSDT
+  timeframes:
+  - '15'
+  - '60'
+  setup_types:
+  - trend_pullback
+  - trend_breakout_retest
+  - ema_trend_follow
+  risk_pct: 0.1
+  max_concurrent_positions: 2
+  ai_profile: trend_v1
+  automation_mode: LEARN_DRY
+  exit_profile: standard_5
+  promotion_rules:
+    enabled: true
+    min_trades: 150
+    min_winrate: 0.52
+    min_avg_r: 0.3
+    min_expectancy_r: 0.15
+    max_drawdown_pct: 18.0
+  notes: 'Primary clean trend follower. Broad liquid universe.
+
+    Stays LEARN_DRY for now (no live orders).
+
+    '
+- sub_uid: 524633243
+  account_label: flashback02
+  strategy_name: Sub2_Breakout
+  role: breakout_momentum
+  enabled: true
+  symbols:
+  - BTCUSDT
+  - ETHUSDT
+  - SOLUSDT
+  - XRPUSDT
+  - ADAUSDT
+  - LINKUSDT
+  - INJUSDT
+  - OPUSDT
+  - AVAXUSDT
+  - DOGEUSDT
+  - NEARUSDT
+  - ARBUSDT
+  - HBARUSDT
+  - FARTCOINUSDT
+  - PUMPFUNUSDT
+  timeframes:
+  - '5'
+  - '15'
+  setup_types:
+  - breakout_high
+  - breakout_range
+  - squeeze_release
+  risk_pct: 0.1
+  max_concurrent_positions: 2
+  ai_profile: breakout_v1
+  automation_mode: LEARN_DRY
+  exit_profile: standard_5
+  promotion_rules:
+    enabled: true
+    min_trades: 200
+    min_winrate: 0.5
+    min_avg_r: 0.35
+    min_expectancy_r: 0.2
+    max_drawdown_pct: 20.0
+  notes: 'Aggressive breakout / momentum hunter.
+
+    TEMP: LEARN_DRY while executor is validated.
+
+    '
+- sub_uid: 524634622
+  account_label: flashback03
+  strategy_name: Sub3_ScalpMajors
+  role: scalp_intraday
+  enabled: true
+  symbols:
+  - BTCUSDT
+  - ETHUSDT
+  - SOLUSDT
+  - XRPUSDT
+  - ADAUSDT
+  - LINKUSDT
+  - DOGEUSDT
+  timeframes:
+  - '1'
+  - '3'
+  - '5'
+  setup_types:
+  - scalp_liquidity_sweep
+  - scalp_trend_continuation
+  - scalp_reversal_snapback
+  risk_pct: 0.1
+  max_concurrent_positions: 2
+  ai_profile: scalp_v1
+  automation_mode: LEARN_DRY
+  exit_profile: standard_5
+  promotion_rules:
+    enabled: true
+    min_trades: 250
+    min_winrate: 0.5
+    min_avg_r: 0.2
+    min_expectancy_r: 0.1
+    max_drawdown_pct: 22.0
+  notes: 'Intraday scalps on the most liquid names only.
+
+    '
+- sub_uid: 524636309
+  account_label: flashback04
+  strategy_name: Alt04_Breakout_Alts25x
+  role: alt_breakout_25x
+  enabled: true
+  symbols:
+  - ARBUSDT
+  - OPUSDT
+  - INJUSDT
+  - NEARUSDT
+  - HBARUSDT
+  - AVAXUSDT
+  - SOLUSDT
+  - LINKUSDT
+  - ADAUSDT
+  - XRPUSDT
+  - DOGEUSDT
+  timeframes:
+  - '5'
+  - '15'
+  setup_types:
+  - breakout_high
+  - breakout_range
+  - squeeze_release
+  risk_pct: 0.1
+  max_concurrent_positions: 1
+  ai_profile: breakout_v1
+  automation_mode: LEARN_DRY
+  exit_profile: standard_5
+  promotion_rules:
+    enabled: true
+    min_trades: 200
+    min_winrate: 0.5
+    min_avg_r: 0.3
+    min_expectancy_r: 0.15
+    max_drawdown_pct: 20.0
+  notes: 'Alt breakout lane.
+
+    '
+- sub_uid: 524637467
+  account_label: flashback05
+  strategy_name: Sub5_HFT_MM
+  role: hft_market_maker
+  enabled: true
+  symbols:
+  - BTCUSDT
+  - ETHUSDT
+  timeframes:
+  - '1'
+  setup_types:
+  - mm_spread_capture
+  - mm_reversion_micro
+  risk_pct: 0.05
+  max_concurrent_positions: 3
+  ai_profile: hft_mm_v1
+  automation_mode: LEARN_DRY
+  exit_profile: standard_5
+  promotion_rules:
+    enabled: true
+    min_trades: 400
+    min_winrate: 0.49
+    min_avg_r: 0.12
+    min_expectancy_r: 0.05
+    max_drawdown_pct: 15.0
+  notes: 'Dedicated HFT / microstructure market-making subaccount.
+
+    '
+- sub_uid: 524638768
+  account_label: flashback06
+  strategy_name: Alt06_ScalpSweep_Alts25x
+  role: alt_sweep_scalp_25x
+  enabled: true
+  symbols:
+  - SOLUSDT
+  - AVAXUSDT
+  - INJUSDT
+  - LINKUSDT
+  - OPUSDT
+  - ARBUSDT
+  - NEARUSDT
+  - HBARUSDT
+  - ADAUSDT
+  - XRPUSDT
+  - DOGEUSDT
+  timeframes:
+  - '1'
+  - '5'
+  setup_types:
+  - scalp_liquidity_sweep
+  - scalp_reversal_snapback
+  - failed_breakout_fade
+  risk_pct: 0.1
+  max_concurrent_positions: 1
+  ai_profile: scalp_v1
+  automation_mode: LEARN_DRY
+  exit_profile: standard_5
+  promotion_rules:
+    enabled: true
+    min_trades: 250
+    min_winrate: 0.5
+    min_avg_r: 0.2
+    min_expectancy_r: 0.1
+    max_drawdown_pct: 22.0
+  notes: 'Alt sweep / scalp lane.
+
+    '
+- sub_uid: 524649709
+  account_label: flashback07
+  strategy_name: Sniper07_ETH
+  role: sniper_eth
+  enabled: true
+  symbols:
+  - ETHUSDT
+  timeframes:
+  - '5'
+  - '15'
+  setup_types:
+  - sniper_liquidity_sweep
+  - sniper_breakout_impulse
+  - sniper_reversal_snap
+  risk_pct: 0.25
+  max_concurrent_positions: 1
+  ai_profile: sniper_v1
+  automation_mode: LEARN_DRY
+  exit_profile: standard_5
+  promotion_rules:
+    enabled: true
+    min_trades: 150
+    min_winrate: 0.52
+    min_avg_r: 0.35
+    min_expectancy_r: 0.2
+    max_drawdown_pct: 25.0
+  notes: 'Sniper lane (ETH only). Single position, single symbol.
+
+    Must align with config/subaccounts.yaml (risk_profile: sniper_v1, pinned_symbol:
+    ETHUSDT).
+
+    '
+- sub_uid: 524650929
+  account_label: flashback08
+  strategy_name: Sniper08_SOL
+  role: sniper_sol
+  enabled: true
+  symbols:
+  - SOLUSDT
+  timeframes:
+  - '5'
+  - '15'
+  setup_types:
+  - sniper_liquidity_sweep
+  - sniper_breakout_impulse
+  - sniper_reversal_snap
+  risk_pct: 0.25
+  max_concurrent_positions: 1
+  ai_profile: sniper_v1
+  automation_mode: LEARN_DRY
+  exit_profile: standard_5
+  promotion_rules:
+    enabled: true
+    min_trades: 150
+    min_winrate: 0.52
+    min_avg_r: 0.35
+    min_expectancy_r: 0.2
+    max_drawdown_pct: 25.0
+  notes: 'Sniper lane (SOL only). Single position, single symbol.
+
+    Must align with config/subaccounts.yaml (risk_profile: sniper_v1, pinned_symbol:
+    SOLUSDT).
+
+    '
+- sub_uid: 524693375
+  account_label: flashback09
+  strategy_name: Sniper09_FARTCOIN
+  role: sniper_fartcoin
+  enabled: true
+  symbols:
+  - FARTCOINUSDT
+  timeframes:
+  - '5'
+  - '15'
+  setup_types:
+  - sniper_liquidity_sweep
+  - sniper_breakout_impulse
+  - sniper_reversal_snap
+  risk_pct: 0.25
+  max_concurrent_positions: 1
+  ai_profile: sniper_v1
+  automation_mode: LEARN_DRY
+  exit_profile: standard_5
+  promotion_rules:
+    enabled: true
+    min_trades: 150
+    min_winrate: 0.52
+    min_avg_r: 0.35
+    min_expectancy_r: 0.2
+    max_drawdown_pct: 25.0
+  notes: 'Sniper lane (FARTCOIN only). Single position, single symbol.
+
+    Must align with config/subaccounts.yaml (risk_profile: sniper_v1, pinned_symbol:
+    FARTCOINUSDT).
+
+    '
+- sub_uid: 524700541
+  account_label: flashback10
+  strategy_name: Sub10_ManualOnly
+  role: manual_discretionary
+  enabled: false
+  symbols:
+  - BTCUSDT
+  - ETHUSDT
+  - SOLUSDT
+  - XRPUSDT
+  - ADAUSDT
+  - LINKUSDT
+  - INJUSDT
+  - OPUSDT
+  - AVAXUSDT
+  - DOGEUSDT
+  - NEARUSDT
+  - ARBUSDT
+  - HBARUSDT
+  - FARTCOINUSDT
+  - PUMPFUNUSDT
+  timeframes:
+  - '5'
+  - '15'
+  setup_types: []
+  risk_pct: 0.01
+  max_concurrent_positions: 0
+  ai_profile: manual_only
+  automation_mode: 'OFF'
+  exit_profile: standard_5
+  promotion_rules:
+    enabled: false
+  notes: 'Reserved for full discretionary control. No auto executor should trade here.
+
+    '
+- sub_uid: null
+  account_label: main
+  strategy_name: main_manual
+  role: main
+  enabled: true
+  symbols:
+  - BTCUSDT
+  - ETHUSDT
+  - SOLUSDT
+  - XRPUSDT
+  - ADAUSDT
+  - LINKUSDT
+  - AVAXUSDT
+  timeframes:
+  - '5'
+  - '15'
+  setup_types: []
+  risk_pct: 0.01
+  max_concurrent_positions: 1
+  ai_profile: manual_v1
+  automation_mode: LEARN_DRY
+  exit_profile: standard_10
+  promotion_rules:
+    enabled: false
+  notes: 'Manual trading on MAIN. Entries are discretionary.
+
+    Executor/AI must not place live orders here.
+
+    Exit profile is standard_10 so TP/SL manager can attach a 10-TP ladder.
+
+    '

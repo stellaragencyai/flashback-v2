@@ -5,11 +5,17 @@ Flashback — Paper Broker (LEARN_DRY engine)
 
 Purpose:
 - Executor_v2 in PAPER mode opens simulated positions via PaperBroker
-- tp_sl_manager reads state/positions_bus.json
+- tp_sl_manager reads state/positions_bus*.json (schema v2)
 - This module publishes PAPER positions to the canonical positions bus so TP/SL can "see" them
 - Includes a small CLI for testing:
     --force-close-all
     --poke-price
+
+IMPORTANT (data integrity):
+- executor_v2 is the canonical writer of setup_context into state/ai_events/setups.jsonl.
+- paper_broker must NOT emit setup_context by default (prevents duplicate setup_context rows).
+- The optional setup_context emission in this module exists ONLY for legacy/manual testing and must
+  be explicitly enabled via log_setup=True.
 """
 
 from __future__ import annotations
@@ -17,6 +23,7 @@ from __future__ import annotations
 import argparse
 import inspect
 import json
+import os
 import time
 import uuid
 from dataclasses import dataclass, asdict
@@ -34,6 +41,28 @@ try:
     ROOT: Path = settings.ROOT  # type: ignore
 except Exception:
     ROOT = Path(__file__).resolve().parents[2]
+
+def _ensure_lane_env(account_label: str) -> None:
+    """
+    Enforce per-account lane routing for PAPER outcomes.
+    - If AI_EVENTS_DIR already set, respect it.
+    - Otherwise set AI_EVENTS_DIR to: <ROOT>/state/ai_events_<label>
+    - Set LANE_REQUIRED=1 to prevent silent fallback to global outcomes.
+    """
+    try:
+        label = str(account_label or "").strip()
+        if not label:
+            return
+        if os.getenv("AI_EVENTS_DIR"):
+            return
+        lane_dir = (ROOT / "state" / f"ai_events_{label}").resolve()
+        lane_dir.mkdir(parents=True, exist_ok=True)
+        os.environ["AI_EVENTS_DIR"] = str(lane_dir)
+        os.environ["LANE_REQUIRED"] = os.getenv("LANE_REQUIRED") or "1"
+    except Exception:
+        # Never crash the broker on env wiring. If it fails, writer will fall back
+        # and tests will catch it by file truth.
+        return
 
 try:
     from app.core.log import get_logger  # type: ignore
@@ -126,10 +155,23 @@ def _load_strategy_for_label(account_label: str) -> Dict[str, Any]:
 
 
 # ----------------------------
-# Positions bus writer
+# Positions bus writer (schema v2)
 # ----------------------------
-_POSITIONS_BUS_PATH: Path = ROOT / "state" / "positions_bus.json"
-_POSITIONS_BUS_PATH.parent.mkdir(parents=True, exist_ok=True)
+def _env_path(var: str, default: str) -> Path:
+    v = (os.getenv(var) or "").strip()
+    if not v:
+        return Path(default)
+    p = Path(v)
+    if not p.is_absolute():
+        return (ROOT / p).resolve()
+    return p
+
+
+def _positions_bus_path_for_label(account_label: str) -> Path:
+    # Prefer env POSITIONS_BUS_PATH (your orchestrator sets this per-label)
+    # Fallback: ROOT/state/positions_bus_<label>.json (matches your current file naming)
+    default = str((ROOT / "state" / f"positions_bus_{account_label.lower()}.json"))
+    return _env_path("POSITIONS_BUS_PATH", default)
 
 
 def _safe_read_json(path: Path) -> Any:
@@ -143,6 +185,7 @@ def _safe_read_json(path: Path) -> Any:
 
 def _safe_write_json(path: Path, obj: Any) -> None:
     try:
+        path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(json.dumps(obj, indent=2, sort_keys=True), encoding="utf-8")
     except Exception as e:
         log.warning("Failed to write %s: %r", path, e)
@@ -174,29 +217,50 @@ def _paper_position_to_bus_row(account_label: str, pos: PaperPosition) -> Dict[s
 
 
 def _publish_positions_bus(account_label: str, open_positions: List[PaperPosition]) -> None:
+    """
+    Write schema v2:
+    {
+      "version": 2,
+      "updated_ms": ...,
+      "labels": {
+         "<label>": {"category":"linear","positions":[...]}
+      }
+    }
+    """
     now_ms = _now_ms()
-    existing = _safe_read_json(_POSITIONS_BUS_PATH)
-
-    if isinstance(existing, dict):
-        rows = existing.get("positions") or []
-    elif isinstance(existing, list):
-        rows = existing
-    else:
-        rows = []
-
-    kept: List[Dict[str, Any]] = []
-    for r in rows:
-        if not isinstance(r, dict):
-            continue
-        is_paper = str(r.get("mode") or "").upper() == "PAPER" or str(r.get("source") or "") == "paper_broker"
-        same_acct = str(r.get("account_label") or "") == account_label
-        if is_paper and same_acct:
-            continue
-        kept.append(r)
+    path = _positions_bus_path_for_label(account_label)
+    existing = _safe_read_json(path)
 
     new_rows = [_paper_position_to_bus_row(account_label, p) for p in open_positions]
-    out = {"ts_ms": now_ms, "source": "paper_broker", "positions": kept + new_rows}
-    _safe_write_json(_POSITIONS_BUS_PATH, out)
+
+    # If existing is already schema v2, update only this label.
+    if isinstance(existing, dict) and int(existing.get("version") or 0) == 2 and isinstance(existing.get("labels"), dict):
+        labels = existing.get("labels") or {}
+        if not isinstance(labels, dict):
+            labels = {}
+
+        labels[account_label] = {
+            "category": (labels.get(account_label, {}) or {}).get("category", "linear"),
+            "positions": new_rows,
+        }
+
+        out = {
+            "version": 2,
+            "updated_ms": int(now_ms),
+            "labels": labels,
+        }
+        _safe_write_json(path, out)
+        return
+
+    # Otherwise, write fresh schema v2 (deterministic, per-label)
+    out = {
+        "version": 2,
+        "updated_ms": int(now_ms),
+        "labels": {
+            account_label: {"category": "linear", "positions": new_rows}
+        },
+    }
+    _safe_write_json(path, out)
 
 
 # ----------------------------
@@ -211,7 +275,7 @@ def _append_jsonl_bytesafe(path: Path, row: dict) -> None:
 
 
 # ----------------------------
-# AI event (setup) publish
+# AI event (setup) publish (OPTIONAL)
 # ----------------------------
 def _maybe_publish_setup_context(
     *,
@@ -225,6 +289,12 @@ def _maybe_publish_setup_context(
     ai_profile: Optional[str],
     extra: Optional[Dict[str, Any]],
 ) -> None:
+    """
+    Optional legacy hook.
+
+    Canonical writer is executor_v2. This function should only be invoked when log_setup=True
+    in open_position, typically for manual/isolated tests.
+    """
     try:
         from app.ai.ai_events_spine import build_setup_context, publish_ai_event  # type: ignore
 
@@ -249,7 +319,7 @@ def _maybe_publish_setup_context(
 # ----------------------------
 _SETUP_CTX_FAIL_PATH = ROOT / "state" / "ai_events" / "setup_context.write_failures.jsonl"
 _SETUP_CTX_FAIL_PATH.parent.mkdir(parents=True, exist_ok=True)
-_PUBLISHED_SETUP_TRADE_IDS = set()  # in-process idempotency
+_PUBLISHED_SETUP_TRADE_IDS = set()  # in-process idempotency (only when log_setup=True)
 
 
 # ----------------------------
@@ -285,6 +355,14 @@ def _maybe_write_outcome_v1_from_close(
     timeframe: Optional[str],
     ai_profile: Optional[str],
 ) -> None:
+    """
+    Canonical outcome.v1 emission hook (PAPER only).
+
+    IMPORTANT:
+    - This function must be robust to different writer call signatures:
+      (A) write_outcome_from_paper_close(payload=<dict>)
+      (B) write_outcome_from_paper_close(**fields)
+    """
     try:
         from app.ai.outcome_writer import write_outcome_from_paper_close  # type: ignore
     except Exception as e:
@@ -296,11 +374,20 @@ def _maybe_write_outcome_v1_from_close(
         return
 
     fn = write_outcome_from_paper_close  # type: ignore
+
+    # Introspect signature to decide how to call writer
     try:
         sig = inspect.signature(fn)
-        params = set(sig.parameters.keys())
+        params = sig.parameters
+        param_names = set(params.keys())
+        has_varkw = any(p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values())
     except Exception:
-        params = set()
+        params = {}
+        param_names = set()
+        has_varkw = False
+
+    entry_side = "Buy" if side == "long" else "Sell"
+    exit_side = "Sell" if side == "long" else "Buy"
 
     payload: Dict[str, Any] = {
         "account_label": account_label,
@@ -309,12 +396,13 @@ def _maybe_write_outcome_v1_from_close(
         "client_trade_id": client_trade_id,
         "source_trade_id": source_trade_id,
         "symbol": symbol,
-        "entry_side": "Buy" if side == "long" else "Sell",
+        "entry_side": entry_side,
         "entry_qty": float(qty),
         "entry_px": float(entry_px),
         "opened_ts_ms": int(opened_ms),
-        "exit_px": float(exit_px),
+        "exit_side": exit_side,
         "exit_qty": float(qty),
+        "exit_px": float(exit_px),
         "closed_ts_ms": int(closed_ms),
         "fees_usd": float(fees_usd),
         "mode": str(mode),
@@ -326,25 +414,26 @@ def _maybe_write_outcome_v1_from_close(
         "ai_profile": ai_profile,
     }
 
-    # If signature is known, only pass accepted keys.
-    # If we couldn't read the signature, we try a conservative minimal set.
-    if params:
-        call_kwargs = {k: v for k, v in payload.items() if k in params}
+    if "payload" in param_names:
+        call_kwargs = {"payload": payload}
+    elif has_varkw:
+        call_kwargs = dict(payload)
+    elif param_names:
+        call_kwargs = {k: v for k, v in payload.items() if k in param_names}
     else:
         call_kwargs = {
-            "account_label": account_label,
             "trade_id": trade_id,
             "symbol": symbol,
-            "entry_side": payload["entry_side"],
-            "entry_qty": payload["entry_qty"],
-            "entry_px": payload["entry_px"],
-            "opened_ts_ms": payload["opened_ts_ms"],
-            "exit_px": payload["exit_px"],
-            "exit_qty": payload["exit_qty"],
-            "closed_ts_ms": payload["closed_ts_ms"],
-            "fees_usd": payload["fees_usd"],
-            "mode": payload["mode"],
-            "close_reason": payload["close_reason"],
+            "entry_side": entry_side,
+            "entry_qty": float(qty),
+            "entry_px": float(entry_px),
+            "opened_ts_ms": int(opened_ms),
+            "exit_side": exit_side,
+            "exit_qty": float(qty),
+            "exit_px": float(exit_px),
+            "closed_ts_ms": int(closed_ms),
+            "pnl_usd": float(pnl_usd),
+            "fees_usd": float(fees_usd),
         }
 
     try:
@@ -382,8 +471,15 @@ class PaperBroker:
         self._state = state
         self._state_path = state_path
 
+        try:
+            self._normalize_trade_ids_in_state()
+        except Exception:
+            pass
+
     @classmethod
     def load_or_create(cls, account_label: str, *, starting_equity: float = 1000.0) -> "PaperBroker":
+        _ensure_lane_env(account_label)
+
         paper_dir = ROOT / "state" / "paper"
         paper_dir.mkdir(parents=True, exist_ok=True)
         state_path = paper_dir / f"{account_label}.json"
@@ -492,6 +588,68 @@ class PaperBroker:
     def list_closed_trades(self) -> List[PaperPosition]:
         return list(self._state.closed_trades)
 
+    def _normalize_trade_id(self, *, symbol: str, trade_id: str) -> str:
+        """Canonical PAPER trade_id:
+        {account}-{symbol}-{suffix}
+        Legacy:
+        {account}:{suffix} -> upgraded
+        """
+        tid = (trade_id or "").strip()
+        if not tid:
+            return tid
+
+        acct = str(self._state.account_label)
+
+        if tid.startswith(acct + "-"):
+            return tid
+
+        legacy = acct + ":"
+        if tid.startswith(legacy):
+            suffix = tid[len(legacy):].strip()
+            if suffix:
+                return f"{acct}-{symbol}-{suffix}"
+            return f"{acct}-{symbol}"
+
+        return tid
+
+    def _normalize_trade_ids_in_state(self) -> None:
+        changed = 0
+        positions = []
+
+        try:
+            positions.extend(list(self._state.open_positions))
+        except Exception:
+            pass
+
+        try:
+            positions.extend(list(self._state.closed_trades))
+        except Exception:
+            pass
+
+        for pos in positions:
+            try:
+                old = str(getattr(pos, "trade_id", "") or "")
+                sym = str(getattr(pos, "symbol", "") or "")
+                if not old or not sym:
+                    continue
+
+                new = self._normalize_trade_id(symbol=sym, trade_id=old)
+                if new != old:
+                    if hasattr(pos, "source_trade_id") and not getattr(pos, "source_trade_id", None):
+                        pos.source_trade_id = old
+                    if hasattr(pos, "client_trade_id") and not getattr(pos, "client_trade_id", None):
+                        pos.client_trade_id = new
+                    pos.trade_id = new
+                    changed += 1
+            except Exception:
+                continue
+
+        if changed:
+            try:
+                self._save()
+            except Exception:
+                pass
+
     def _generate_trade_id(self, symbol: str) -> str:
         suffix = uuid.uuid4().hex[:10]
         return f"{self._state.account_label}-{symbol}-{suffix}"
@@ -509,7 +667,7 @@ class PaperBroker:
         features: Dict[str, Any],
         extra: Optional[Dict[str, Any]] = None,
         trade_id: Optional[str] = None,
-        log_setup: bool = False,  # kept for compatibility; invariant is always-on
+        log_setup: bool = False,  # legacy/manual ONLY. executor_v2 is canonical setup_context writer.
     ) -> PaperPosition:
         if entry_price <= 0 or stop_price <= 0:
             raise ValueError("entry_price and stop_price must be > 0")
@@ -541,37 +699,37 @@ class PaperBroker:
             features_ext["size"] = float(size_val)
 
         trade_id_final = trade_id or self._generate_trade_id(symbol)
+        trade_id_final = self._normalize_trade_id(symbol=symbol, trade_id=trade_id_final)
         now = _now_ms()
 
-        # Canonical invariant: setup_context must be emitted once per trade open (PAPER/LEARN_DRY)
-        if trade_id_final not in _PUBLISHED_SETUP_TRADE_IDS:
-            try:
-                _maybe_publish_setup_context(
-                    trade_id=trade_id_final,
-                    symbol=symbol,
-                    account_label=self._state.account_label,
-                    strategy=self._state.strategy_name,
-                    features=features_ext,
-                    setup_type=setup_type,
-                    timeframe=timeframe,
-                    ai_profile=self._state.ai_profile,
-                    extra=extra,
-                )
-                _PUBLISHED_SETUP_TRADE_IDS.add(trade_id_final)
-            except Exception as e:
-                _append_jsonl_bytesafe(
-                    _SETUP_CTX_FAIL_PATH,
-                    {
-                        "event_type": "setup_context_write_failed",
-                        "ts_ms": _now_ms(),
-                        "trade_id": trade_id_final,
-                        "account_label": self._state.account_label,
-                        "symbol": symbol,
-                        "error": repr(e),
-                    },
-                )
+        if log_setup:
+            if trade_id_final not in _PUBLISHED_SETUP_TRADE_IDS:
+                try:
+                    _maybe_publish_setup_context(
+                        trade_id=trade_id_final,
+                        symbol=symbol,
+                        account_label=self._state.account_label,
+                        strategy=self._state.strategy_name,
+                        features=features_ext,
+                        setup_type=setup_type,
+                        timeframe=timeframe,
+                        ai_profile=self._state.ai_profile,
+                        extra=extra,
+                    )
+                    _PUBLISHED_SETUP_TRADE_IDS.add(trade_id_final)
+                except Exception as e:
+                    _append_jsonl_bytesafe(
+                        _SETUP_CTX_FAIL_PATH,
+                        {
+                            "event_type": "setup_context_write_failed",
+                            "ts_ms": _now_ms(),
+                            "trade_id": trade_id_final,
+                            "account_label": self._state.account_label,
+                            "symbol": symbol,
+                            "error": repr(e),
+                        },
+                    )
 
-        # continuity defaults (never None if we can avoid it)
         client_tid = (
             str(extra.get("client_trade_id"))
             if isinstance(extra, dict) and extra.get("client_trade_id")
@@ -639,13 +797,11 @@ class PaperBroker:
 
         self._state.equity += float(pnl)
 
-        # move to closed
         self._state.open_positions = [p for p in self._state.open_positions if p.trade_id != pos.trade_id]
         self._state.closed_trades.append(pos)
         self._save()
         _publish_positions_bus(self._state.account_label, self._state.open_positions)
 
-        # Try writing outcome (fail-soft)
         _maybe_write_outcome_v1_from_close(
             account_label=self._state.account_label,
             strategy=self._state.strategy_name,
@@ -751,3 +907,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+

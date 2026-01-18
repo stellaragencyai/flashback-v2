@@ -1,0 +1,14 @@
+﻿{% for r in rows %}
+<tr>
+<td>{{ r.account }}</td>
+<td>{{ r.status }}</td>
+<td>{{ r.pnl_pct }}</td>
+<td>{{ r.drawdown }}</td>
+<td>{{ r.confidence }}</td>
+<td>{{ r.learning }}</td>
+<td>{{ r.intent }}</td>
+<td>{{ r.win_rate }}</td>
+<td>{{ r.trades }}</td>
+<td>{{ r.health }}</td>
+</tr>
+{% endfor %}

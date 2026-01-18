@@ -1,15 +1,19 @@
-﻿#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
+﻿
 """
-Flashback — AI Stack Supervisor v3.3 (Hardened validator + log-safe STOP messages)
+Flashback — AI Stack Supervisor v3.9.2
+(HARD venv pinning + spawn executable hard lock + validator hard venv + log-safe STOP + ORCH_ENV_LOADED support)
 
-Changes (v3.3):
-1) HARD GATE validator import is robust:
-   - try package import (app.tools.validate_config)
-   - fallback to running validate_config.py by file path (subprocess)
-2) STOP messages are ASCII-only to avoid Windows cp1252 logging crashes
-3) Workers: supports BOTH sync + async entry functions (fixes "coroutine was never awaited")
-4) Keeps: ops_snapshot writes, per-worker telemetry, restart tracking, rate-limited alerts
+Core guarantees:
+- If supervisor is not running under repo venv python -> HARD STOP (AT IMPORT TIME).
+- Multiprocessing spawn executable is pinned to repo venv python -> HARD PIN (AT IMPORT TIME).
+- If mp/spawn get_executable != expected venv python -> HARD STOP (prevents system Python children).
+- Validator subprocess runs under expected venv python (never system python).
+
+Keeps:
+- robust validator (import + file fallback)
+- ASCII-safe logging
+- sync + async worker entry support
+- ops_snapshot writes, per-worker telemetry, restart tracking, rate-limited alerts
 """
 
 from __future__ import annotations
@@ -25,6 +29,88 @@ import time
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
 
+# ---------------------------------------------------------------------------
+# ABSOLUTE EARLY BOOTSTRAP (IMPORT-TIME HARD GATE)
+# ---------------------------------------------------------------------------
+
+def _bootstrap_root() -> Path:
+    # supervisor_ai_stack.py lives at: <ROOT>\app\bots\supervisor_ai_stack.py
+    return Path(__file__).resolve().parents[2]
+
+
+def _bootstrap_expected_venv_python(root: Path) -> Path:
+    return (root / ".venv" / "Scripts" / "python.exe").resolve()
+
+
+def _bootstrap_hard_gate_and_pin() -> None:
+    """
+    MUST run at import time.
+    If this module is executed by system Python (e.g., Python312), kill it immediately.
+    Also pins multiprocessing executable early so Windows spawn can't drift.
+    """
+    root = _bootstrap_root()
+    expected = _bootstrap_expected_venv_python(root)
+    actual = Path(sys.executable).resolve()
+
+    # Make environment deterministic and hostile to user-site pollution
+    os.environ.setdefault("PYTHONNOUSERSITE", "1")
+    os.environ.setdefault("PYTHONUTF8", "1")
+    os.environ.setdefault("PYTHONIOENCODING", "utf-8")
+
+    if not expected.exists():
+        # If the venv doesn't exist, nothing should proceed.
+        sys.stderr.write(f"STOP Missing expected venv python: {expected}\n")
+        raise SystemExit(78)
+
+    if actual != expected:
+        # This is the BIG fix: kill Python312 invocations instantly.
+        sys.stderr.write(
+            "STOP Interpreter HARD GATE FAIL (IMPORT-TIME):\n"
+            f"  sys.executable = {actual}\n"
+            f"  expected       = {expected}\n"
+        )
+        raise SystemExit(77)
+
+    # Ensure "spawn" is used (Windows default), but force to avoid surprises.
+    try:
+        mp.set_start_method("spawn", force=True)
+    except Exception:
+        pass
+
+    # Pin mp executable ASAP. Use both mp and multiprocessing.spawn fallbacks.
+    try:
+        if hasattr(mp, "set_executable"):
+            mp.set_executable(str(expected))  # type: ignore[attr-defined]
+        else:
+            import multiprocessing.spawn as mps  # type: ignore
+            if hasattr(mps, "set_executable"):
+                mps.set_executable(str(expected))  # type: ignore[attr-defined]
+    except Exception as e:
+        sys.stderr.write(f"STOP Could not pin multiprocessing executable: {e}\n")
+        raise SystemExit(79)
+
+    # Verify pin stuck
+    try:
+        if hasattr(mp, "get_executable"):
+            got = Path(str(mp.get_executable())).resolve()  # type: ignore[attr-defined]
+        else:
+            import multiprocessing.spawn as mps  # type: ignore
+            got = Path(str(mps.get_executable())).resolve()  # type: ignore[attr-defined]
+    except Exception as e:
+        sys.stderr.write(f"STOP Could not read multiprocessing executable: {e}\n")
+        raise SystemExit(80)
+
+    if got != expected:
+        sys.stderr.write(
+            "STOP multiprocessing executable mismatch after pin (IMPORT-TIME):\n"
+            f"  get_executable() = {got}\n"
+            f"  expected         = {expected}\n"
+        )
+        raise SystemExit(81)
+
+
+_bootstrap_hard_gate_and_pin()
+
 # --- PHASE8_IMPORT_PATH_SHIM ---
 import os as _os
 import sys as _sys
@@ -34,7 +120,6 @@ _ROOT = _Path(__file__).resolve().parents[2]
 if str(_ROOT) not in _sys.path:
     _sys.path.insert(0, str(_ROOT))
 
-# Best-effort env defaults (NOTE: does NOT retroactively change sys.stdout encoding)
 _os.environ.setdefault("PYTHONUTF8", "1")
 _os.environ.setdefault("PYTHONIOENCODING", "utf-8")
 # --- END PHASE8_IMPORT_PATH_SHIM ---
@@ -61,9 +146,7 @@ def _get_logger():
 
 
 def _ascii_safe(s: str) -> str:
-    """
-    Avoid Windows cp1252 stdout crashes from emoji/unicode in logging.
-    """
+    """Avoid Windows cp1252 stdout crashes from emoji/unicode in logging."""
     try:
         return s.encode("ascii", errors="replace").decode("ascii", errors="ignore")
     except Exception:
@@ -71,7 +154,7 @@ def _ascii_safe(s: str) -> str:
 
 
 # ---------------------------------------------------------------------------
-# ROOT + dotenv (must be called only in MainProcess)
+# ROOT + dotenv
 # ---------------------------------------------------------------------------
 
 def _resolve_root() -> Path:
@@ -82,11 +165,119 @@ def _resolve_root() -> Path:
         return Path(__file__).resolve().parents[2]
 
 
+def _expected_venv_python(root: Path) -> Path:
+    """
+    Canonical venv python for this repo. This must be the ONLY interpreter allowed.
+    Windows: <ROOT>\\.venv\\Scripts\\python.exe
+    """
+    return (root / ".venv" / "Scripts" / "python.exe").resolve()
+
+
+def _hard_gate_venv_interpreter(root: Path, log) -> Path:
+    """
+    HARD STOP if supervisor is not running under repo venv python.
+    Returns expected venv python path.
+    (This is still kept, but the real enforcement is import-time bootstrap.)
+    """
+    expected = _expected_venv_python(root)
+    actual = Path(sys.executable).resolve()
+
+    if not expected.exists():
+        msg = f"STOP Missing expected venv python: {expected}"
+        log.error(_ascii_safe(msg))
+        raise SystemExit(msg)
+
+    if actual != expected:
+        msg = (
+            f"STOP Interpreter HARD GATE FAIL: sys.executable={actual} "
+            f"!= expected venv python={expected}"
+        )
+        log.error(_ascii_safe(msg))
+        raise SystemExit(msg)
+
+    log.info("Interpreter HARD GATE PASS: sys.executable == expected venv python (%s)", str(expected))
+    return expected
+
+
+def _mp_get_executable() -> Path:
+    """
+    Python version / platform compatible mp executable getter.
+    - Some builds do NOT expose multiprocessing.get_executable (your case).
+    - On Windows, the canonical getter is multiprocessing.spawn.get_executable().
+    """
+    if hasattr(mp, "get_executable"):
+        got = mp.get_executable()  # type: ignore[attr-defined]
+        return Path(str(got)).resolve()
+
+    import multiprocessing.spawn as mps  # type: ignore
+    if hasattr(mps, "get_executable"):
+        got = mps.get_executable()  # type: ignore[attr-defined]
+        return Path(str(got)).resolve()
+
+    raise AttributeError("No supported get_executable found (multiprocessing or multiprocessing.spawn)")
+
+
+def _mp_set_executable(expected_py: Path) -> None:
+    """
+    Python version / platform compatible mp executable setter.
+    Prefer multiprocessing.set_executable; fall back to multiprocessing.spawn.set_executable if needed.
+    """
+    if hasattr(mp, "set_executable"):
+        mp.set_executable(str(expected_py))  # type: ignore[attr-defined]
+        return
+
+    import multiprocessing.spawn as mps  # type: ignore
+    if hasattr(mps, "set_executable"):
+        mps.set_executable(str(expected_py))  # type: ignore[attr-defined]
+        return
+
+    raise AttributeError("No supported set_executable found (multiprocessing or multiprocessing.spawn)")
+
+
+def _pin_multiprocessing_executable(expected_py: Path, log) -> None:
+    """
+    HARD pin spawn executable. If this fails or doesn't stick, STOP.
+    This is the key to preventing system-Python children.
+    """
+    try:
+        _mp_set_executable(expected_py)
+        log.info("Pinned multiprocessing executable (EXPECTED venv python): %s", str(expected_py))
+    except Exception as e:
+        msg = f"STOP Could not pin multiprocessing executable to expected venv python: {e}"
+        log.error(_ascii_safe(msg))
+        raise SystemExit(msg)
+
+    # Hard verify
+    try:
+        got_path = _mp_get_executable()
+    except Exception as e:
+        msg = f"STOP Could not read multiprocessing executable: {e}"
+        log.error(_ascii_safe(msg))
+        raise SystemExit(msg)
+
+    if got_path != expected_py.resolve():
+        msg = (
+            "STOP multiprocessing executable mismatch after pin. "
+            f"get_executable()={got_path} expected={expected_py.resolve()}"
+        )
+        log.error(_ascii_safe(msg))
+        raise SystemExit(msg)
+
+    log.info("MP EXECUTABLE (get_executable) = %s", str(got_path))
+
+
 def _load_env_file(root: Path, log) -> Dict[str, str]:
     """
     Load .env into process env, and return dotenv_values (file-first behavior).
-    Must run only in MainProcess to avoid spam on spawn imports.
+
+    IMPORTANT:
+    - If ORCH_ENV_LOADED=1, orchestrator already loaded .env and exported vars.
+      In that case, do NOT load dotenv here (prevents double-load & surprises).
     """
+    if os.getenv("ORCH_ENV_LOADED", "").strip() == "1":
+        log.info("ORCH_ENV_LOADED=1 -> skipping dotenv load; relying on OS environment only.")
+        return {}
+
     try:  # pragma: no cover
         from dotenv import load_dotenv, dotenv_values  # type: ignore
         load_dotenv(root / ".env")
@@ -112,9 +303,7 @@ def _now_ms() -> int:
 
 
 def _ops_write(component: str, account_label: str, ok: bool, details: Dict[str, Any]) -> None:
-    """
-    Best-effort write into ops_snapshot.json. Never break supervisor if ops fails.
-    """
+    """Best-effort write into ops_snapshot.json. Never break supervisor if ops fails."""
     try:
         from app.ops.ops_state import write_component_status  # type: ignore
         write_component_status(
@@ -201,18 +390,20 @@ def _file_first_bool_alias(env_file_vars: Dict[str, str], primary_name: str, ali
 # HARD GATE: Config validation (robust import + file fallback)
 # ---------------------------------------------------------------------------
 
-def _run_validator_by_path(root: Path, log) -> int:
-    """
-    Fallback: run validate_config.py by file path.
-    Returns process return code.
-    """
+def _run_validator_by_path(root: Path, log, expected_py: Path) -> int:
+    """Fallback: run validate_config.py by file path using expected venv python."""
     candidate = root / "app" / "tools" / "validate_config.py"
     if not candidate.exists():
         log.error("STOP Config validation missing: %s", candidate)
         return 2
 
     try:
-        p = subprocess.run([sys.executable, str(candidate)], cwd=str(root), capture_output=True, text=True)
+        p = subprocess.run(
+            [str(expected_py), str(candidate)],
+            cwd=str(root),
+            capture_output=True,
+            text=True,
+        )
         out = _ascii_safe(p.stdout or "")
         err = _ascii_safe(p.stderr or "")
         if out.strip():
@@ -225,7 +416,7 @@ def _run_validator_by_path(root: Path, log) -> int:
         return 3
 
 
-def _hard_gate_validate_config(root: Path, log, send_tg) -> bool:
+def _hard_gate_validate_config(root: Path, log, send_tg, expected_py: Path) -> bool:
     try:
         from app.tools.validate_config import main as validate_config_main  # type: ignore
         rc = int(validate_config_main() or 0)
@@ -249,7 +440,7 @@ def _hard_gate_validate_config(root: Path, log, send_tg) -> bool:
         except Exception:
             pass
 
-        rc = _run_validator_by_path(root, log)
+        rc = _run_validator_by_path(root, log, expected_py)
         if rc != 0:
             msg2 = f"STOP Config validation FAILED via file fallback (rc={rc}). Refusing to start AI stack."
             log.error(_ascii_safe(msg2))
@@ -339,12 +530,7 @@ def _import_first(log, mod_names: List[str]):
 
 
 def _run_entry_callable(log, bot_name: str, fn: Callable[..., Any]) -> None:
-    """
-    Run a worker entry callable that might be:
-      - normal sync function
-      - async function (coroutinefunction)
-      - sync function that returns a coroutine
-    """
+    """Run a worker entry callable that might be sync/async/coroutine-returning."""
     try:
         if inspect.iscoroutinefunction(fn):
             log.info("%s entry: async %s()", bot_name, getattr(fn, "__name__", "callable"))
@@ -359,8 +545,6 @@ def _run_entry_callable(log, bot_name: str, fn: Callable[..., Any]) -> None:
 
         return
     except RuntimeError as e:
-        # If an event loop is already running (rare in spawned worker),
-        # fall back to creating a new loop explicitly.
         msg = _ascii_safe(str(e))
         log.warning("%s entry: runtime loop issue: %s", bot_name, msg)
         loop = asyncio.new_event_loop()
@@ -411,6 +595,17 @@ def _run_tp_sl_manager() -> None:
         _call_entry(log, mod, "tp_sl_manager")
     except Exception as e:
         alert_bot_error("tp_sl_manager", f"import/runtime error: {e}", "ERROR")
+
+
+
+def _run_executor_v2() -> None:
+    log = _get_logger()
+    _, _, alert_bot_error = _load_common(log)
+    try:
+        mod = _import_first(log, ["app.bots.executor_v2"])
+        _call_entry(log, mod, "executor_v2")
+    except Exception as e:
+        alert_bot_error("executor_v2", f"import/runtime error: {e}", "ERROR")
 
 
 def _run_ai_pilot() -> None:
@@ -491,6 +686,7 @@ class WorkerSpec:
 def _build_worker_specs(env_file_vars: Dict[str, str]) -> Dict[str, WorkerSpec]:
     ws = _file_first_bool(env_file_vars, "AI_STACK_ENABLE_WS_SWITCHBOARD", "true")
     tp = _file_first_bool(env_file_vars, "AI_STACK_ENABLE_TP_SL_MANAGER", "true")
+    execv2 = _file_first_bool(env_file_vars, "AI_STACK_ENABLE_EXECUTOR_V2", "true")
     pilot = _file_first_bool(env_file_vars, "AI_STACK_ENABLE_AI_PILOT", "true")
     router = _file_first_bool(env_file_vars, "AI_STACK_ENABLE_AI_ACTION_ROUTER", "true")
     journal = _file_first_bool(env_file_vars, "AI_STACK_ENABLE_AI_JOURNAL", "false")
@@ -500,6 +696,7 @@ def _build_worker_specs(env_file_vars: Dict[str, str]) -> Dict[str, WorkerSpec]:
 
     return {
         "ws_switchboard": WorkerSpec("ws_switchboard", ws, _run_ws_switchboard),
+        "executor_v2": WorkerSpec("executor_v2", execv2, _run_executor_v2),
         "tp_sl_manager": WorkerSpec("tp_sl_manager", tp, _run_tp_sl_manager),
         "ai_pilot": WorkerSpec("ai_pilot", pilot, _run_ai_pilot),
         "ai_action_router": WorkerSpec("ai_action_router", router, _run_ai_action_router),
@@ -524,10 +721,29 @@ def _should_alert(last_alert_ms: int, min_interval_sec: int) -> bool:
 # Supervisor core
 # ---------------------------------------------------------------------------
 
-def _start_worker(log, spec: WorkerSpec) -> None:
+def _start_worker(log, spec: WorkerSpec, expected_py: Path) -> None:
     if spec.process is not None and spec.process.is_alive():
         return
+
+    # Pre-spawn hard check every single time
+    try:
+        got = _mp_get_executable()
+    except Exception as e:
+        msg = f"STOP get_executable read failed right before spawn: {e}"
+        log.error(_ascii_safe(msg))
+        raise SystemExit(msg)
+
+    if got != expected_py.resolve():
+        msg = (
+            f"STOP Refusing to spawn worker {spec.name}: "
+            f"get_executable()={got} expected={expected_py.resolve()}"
+        )
+        log.error(_ascii_safe(msg))
+        raise SystemExit(msg)
+
     log.info("Starting worker %s ...", spec.name)
+    log.info("ABOUT TO SPAWN | sys.executable=%s | get_executable=%s", str(Path(sys.executable).resolve()), str(got))
+
     p = mp.Process(target=spec.target, name=f"fb_{spec.name}", daemon=False)
     p.start()
     spec.process = p
@@ -564,14 +780,14 @@ def _stop_worker(log, spec: WorkerSpec) -> None:
     log.info("Worker %s stopped.", spec.name)
 
 
-def _supervisor_loop(root: Path, account_label: str, poll_seconds: int, env_file_vars: Dict[str, str]) -> None:
+def _supervisor_loop(root: Path, account_label: str, poll_seconds: int, env_file_vars: Dict[str, str], expected_py: Path) -> None:
     log = _get_logger()
     record_heartbeat, send_tg, alert_bot_error = _load_common(log)
 
     alert_min_sec = int(os.getenv("AI_STACK_ALERT_MIN_INTERVAL_SEC", "20") or "20")
     last_alert_ms = 0
 
-    log.info("BOOT | ROOT=%s | ACCOUNT_LABEL=%s | poll=%ss", root, account_label, poll_seconds)
+    log.info("BOOT | ROOT=%s | ACCOUNT_LABEL=%s | poll=%ss | expected_py=%s", str(root), account_label, poll_seconds, str(expected_py))
 
     kill_switch_path = Path(_ROOT) / "state" / "KILL_SWITCH"
     if kill_switch_path.exists():
@@ -583,8 +799,9 @@ def _supervisor_loop(root: Path, account_label: str, poll_seconds: int, env_file
     specs = _build_worker_specs(env_file_vars)
 
     log.info(
-        "Flags (file-first): WS=%s TP/SL=%s PILOT=%s ROUTER=%s RISK=%s OUTCOMES=%s PAPER_FEED=%s",
+        "Flags (file-first): WS=%s EXEC=%s TP/SL=%s PILOT=%s ROUTER=%s RISK=%s OUTCOMES=%s PAPER_FEED=%s",
         specs["ws_switchboard"].enabled,
+        specs["executor_v2"].enabled,
         specs["tp_sl_manager"].enabled,
         specs["ai_pilot"].enabled,
         specs["ai_action_router"].enabled,
@@ -653,7 +870,7 @@ def _supervisor_loop(root: Path, account_label: str, poll_seconds: int, env_file
                 else:
                     spec.last_reason = "not_started"
 
-                _start_worker(log, spec)
+                _start_worker(log, spec, expected_py)
 
             alive = (spec.process is not None and spec.process.is_alive())
             pid = spec.process.pid if spec.process is not None else None
@@ -696,16 +913,11 @@ def _supervisor_loop(root: Path, account_label: str, poll_seconds: int, env_file
 
 
 def main() -> None:
-    try:
-        mp.set_start_method("spawn", force=False)
-    except RuntimeError:
-        pass
-
     log = _get_logger()
     root = _resolve_root()
 
-    if mp.current_process().name != "MainProcess":
-        return
+    expected_py = _hard_gate_venv_interpreter(root, log)
+    _pin_multiprocessing_executable(expected_py, log)
 
     env_file_vars = _load_env_file(root, log)
 
@@ -724,12 +936,12 @@ def main() -> None:
             pass
         return
 
-    if not _hard_gate_validate_config(root, log, send_tg):
+    if not _hard_gate_validate_config(root, log, send_tg, expected_py):
         _ops_write("supervisor_ai_stack", account_label, False, {"phase": "blocked", "reason": "config validation failed"})
         return
 
     try:
-        _supervisor_loop(root, account_label, poll_seconds, env_file_vars)
+        _supervisor_loop(root, account_label, poll_seconds, env_file_vars, expected_py)
     except KeyboardInterrupt:
         log.info("AI Stack Supervisor interrupted by user; shutting down...")
         record_heartbeat("supervisor_ai_stack_stopped")
@@ -746,3 +958,4 @@ if __name__ == "__main__":
     except Exception:
         pass
     main()
+

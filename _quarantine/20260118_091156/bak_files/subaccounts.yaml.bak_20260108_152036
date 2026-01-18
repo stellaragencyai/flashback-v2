@@ -1,0 +1,297 @@
+version: 2.3
+notes: "v2.3:\n  - Canonical source of truth is the top-level account mapping (main,\
+  \ flashback01..10, legacy).\n  - legacy.accounts_list is preserved for older loaders,\
+  \ but is now a strict mirror of the canonical mapping\n    to prevent drift (roles/strategy_name/risk_profile/ai_profile/automation_mode\
+  \ must match).\n  - Updated Sniper accounts per latest decision:\n      * flashback07\
+  \ = ETHUSDT only, sniper risk 25% per trade (via risk_profile: sniper_25)\n    \
+  \  * flashback08 = SOLUSDT only, sniper risk 25% per trade (via risk_profile: sniper_25)\n\
+  \      * flashback09 = FARTCOINUSDT only, sniper risk 25% per trade (via risk_profile:\
+  \ sniper_25)\n  - 25x “money extraction” alts group stays at 10% risk via profiles\
+  \ (default_sub/spec_small etc).\n"
+main:
+  sub_uid: null
+  role: main
+  strategy_name: main_manual
+  enabled: true
+  telegram_channel: main
+  risk_profile: main_manual_exits_only
+  enable_tp_sl: true
+  enable_journal: true
+  enable_ai_stack: false
+  ai_profile: manual_v1
+  automation_mode: false
+flashback01:
+  sub_uid: 524630315
+  role: trend_follow
+  strategy_name: Sub1_Trend
+  enabled: true
+  telegram_channel: sub1
+  risk_profile: midterm_core
+  enable_tp_sl: true
+  enable_journal: true
+  enable_ai_stack: true
+  ai_profile: trend_v1
+  automation_mode: LEARN_DRY
+flashback02:
+  sub_uid: 524633243
+  role: breakout_momentum
+  strategy_name: Sub2_Breakout
+  enabled: true
+  telegram_channel: sub2
+  risk_profile: midterm_core
+  enable_tp_sl: true
+  enable_journal: true
+  enable_ai_stack: true
+  ai_profile: breakout_v1
+  automation_mode: LEARN_DRY
+flashback03:
+  sub_uid: 524634622
+  role: scalp_intraday
+  strategy_name: Sub3_ScalpMajors
+  enabled: true
+  telegram_channel: sub3
+  risk_profile: midterm_core
+  enable_tp_sl: true
+  enable_journal: true
+  enable_ai_stack: true
+  ai_profile: scalp_v1
+  automation_mode: LEARN_DRY
+flashback04:
+  sub_uid: 524636309
+  role: alt_breakout_25x
+  strategy_name: Alt04_Breakout_Alts25x
+  enabled: true
+  telegram_channel: sub4
+  risk_profile: extractor_25x_v1
+  enable_tp_sl: true
+  enable_journal: true
+  enable_ai_stack: true
+  ai_profile: breakout_v1
+  automation_mode: LEARN_DRY
+flashback05:
+  sub_uid: 524637467
+  role: alt_breakout_25x
+  strategy_name: Alt04_Breakout_Alts25x
+  enabled: true
+  telegram_channel: sub5
+  risk_profile: extractor_25x_v1
+  enable_tp_sl: true
+  enable_journal: true
+  enable_ai_stack: true
+  ai_profile: breakout_v1
+  automation_mode: LEARN_DRY
+flashback06:
+  sub_uid: 524638768
+  role: alt_sweep_scalp_25x
+  strategy_name: Alt06_ScalpSweep_Alts25x
+  enabled: true
+  telegram_channel: sub6
+  risk_profile: extractor_25x_v1
+  enable_tp_sl: true
+  enable_journal: true
+  enable_ai_stack: true
+  ai_profile: scalp_v1
+  automation_mode: LEARN_DRY
+flashback07:
+  sub_uid: 524649709
+  role: sniper_eth
+  strategy_name: Sniper07_ETH
+  enabled: true
+  telegram_channel: sub7
+  risk_profile: sniper_v1
+  enable_tp_sl: true
+  enable_journal: true
+  enable_ai_stack: true
+  ai_profile: sniper_v1
+  automation_mode: LEARN_DRY
+  pinned_symbol: ETHUSDT
+flashback08:
+  sub_uid: 524650929
+  role: alt_swing_trend_25x
+  strategy_name: Alt08_SwingTrend_Alts25x
+  enabled: true
+  telegram_channel: sub8
+  risk_profile: sniper_v1
+  enable_tp_sl: true
+  enable_journal: true
+  enable_ai_stack: true
+  ai_profile: swing_v1
+  automation_mode: LEARN_DRY
+  pinned_symbol: SOLUSDT
+flashback09:
+  sub_uid: 524693375
+  role: alt_range_fade_25x
+  strategy_name: Alt09_RangeFade_Alts25x
+  enabled: true
+  telegram_channel: sub9
+  risk_profile: sniper_v1
+  enable_tp_sl: true
+  enable_journal: true
+  enable_ai_stack: true
+  ai_profile: range_v1
+  automation_mode: LEARN_DRY
+  pinned_symbol: FARTCOINUSDT
+flashback10:
+  sub_uid: 524700541
+  role: manual_discretionary
+  strategy_name: Sub10_ManualOnly
+  enabled: false
+  telegram_channel: sub10
+  risk_profile: manual_only
+  enable_tp_sl: true
+  enable_journal: true
+  enable_ai_stack: false
+  ai_profile: manual_only
+  automation_mode: false
+legacy:
+  enabled: false
+  role: legacy_compat
+  strategy_name: legacy_compat
+  telegram_channel: none
+  risk_profile: main_manual_exits_only
+  enable_tp_sl: false
+  enable_journal: false
+  enable_ai_stack: false
+  ai_profile: legacy
+  automation_mode: false
+  notes: 'Legacy compatibility container for older loaders expecting a list.
+
+    Not a real trading account. Keep disabled.
+
+    '
+  accounts_list:
+  - account_label: main
+    sub_uid: null
+    role: main
+    strategy_name: main_manual
+    enabled: true
+    telegram_channel: main
+    risk_profile: main_manual_exits_only
+    enable_tp_sl: true
+    enable_journal: true
+    enable_ai_stack: false
+    ai_profile: manual_v1
+    automation_mode: false
+  - account_label: flashback01
+    sub_uid: 524630315
+    role: trend_follow
+    strategy_name: Sub1_Trend
+    enabled: true
+    telegram_channel: sub1
+    risk_profile: midterm_core
+    enable_tp_sl: true
+    enable_journal: true
+    enable_ai_stack: true
+    ai_profile: trend_v1
+    automation_mode: LEARN_DRY
+  - account_label: flashback02
+    sub_uid: 524633243
+    role: breakout_momentum
+    strategy_name: Sub2_Breakout
+    enabled: true
+    telegram_channel: sub2
+    risk_profile: midterm_core
+    enable_tp_sl: true
+    enable_journal: true
+    enable_ai_stack: true
+    ai_profile: breakout_v1
+    automation_mode: LEARN_DRY
+  - account_label: flashback03
+    sub_uid: 524634622
+    role: scalp_intraday
+    strategy_name: Sub3_ScalpMajors
+    enabled: true
+    telegram_channel: sub3
+    risk_profile: midterm_core
+    enable_tp_sl: true
+    enable_journal: true
+    enable_ai_stack: true
+    ai_profile: scalp_v1
+    automation_mode: LEARN_DRY
+  - account_label: flashback04
+    sub_uid: 524636309
+    role: alt_breakout_25x
+    strategy_name: Alt04_Breakout_Alts25x
+    enabled: true
+    telegram_channel: sub4
+    risk_profile: extractor_25x_v1
+    enable_tp_sl: true
+    enable_journal: true
+    enable_ai_stack: true
+    ai_profile: breakout_v1
+    automation_mode: LEARN_DRY
+  - account_label: flashback05
+    sub_uid: 524637467
+    role: alt_breakout_25x
+    strategy_name: Alt04_Breakout_Alts25x
+    enabled: true
+    telegram_channel: sub5
+    risk_profile: extractor_25x_v1
+    enable_tp_sl: true
+    enable_journal: true
+    enable_ai_stack: true
+    ai_profile: breakout_v1
+    automation_mode: LEARN_DRY
+  - account_label: flashback06
+    sub_uid: 524638768
+    role: alt_sweep_scalp_25x
+    strategy_name: Alt06_ScalpSweep_Alts25x
+    enabled: true
+    telegram_channel: sub6
+    risk_profile: extractor_25x_v1
+    enable_tp_sl: true
+    enable_journal: true
+    enable_ai_stack: true
+    ai_profile: scalp_v1
+    automation_mode: LEARN_DRY
+  - account_label: flashback07
+    sub_uid: 524649709
+    role: sniper_eth
+    strategy_name: Sniper07_ETH
+    enabled: true
+    telegram_channel: sub7
+    risk_profile: sniper_v1
+    enable_tp_sl: true
+    enable_journal: true
+    enable_ai_stack: true
+    ai_profile: sniper_v1
+    automation_mode: LEARN_DRY
+    pinned_symbol: ETHUSDT
+  - account_label: flashback08
+    sub_uid: 524650929
+    role: sniper_sol
+    strategy_name: Sniper08_SOL
+    enabled: true
+    telegram_channel: sub8
+    risk_profile: sniper_v1
+    enable_tp_sl: true
+    enable_journal: true
+    enable_ai_stack: true
+    ai_profile: sniper_v1
+    automation_mode: LEARN_DRY
+    pinned_symbol: SOLUSDT
+  - account_label: flashback09
+    sub_uid: 524693375
+    role: sniper_fartcoin
+    strategy_name: Sniper09_FARTCOIN
+    enabled: true
+    telegram_channel: sub9
+    risk_profile: sniper_v1
+    enable_tp_sl: true
+    enable_journal: true
+    enable_ai_stack: true
+    ai_profile: sniper_v1
+    automation_mode: LEARN_DRY
+    pinned_symbol: FARTCOINUSDT
+  - account_label: flashback10
+    sub_uid: 524700541
+    role: manual_discretionary
+    strategy_name: Sub10_ManualOnly
+    enabled: false
+    telegram_channel: sub10
+    risk_profile: manual_only
+    enable_tp_sl: true
+    enable_journal: true
+    enable_ai_stack: false
+    ai_profile: manual_only
+    automation_mode: false

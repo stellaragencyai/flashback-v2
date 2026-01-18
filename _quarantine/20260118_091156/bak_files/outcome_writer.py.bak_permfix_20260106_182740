@@ -1,0 +1,162 @@
+﻿from __future__ import annotations
+
+"""
+Flashback — Outcome Writer (v1)
+
+Writes ONLY canonical outcome.v1 rows.
+
+Routing (critical for per-account isolation):
+- If AI_EVENTS_DIR is set (env), write to: <AI_EVENTS_DIR>/outcomes.v1.jsonl
+- Else (default), write to: state/ai_events/outcomes.v1.jsonl
+
+Compatibility:
+- Exposes write_outcome_from_paper_close(...) for PaperBroker
+- Accepts BOTH calling styles:
+  (A) write_outcome_from_paper_close(payload=<dict>)
+  (B) write_outcome_from_paper_close(**fields)
+
+This is intentionally boring. Boring is reliable.
+"""
+
+import json
+import os
+import time
+from pathlib import Path
+from typing import Any, Dict, Optional
+
+from app.ai.outcome_contract import OUTCOME_SCHEMA_VERSION, validate_outcome_v1
+
+
+def _root() -> Path:
+    # Canonical config path in this repo is app.core.config.settings (NOT app.core.settings).
+    try:
+        from app.core.config import settings  # type: ignore
+        return Path(settings.ROOT)  # type: ignore
+    except Exception:
+        return Path(__file__).resolve().parents[2]
+
+
+ROOT: Path = _root()
+
+
+def _now_ms() -> int:
+    return int(time.time() * 1000)
+
+
+def _resolve_out_path() -> Path:
+    ai_events_dir = (os.environ.get("AI_EVENTS_DIR") or "").strip()
+    if ai_events_dir:
+        base = Path(ai_events_dir)
+        if not base.is_absolute():
+            base = (ROOT / base).resolve()
+        out_path = base / "outcomes.v1.jsonl"
+    else:
+        out_path = ROOT / "state" / "ai_events" / "outcomes.v1.jsonl"
+
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    return out_path
+
+
+def append_outcome_v1(outcome: Dict[str, Any]) -> None:
+    # Hard schema validation (fail fast)
+    validate_outcome_v1(outcome)
+
+    # Enforce schema_version
+    outcome["schema_version"] = OUTCOME_SCHEMA_VERSION
+
+    out_path = _resolve_out_path()
+    line = json.dumps(outcome, ensure_ascii=False)
+    with out_path.open("a", encoding="utf-8", newline="\n") as f:
+        f.write(line + "\n")
+
+
+def _req(payload: Dict[str, Any], k: str) -> Any:
+    if k not in payload or payload[k] in (None, ""):
+        raise ValueError(f"missing_required_field={k}")
+    return payload[k]
+
+
+def write_outcome_from_paper_close(*, payload: Optional[Dict[str, Any]] = None, **fields: Any) -> Dict[str, Any]:
+    """
+    PaperBroker compatibility hook.
+
+    Accepts either:
+      - payload=<dict>
+      - kwargs fields (trade_id, symbol, entry_px, ...)
+
+    Produces a strict outcome.v1 row and appends it.
+    """
+    src: Dict[str, Any]
+    if payload is not None:
+        src = dict(payload)
+    else:
+        # If caller passed "payload" inside fields, support that too.
+        if isinstance(fields.get("payload"), dict):
+            src = dict(fields["payload"])
+        else:
+            src = dict(fields)
+
+    # Normalize / derive fields
+    trade_id = str(_req(src, "trade_id"))
+    symbol = str(_req(src, "symbol"))
+
+    entry_side = str(_req(src, "entry_side"))
+    entry_qty = float(_req(src, "entry_qty"))
+    entry_px = float(_req(src, "entry_px"))
+    opened_ts_ms = int(_req(src, "opened_ts_ms"))
+
+    # exit side can be provided or derived from entry_side
+    exit_side = src.get("exit_side")
+    if not exit_side:
+        exit_side = "Sell" if entry_side.lower() == "buy" else "Buy"
+    exit_side = str(exit_side)
+
+    exit_qty = float(_req(src, "exit_qty"))
+    exit_px = float(_req(src, "exit_px"))
+    closed_ts_ms = int(_req(src, "closed_ts_ms"))
+
+    pnl_usd = float(_req(src, "pnl_usd"))
+    fees_usd = float(_req(src, "fees_usd"))
+
+    # Optional metadata
+    account_label = str(src.get("account_label") or "")
+    timeframe = str(src.get("timeframe") or "")
+    setup_type = str(src.get("setup_type") or "")
+    mode = str(src.get("mode") or "PAPER")
+    close_reason = str(src.get("close_reason") or "")
+
+    out: Dict[str, Any] = {
+        "schema_version": OUTCOME_SCHEMA_VERSION,
+        "event_type": "trade_outcome",
+        "ts_ms": int(src.get("ts_ms") or _now_ms()),
+        "trade_id": trade_id,
+        "client_trade_id": str(src.get("client_trade_id") or trade_id),
+        "source_trade_id": src.get("source_trade_id"),
+        "symbol": symbol,
+        "account_label": account_label,
+        "timeframe": timeframe,
+        "setup_type": setup_type,
+        "mode": mode,
+        "entry_side": entry_side,
+        "entry_qty": entry_qty,
+        "entry_px": entry_px,
+        "opened_ts_ms": opened_ts_ms,
+        "exit_side": exit_side,
+        "exit_qty": exit_qty,
+        "exit_px": exit_px,
+        "closed_ts_ms": closed_ts_ms,
+        "pnl_usd": pnl_usd,
+        "fees_usd": fees_usd,
+        "close_reason": close_reason,
+    }
+
+    # Pass through a few optional fields if present
+    if "r_multiple" in src:
+        out["r_multiple"] = src.get("r_multiple")
+    if "ai_profile" in src:
+        out["ai_profile"] = src.get("ai_profile")
+    if "strategy" in src:
+        out["strategy"] = src.get("strategy")
+
+    append_outcome_v1(out)
+    return out

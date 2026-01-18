@@ -133,6 +133,9 @@ def _validate_strategies(strat_cfg: Dict[str, Any], exit_profiles: List[str]) ->
     subs: List[dict] = strat_cfg["subaccounts"]
     for idx, s in enumerate(subs):
         ctx = f"strategies.yaml: subaccounts[{idx}]"
+        # DISABLED_LANES_CAN_BE_EMPTY: allow disabled/manual lanes (flashback10/main) to keep symbols/timeframes empty.
+        enabled_bool = bool(s.get('enabled', True))
+
         if not isinstance(s, dict):
             _err(errs, f"{ctx}: must be a dict")
             continue
@@ -184,10 +187,10 @@ def _validate_strategies(strat_cfg: Dict[str, Any], exit_profiles: List[str]) ->
 
         # symbols/timeframes sanity
         symbols = s.get("symbols")
-        if not isinstance(symbols, list) or len(symbols) == 0:
+        if enabled_bool and (not isinstance(symbols, list) or len(symbols) == 0):
             _err(errs, f"{ctx}.symbols must be a non-empty list")
         timeframes = s.get("timeframes")
-        if not isinstance(timeframes, list) or len(timeframes) == 0:
+        if enabled_bool and (not isinstance(timeframes, list) or len(timeframes) == 0):
             _err(errs, f"{ctx}.timeframes must be a non-empty list")
 
         # exit_profile must exist

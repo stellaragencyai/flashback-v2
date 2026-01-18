@@ -1,0 +1,309 @@
+﻿from __future__ import annotations
+
+import json
+import os
+import sys
+import time
+import subprocess
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Dict, Any, List, Optional, Tuple
+
+try:
+    import yaml  # type: ignore
+except Exception as e:
+    raise SystemExit(f"FATAL: PyYAML missing. pip install pyyaml. err={e!r}")
+
+ROOT = Path(__file__).resolve().parents[2]
+LOG_DIR = ROOT / "app" / "logs"
+CFG = ROOT / "config" / "fleet_manifest.yaml"
+STATE_DIR = ROOT / "state"
+FLEET_SNAPSHOT_PATH = STATE_DIR / "fleet_snapshot.json"
+
+# Common bus files (best-effort; missing is allowed)
+BUS_FILES: Tuple[Tuple[str, Path], ...] = (
+    ("positions_bus", STATE_DIR / "positions_bus.json"),
+    ("trades_bus", STATE_DIR / "trades_bus.json"),
+    ("orderbook_bus", STATE_DIR / "orderbook_bus.json"),
+    ("ops_snapshot", STATE_DIR / "ops_snapshot.json"),
+    ("heartbeats", STATE_DIR / "heartbeats.json"),
+)
+
+@dataclass
+class ProcSpec:
+    label: str
+    enabled: bool
+    enable_ai_stack: bool
+    p: Optional[subprocess.Popen] = None
+    restart_count: int = 0
+    last_start_ts: float = 0.0
+    last_exit_code: Optional[int] = None
+
+def _now_ms() -> int:
+    return int(time.time() * 1000)
+
+def _safe_stat(p: Path) -> Optional[os.stat_result]:
+    try:
+        return p.stat()
+    except Exception:
+        return None
+
+def _file_age_ms(p: Path) -> Optional[int]:
+    st = _safe_stat(p)
+    if st is None:
+        return None
+    try:
+        mtime_ms = int(st.st_mtime * 1000)
+    except Exception:
+        return None
+    return max(0, _now_ms() - mtime_ms)
+
+def _bus_freshness() -> Dict[str, Any]:
+    out: Dict[str, Any] = {}
+    for name, path in BUS_FILES:
+        st = _safe_stat(path)
+        if st is None:
+            out[name] = {"exists": False, "path": str(path)}
+            continue
+        age_ms = _file_age_ms(path)
+        out[name] = {
+            "exists": True,
+            "path": str(path),
+            "size": int(st.st_size),
+            "mtime_ms": int(st.st_mtime * 1000),
+            "age_ms": age_ms,
+        }
+    return out
+
+def _atomic_write_json(path: Path, payload: Dict[str, Any]) -> None:
+    """
+    Atomic JSON write on Windows:
+    - write temp file in same dir
+    - os.replace(temp, path)
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(f"{path.name}.tmp.{os.getpid()}.{time.time_ns()}")
+    data = json.dumps(payload, indent=2, sort_keys=True, ensure_ascii=False)
+    tmp.write_text(data, encoding="utf-8", errors="replace")
+    os.replace(str(tmp), str(path))
+
+def _load_manifest(path: Path) -> List[Dict[str, Any]]:
+    d = yaml.safe_load(path.read_text(encoding="utf-8", errors="ignore")) or {}
+    fleet = d.get("fleet") or []
+    if not isinstance(fleet, list):
+        raise SystemExit("Manifest invalid: expected top-level fleet: [..]")
+    return [x for x in fleet if isinstance(x, dict)]
+
+def _log_path(label: str) -> Path:
+    LOG_DIR.mkdir(parents=True, exist_ok=True)
+    return LOG_DIR / f"orchestrator_{label}.log"
+
+def _spawn_supervisor(label: str) -> subprocess.Popen:
+    env = os.environ.copy()
+    env["ACCOUNT_LABEL"] = label
+    # Make Windows console less fragile
+    env.setdefault("PYTHONUTF8", "1")
+    env.setdefault("PYTHONIOENCODING", "utf-8")
+
+    lp = _log_path(label)
+    f = open(lp, "a", encoding="utf-8", errors="replace")
+    f.write(f"\n\n=== ORCH SPAWN {label} ts_ms={_now_ms()} ===\n")
+    f.flush()
+
+    cmd = [sys.executable, "-m", "app.bots.supervisor_ai_stack"]
+    p = subprocess.Popen(
+        cmd,
+        cwd=str(ROOT),
+        env=env,
+        stdout=f,
+        stderr=f,
+        text=True,
+    )
+    return p
+
+def _spawn_ops_tick() -> int:
+    # Best-effort periodic self-check; never required for supervising workers.
+    cmd = [sys.executable, "-m", "app.tools.phase8_ops_tick"]
+    p = subprocess.run(cmd, cwd=str(ROOT), capture_output=True, text=True)
+    return int(p.returncode)
+
+def _terminate_proc(p: subprocess.Popen) -> None:
+    try:
+        if p.poll() is not None:
+            return
+        p.terminate()
+    except Exception:
+        pass
+
+def _build_snapshot(
+    specs: Dict[str, ProcSpec],
+    poll_sec: int,
+    ops_tick_sec: int,
+    manifest_mtime_ms: Optional[int],
+    manifest_path: Path,
+) -> Dict[str, Any]:
+    now = time.time()
+    now_ms = _now_ms()
+
+    subs: Dict[str, Any] = {}
+    for label, spec in sorted(specs.items(), key=lambda kv: kv[0].lower()):
+        should_run = bool(spec.enabled and spec.enable_ai_stack)
+        alive = (spec.p is not None and spec.p.poll() is None)
+        pid = spec.p.pid if (spec.p is not None) else None
+        uptime_sec: Optional[float] = None
+        if alive and spec.last_start_ts > 0:
+            uptime_sec = max(0.0, now - spec.last_start_ts)
+
+        subs[label] = {
+            "enabled": bool(spec.enabled),
+            "enable_ai_stack": bool(spec.enable_ai_stack),
+            "should_run": bool(should_run),
+            "alive": bool(alive),
+            "pid": pid,
+            "restart_count": int(spec.restart_count),
+            "last_start_ts": float(spec.last_start_ts),
+            "last_exit_code": spec.last_exit_code,
+            "uptime_sec": uptime_sec,
+        }
+
+    snapshot: Dict[str, Any] = {
+        "ts_ms": now_ms,
+        "root": str(ROOT),
+        "orchestrator": {
+            "poll_sec": poll_sec,
+            "ops_tick_sec": ops_tick_sec,
+            "pid": os.getpid(),
+            "python": sys.executable,
+            "cwd": os.getcwd(),
+        },
+        "manifest": {
+            "path": str(manifest_path),
+            "mtime_ms": manifest_mtime_ms,
+        },
+        "buses": _bus_freshness(),
+        "fleet": {
+            "count": len(subs),
+            "labels": list(subs.keys()),
+            "subs": subs,
+        },
+    }
+    return snapshot
+
+def main() -> int:
+    os.chdir(ROOT)
+    if not CFG.exists():
+        raise SystemExit(f"Missing manifest: {CFG}")
+
+    # Initial manifest load
+    fleet = _load_manifest(CFG)
+    specs: Dict[str, ProcSpec] = {}
+    for row in fleet:
+        label = str(row.get("account_label", "")).strip()
+        if not label:
+            continue
+        specs[label] = ProcSpec(
+            label=label,
+            enabled=bool(row.get("enabled", False)),
+            enable_ai_stack=bool(row.get("enable_ai_stack", False)),
+        )
+
+    poll_sec = int(os.getenv("ORCH_POLL_SEC", "3") or "3")
+    ops_tick_sec = int(os.getenv("ORCH_OPS_TICK_SEC", "30") or "30")
+    last_ops = 0.0
+
+    # manifest hot-reload tracking
+    last_manifest_mtime_ms: Optional[int] = None
+    try:
+        last_manifest_mtime_ms = int(CFG.stat().st_mtime * 1000)
+    except Exception:
+        last_manifest_mtime_ms = None
+
+    print("ORCH: loaded", len(specs), "labels from", str(CFG))
+    print("ORCH: poll_sec=", poll_sec, "ops_tick_sec=", ops_tick_sec)
+    print("ORCH: fleet_snapshot_path=", str(FLEET_SNAPSHOT_PATH))
+
+    while True:
+        # 0) Hot reload manifest if changed
+        try:
+            mtime_ms = int(CFG.stat().st_mtime * 1000)
+        except Exception:
+            mtime_ms = None
+
+        if mtime_ms is not None and mtime_ms != last_manifest_mtime_ms:
+            last_manifest_mtime_ms = mtime_ms
+            try:
+                fleet = _load_manifest(CFG)
+                new_specs: Dict[str, ProcSpec] = {}
+                for row in fleet:
+                    label = str(row.get("account_label", "")).strip()
+                    if not label:
+                        continue
+                    enabled = bool(row.get("enabled", False))
+                    enable_ai_stack = bool(row.get("enable_ai_stack", False))
+
+                    # preserve existing ProcSpec state if label already exists
+                    if label in specs:
+                        cur = specs[label]
+                        cur.enabled = enabled
+                        cur.enable_ai_stack = enable_ai_stack
+                        new_specs[label] = cur
+                    else:
+                        new_specs[label] = ProcSpec(label=label, enabled=enabled, enable_ai_stack=enable_ai_stack)
+
+                # terminate labels removed from manifest
+                removed = [lbl for lbl in specs.keys() if lbl not in new_specs]
+                for lbl in removed:
+                    ps = specs[lbl]
+                    if ps.p is not None and ps.p.poll() is None:
+                        _terminate_proc(ps.p)
+
+                specs = new_specs
+                print(f"ORCH: manifest reloaded. labels={len(specs)} mtime_ms={mtime_ms}")
+            except Exception as e:
+                print(f"ORCH: manifest reload FAILED: {e}")
+
+        # 1) Ensure required supervisors are running
+        for label, spec in specs.items():
+            should_run = bool(spec.enabled and spec.enable_ai_stack)
+            if not should_run:
+                # If somehow running, terminate
+                if spec.p is not None and spec.p.poll() is None:
+                    _terminate_proc(spec.p)
+                spec.p = None
+                continue
+
+            # Start if not running
+            if spec.p is None or spec.p.poll() is not None:
+                if spec.p is not None:
+                    spec.last_exit_code = spec.p.returncode
+                    spec.restart_count += 1
+                spec.p = _spawn_supervisor(label)
+                spec.last_start_ts = time.time()
+
+        # 2) Write fleet snapshot (best-effort, but we really want it)
+        try:
+            snap = _build_snapshot(
+                specs=specs,
+                poll_sec=poll_sec,
+                ops_tick_sec=ops_tick_sec,
+                manifest_mtime_ms=last_manifest_mtime_ms,
+                manifest_path=CFG,
+            )
+            _atomic_write_json(FLEET_SNAPSHOT_PATH, snap)
+        except Exception as e:
+            # Never crash orchestrator because of snapshot write.
+            print(f"ORCH: snapshot write failed: {e}")
+
+        # 3) Optional global ops tick
+        now = time.time()
+        if ops_tick_sec > 0 and (now - last_ops) >= ops_tick_sec:
+            last_ops = now
+            try:
+                _spawn_ops_tick()
+            except Exception:
+                pass
+
+        time.sleep(poll_sec)
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -1,23 +1,22 @@
-#!/usr/bin/env python3
+﻿#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
 Flashback — Auto Executor v2 (Strategy-aware, multi-sub, AI-gated, policy-aware)
 
-[... header unchanged ...]
+[header unchanged]
 """
 
 from __future__ import annotations
 
 import os
-import re
 import json
 import asyncio
 import time
 import hashlib
+import traceback
 from decimal import Decimal
 from pathlib import Path
 from typing import Dict, Optional, List, Any, Iterable, Tuple
-
 
 from app.core.config import settings
 
@@ -60,48 +59,180 @@ from app.core.strategy_gate import (
     strategy_label,
     strategy_risk_pct,
 )
-from app.core.portfolio_guard import can_open_trade
 from app.core.flashback_common import get_equity_usdt, record_heartbeat, GLOBAL_BREAKER
 from app.core.session_guard import should_block_trading
 from app.ai.setup_memory_policy import get_risk_multiplier  # keep: risk multiplier lives here
 
-from app.core.orders_bus import record_order_event
-from app.ai.feature_logger import log_features_at_open
 from app.ai.ai_events_spine import build_setup_context, publish_ai_event
-from app.core.ai_state_bus import build_ai_snapshot, validate_snapshot_v2
+from app.core.ai_state_bus import build_ai_snapshot as _raw_build_ai_snapshot, validate_snapshot_v2
+def _safe_build_ai_snapshot(**kwargs):
+    """
+    Bulletproof wrapper around build_ai_snapshot() that drops unsupported kwargs.
+    Prevents pipeline breaks when snapshot signature drifts across versions.
+    """
+    try:
+        import inspect
+        sig = inspect.signature(_raw_build_ai_snapshot)
+        allowed = set(sig.parameters.keys())
+        filtered = {k: v for k, v in kwargs.items() if k in allowed}
+        return _raw_build_ai_snapshot(**filtered)
+    except TypeError:
+        # If signature introspection fails, last-resort: call with no extras
+        try:
+            return _raw_build_ai_snapshot()
+        except Exception:
+            return None
+    except Exception:
+        # Never let snapshot creation kill trade execution
+        return None
 
 
-# ✅ Decision enforcer (manual blocks + pilot decisions)
+# Decision enforcer (manual blocks + pilot decisions)
 from app.ai.ai_decision_enforcer import enforce_decision
 
-# ✅ Pilot (legacy decision schema v1) producer
+# Pilot (legacy decision schema v1) producer
 try:
     from app.bots.ai_pilot import pilot_decide  # type: ignore
 except Exception:
     pilot_decide = None  # type: ignore
 
-from app.core.position_bus import get_positions_snapshot as bus_get_positions_snapshot
 from app.sim.paper_broker import PaperBroker  # type: ignore
 
-# ✅ NEW: canonical policy gate + audit log
+# Canonical policy gate + audit log
 from app.ai.ai_scoreboard_gatekeeper_v1 import scoreboard_gate_decide
 from app.ai.ai_executor_gate import ai_gate_decide, load_setup_policy, resolve_policy_cfg_for_strategy
 from app.core.ai_decision_stub_emitter import ensure_default_ai_decision
 
+from app.core.orders_bus import record_order_event
+from app.core.portfolio_guard import can_open_trade
+
 log = get_logger("executor_v2")
+
+# ---------------------------------------------------------------------------
+# EXECUTOR_ERROR recursion guard (prevents infinite self-report loops)
+# ---------------------------------------------------------------------------
+_EMITTING_EXECUTOR_ERROR: bool = False
 
 EXEC_DRY_RUN: bool = os.getenv("EXEC_DRY_RUN", "true").strip().lower() in ("1", "true", "yes", "y", "on")
 
-# ✅ Decision enforcement toggles
+# Decision enforcement toggles
 EXEC_ENFORCE_DECISIONS: bool = os.getenv("EXEC_ENFORCE_DECISIONS", "true").strip().lower() in ("1", "true", "yes", "y", "on")
 EXEC_FORCE_TRADE_ID: str = os.getenv("EXEC_FORCE_TRADE_ID", "").strip()
 
 ROOT: Path = settings.ROOT
-SIGNAL_FILE: Path = ROOT / "signals" / "observed.jsonl"
-CURSOR_FILE: Path = ROOT / "state" / "observed.cursor"
+
+# ---------------------------------------------------------------------------
+# SIGNAL + CURSOR PATHS (minimal override, default unchanged)
+# ---------------------------------------------------------------------------
+
+_DEFAULT_SIGNAL_FILE: Path = ROOT / "signals" / "observed.jsonl"
+_sig_env = os.getenv("EXEC_SIGNAL_FILE", "").strip()
+
+if _sig_env:
+    _sig_path = Path(_sig_env)
+    if not _sig_path.is_absolute():
+        _sig_path = ROOT / _sig_path
+    SIGNAL_FILE: Path = _sig_path
+else:
+    SIGNAL_FILE = _DEFAULT_SIGNAL_FILE
+
+_cursor_env = os.getenv("EXEC_CURSOR_FILE", "").strip()
+if _cursor_env:
+    _cur_path = Path(_cursor_env)
+    if not _cur_path.is_absolute():
+        _cur_path = ROOT / _cur_path
+    CURSOR_FILE: Path = _cur_path
+else:
+    # Default cursor path stays EXACTLY as before unless EXEC_SIGNAL_FILE is set.
+    if _sig_env:
+        # Separate cursor for non-default signal files to prevent corrupting legacy observed.cursor
+        CURSOR_FILE = ROOT / "state" / "cursors" / f"{SIGNAL_FILE.stem}.cursor"
+    else:
+        CURSOR_FILE = ROOT / "state" / "observed.cursor"
 
 SIGNAL_FILE.parent.mkdir(parents=True, exist_ok=True)
 CURSOR_FILE.parent.mkdir(parents=True, exist_ok=True)
+
+
+# SINGLE INSTANCE LOCK (per cursor file)
+def _acquire_single_instance_lock(cursor_path: str):
+    # Lock is scoped to the cursor file so multi-label runs still work.
+    import hashlib
+    import json
+    import os
+    import sys
+    import time
+    try:
+        import msvcrt  # Windows-only
+    except Exception:
+        msvcrt = None  # type: ignore
+
+    lock_dir = ROOT / "state" / "locks"
+    lock_dir.mkdir(parents=True, exist_ok=True)
+
+    key = (str(cursor_path) or "").strip().lower()
+    digest = hashlib.sha1(key.encode("utf-8", errors="ignore")).hexdigest()[:16]
+    lock_path = lock_dir / ("executor_v2_" + digest + ".lock")
+
+    fh = open(lock_path, "a+", encoding="utf-8")
+    try:
+        if msvcrt is None:
+            raise RuntimeError("msvcrt unavailable; cannot lock on Windows")
+        fh.seek(0)
+        # Lock first byte, non-blocking
+        msvcrt.locking(fh.fileno(), msvcrt.LK_NBLCK, 1)
+    except OSError:
+        try:
+            fh.seek(0)
+            existing = fh.read().strip()
+        except Exception:
+            existing = ""
+        msg = "REFUSING TO START: another executor_v2 is already running for cursor=" + str(cursor_path) + ". lock=" + str(lock_path)
+        if existing:
+            msg = msg + " holder=" + existing[:300]
+        try:
+            log.error(msg)
+        except Exception:
+            pass
+        try:
+            print(msg)
+        except Exception:
+            pass
+        try:
+            fh.close()
+        except Exception:
+            pass
+        sys.exit(2)
+    except Exception as e:
+        msg = "REFUSING TO START: could not acquire single-instance lock for cursor=" + str(cursor_path) + ". lock=" + str(lock_path) + ". err=" + str(e)
+        try:
+            log.error(msg)
+        except Exception:
+            pass
+        try:
+            print(msg)
+        except Exception:
+            pass
+        try:
+            fh.close()
+        except Exception:
+            pass
+        sys.exit(2)
+
+    # Write holder metadata for debugging
+    try:
+        fh.seek(0)
+        fh.truncate()
+        meta = {"pid": os.getpid(), "ts": time.time(), "cursor": str(cursor_path)}
+        fh.write(json.dumps(meta, ensure_ascii=False))
+        fh.flush()
+    except Exception:
+        pass
+
+    return fh
+
+_SINGLE_INSTANCE_LOCK_FH = _acquire_single_instance_lock(str(CURSOR_FILE))
+
 
 LATENCY_LOG_PATH: Path = ROOT / "state" / "latency_exec.jsonl"
 LATENCY_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
@@ -113,12 +244,29 @@ except Exception:
 
 SUSPECT_LOCK_PATH: Path = ROOT / "state" / "execution_suspect.lock"
 
-# ✅ Decisions store (for enforcer + joiner)
-DECISIONS_PATH: Path = ROOT / "state" / "ai_decisions.jsonl"
+# Decisions store (for enforcer + joiner)
+# EXECUTOR_LANE_DECISIONS_PATCH_v1
+_DECISIONS_ENV = os.getenv("AI_DECISIONS_PATH", "").strip()
+
+# Lane-safe decisions path:
+# - MAIN may use legacy global state/ai_decisions.jsonl
+# - SUB accounts must never silently fall back to global.
+_account_label = (os.getenv("ACCOUNT_LABEL") or os.getenv("ACCOUNT_SLUG") or os.getenv("FLASHBACK_LABEL") or "").strip().lower()
+_is_main = (_account_label == "" or _account_label == "main")
+
+if _DECISIONS_ENV:
+    DECISIONS_PATH: Path = Path(_DECISIONS_ENV)
+else:
+    if _is_main:
+        DECISIONS_PATH = (ROOT / "state" / "ai_decisions.jsonl")
+    else:
+        DECISIONS_PATH = (ROOT / "state" / f"ai_decisions_{_account_label}.jsonl")
+
+DECISIONS_PATH.parent.mkdir(parents=True, exist_ok=True)
 DECISIONS_PATH.parent.mkdir(parents=True, exist_ok=True)
 
 # ---------------------------------------------------------------------------
-# ✅ Hardened decision logger import (lock + tail-dedupe)
+# Hardened decision logger import (lock + tail-dedupe)
 # ---------------------------------------------------------------------------
 try:
     from app.core.ai_decision_logger import append_decision as _append_decision_hardened  # type: ignore
@@ -127,18 +275,404 @@ except Exception:
 
 
 # ---------------------------------------------------------------------------
+# Event dedupe + lifecycle (Upgrades 2 + 3 + 4)
+# ---------------------------------------------------------------------------
+
+EXEC_DEDUPE_MAX_KEYS: int = int(os.getenv("EXEC_DEDUPE_MAX_KEYS", "5000").strip() or "5000")
+EXEC_DEDUPE_TTL_SEC: float = float(os.getenv("EXEC_DEDUPE_TTL_SEC", "120").strip() or "120")
+EXEC_FAIL_FAST_DRY: bool = os.getenv("EXEC_FAIL_FAST_DRY", "true").strip().lower() in ("1", "true", "yes", "y", "on")
+
+
+class _LRUDedupe:
+    """
+    Cheap in-process dedupe guard:
+    - bounded by max_keys
+    - TTL based eviction on access
+    """
+    def __init__(self, max_keys: int, ttl_sec: float):
+        self.max_keys = max(100, int(max_keys))
+        self.ttl_sec = max(5.0, float(ttl_sec))
+        self._store: Dict[str, float] = {}
+
+    def _evict_if_needed(self) -> None:
+        if len(self._store) <= self.max_keys:
+            return
+        # Evict oldest by timestamp (O(n) but bounded, and only on overflow)
+        items = sorted(self._store.items(), key=lambda kv: kv[1])
+        over = len(items) - self.max_keys
+        for i in range(max(0, over)):
+            k, _ = items[i]
+            self._store.pop(k, None)
+
+    def seen_recently(self, key: str) -> bool:
+        now = time.time()
+        ts = self._store.get(key)
+        if ts is not None:
+            if (now - ts) <= self.ttl_sec:
+                return True
+        self._store[key] = now
+        self._evict_if_needed()
+        return False
+
+
+_DEDUPE = _LRUDedupe(EXEC_DEDUPE_MAX_KEYS, EXEC_DEDUPE_TTL_SEC)
+
+
+def _now_ms() -> int:
+    return int(time.time() * 1000)
+
+
+def _exc_fingerprint(e: BaseException) -> str:
+    try:
+        s = f"{type(e).__name__}:{str(e)}"
+        return hashlib.sha1(s.encode("utf-8", errors="ignore")).hexdigest()[:16]
+    except Exception:
+        return "exc_hash_failed"
+
+
+def _safe_stack(e: BaseException, limit: int = 12) -> str:
+    try:
+        tb = traceback.format_exception(type(e), e, e.__traceback__)
+        # keep it bounded, no one needs a novel in JSONL
+        s = "".join(tb[-limit:])
+        if len(s) > 4000:
+            s = s[-4000:]
+        return s
+    except Exception:
+        return ""
+
+
+def _is_live_like(trade_mode: str) -> bool:
+    m = str(trade_mode or "").upper().strip()
+    return m in ("LIVE_CANARY", "LIVE_FULL")
+
+
+def _mk_dedupe_key(event_type: str, trade_id: str, stage: str, account_label: str, symbol: str) -> str:
+    base = f"{event_type}|{trade_id}|{stage}|{account_label}|{symbol}"
+    return hashlib.sha1(base.encode("utf-8", errors="ignore")).hexdigest()
+
+
+# Minimal schema requirements (Upgrade #4)
+_SCHEMA_REQ: Dict[str, List[str]] = {
+    "ai_decision": [
+        "ts_ms", "event_type", "trade_id", "client_trade_id", "symbol", "account_label",
+        "strategy_id", "strategy_name", "timeframe", "side", "mode", "allow", "decision_code", "reason"
+    ],
+    "setup_context": [
+        # build_setup_context likely includes schema_version internally, but we enforce core join keys
+        "trade_id", "symbol", "account_label", "strategy", "setup_type", "timeframe"
+    ],
+    "executor_error": ["ts_ms", "event_type", "stage", "trade_id", "account_label", "symbol", "mode", "error_code", "error_hash"],
+    "executor_lifecycle": ["ts_ms", "event_type", "trade_id", "account_label", "symbol", "mode", "transition", "stage"],
+}
+
+
+def _validate_event(event_type: str, payload: Dict[str, Any]) -> Tuple[bool, List[str]]:
+    errs: List[str] = []
+    req = _SCHEMA_REQ.get(event_type, [])
+    for k in req:
+        if k not in payload or payload.get(k) in ("", None):
+            errs.append(f"missing:{k}")
+    # basic type-ish checks for the big ones
+    if event_type == "ai_decision":
+        if payload.get("event_type") != "ai_decision":
+            errs.append("bad:event_type")
+        if not isinstance(payload.get("allow"), bool):
+            errs.append("bad:allow_not_bool")
+        try:
+            int(payload.get("ts_ms"))
+        except Exception:
+            errs.append("bad:ts_ms_not_int")
+    return (len(errs) == 0), errs
+
+
+def _emit_executor_error(
+    *,
+    stage: str,
+    trade_id: str,
+    account_label: str,
+    symbol: str,
+    mode: str,
+    error_code: str,
+    reason: str,
+    exc: Optional[BaseException],
+    extra: Optional[Dict[str, Any]] = None,
+    bound_log=None,
+) -> None:
+    """
+    IMPORTANT:
+    This function MUST NEVER recursively call itself via schema/publish failure.
+    We guard that with _EMITTING_EXECUTOR_ERROR and special-case schema failures.
+    """
+    global _EMITTING_EXECUTOR_ERROR
+
+    if _EMITTING_EXECUTOR_ERROR:
+        # Absolute last line of defense: do not recurse, just log and bail.
+        try:
+            (bound_log or log).warning(
+                "executor_error recursion guard tripped; dropping nested error. stage=%s code=%s trade_id=%s reason=%s",
+                stage, error_code, trade_id, reason
+            )
+        except Exception:
+            pass
+        return
+
+    _EMITTING_EXECUTOR_ERROR = True
+    try:
+        err_hash = _exc_fingerprint(exc) if exc is not None else hashlib.sha1(str(reason).encode("utf-8", errors="ignore")).hexdigest()[:16]
+        payload: Dict[str, Any] = {
+            "ts_ms": _now_ms(),
+            "event_type": "executor_error",
+            "stage": str(stage),
+            "trade_id": str(trade_id or ""),
+            "account_label": str(account_label or ""),
+            "symbol": str(symbol or ""),
+            "mode": str(mode or ""),
+            "error_code": str(error_code),
+            "reason": str(reason or ""),
+            "error_hash": str(err_hash),
+        }
+        if exc is not None:
+            payload["exc_type"] = type(exc).__name__
+            payload["stack"] = _safe_stack(exc)
+        if extra:
+            payload["extra"] = extra
+
+        # also log locally
+        try:
+            if bound_log:
+                bound_log.warning(
+                    "executor_error stage=%s code=%s trade_id=%s reason=%s hash=%s",
+                    stage, error_code, trade_id, reason, err_hash
+                )
+            else:
+                log.warning(
+                    "executor_error stage=%s code=%s trade_id=%s reason=%s hash=%s",
+                    stage, error_code, trade_id, reason, err_hash
+                )
+        except Exception:
+            pass
+
+        # Try to publish. BUT: if publishing fails, do NOT recurse.
+        try:
+            publish_ai_event(payload)
+        except Exception as e_pub:
+            try:
+                (bound_log or log).warning(
+                    "executor_error publish failed (suppressed recursion): %r", e_pub
+                )
+            except Exception:
+                pass
+
+        # Telegram only for live-like modes (don’t spam DRY/PAPER)
+        try:
+            if _is_live_like(mode):
+                tg_send(f"EXECUTOR_ERROR [{mode}] {symbol} trade_id={trade_id} stage={stage} code={error_code} hash={err_hash}")
+        except Exception:
+            pass
+
+    finally:
+        _EMITTING_EXECUTOR_ERROR = False
+
+
+def _publish_ai_event_safe(
+    event: Dict[str, Any],
+    *,
+    event_type_for_validation: Optional[str] = None,
+    stage: str = "unknown",
+    trade_id: str = "",
+    account_label: str = "",
+    symbol: str = "",
+    mode: str = "",
+    bound_log=None,
+) -> bool:
+    """
+    publish_ai_event wrapper:
+    - dedupe
+    - schema validate (optional)
+    - emits executor_error if publish fails
+    """
+    et = event_type_for_validation
+    if et:
+        ok, errs = _validate_event(et, event)
+        if not ok:
+            # CRITICAL: never recurse on executor_error schema invalid
+            if et == "executor_error":
+                try:
+                    (bound_log or log).warning(
+                        "executor_error schema_invalid (suppressed recursion): stage=%s trade_id=%s errs=%s",
+                        stage, trade_id, errs
+                    )
+                except Exception:
+                    pass
+                return False
+
+            _emit_executor_error(
+                stage=f"{stage}:schema_invalid:{et}",
+                trade_id=trade_id,
+                account_label=account_label,
+                symbol=symbol,
+                mode=mode,
+                error_code="SCHEMA_INVALID",
+                reason=";".join(errs),
+                exc=None,
+                extra={"bad_event_type": et},
+                bound_log=bound_log,
+            )
+            # fail-fast in DRY/PAPER because poisoning logs is worse than stopping
+            if EXEC_FAIL_FAST_DRY and (mode == "PAPER" or str(mode).upper().startswith("PAPER")):
+                return False
+            # in LIVE, just skip the publish
+            return False
+
+    dedupe_key = _mk_dedupe_key(event.get("event_type", et or "ai_event"), str(trade_id), stage, str(account_label), str(symbol))
+    if _DEDUPE.seen_recently(dedupe_key):
+        # suppressed duplicate
+        try:
+            if bound_log:
+                bound_log.debug("dedupe suppressed publish: stage=%s trade_id=%s", stage, trade_id)
+        except Exception:
+            pass
+        return False
+
+    try:
+        publish_ai_event(event)
+        return True
+    except Exception as e:
+        # IMPORTANT: do not recurse if failing to publish an executor_error
+        if (event.get("event_type") == "executor_error") or (et == "executor_error"):
+            try:
+                (bound_log or log).warning("publish executor_error failed (suppressed recursion): %r", e)
+            except Exception:
+                pass
+            return False
+
+        _emit_executor_error(
+            stage=f"{stage}:publish_failed",
+            trade_id=trade_id,
+            account_label=account_label,
+            symbol=symbol,
+            mode=mode,
+            error_code="PUBLISH_FAILED",
+            reason=str(e),
+            exc=e,
+            extra={"event_type": event.get("event_type"), "validated_as": et},
+            bound_log=bound_log,
+        )
+        return False
+
+
+# Lifecycle contract (Upgrade #2)
+_ALLOWED_NEXT: Dict[str, List[str]] = {
+    "INIT": ["SIGNAL_PARSED"],
+    "SIGNAL_PARSED": ["LABEL_NORMED", "DROPPED"],
+    "LABEL_NORMED": ["TRADE_ID_ASSIGNED", "DROPPED"],
+    "TRADE_ID_ASSIGNED": ["PILOT_EMITTED", "DECISION_ENFORCED", "DROPPED"],
+    "PILOT_EMITTED": ["DECISION_ENFORCED", "DROPPED"],
+    "DECISION_ENFORCED": ["SNAPSHOT_OK", "SNAPSHOT_BLOCK", "DROPPED"],
+    "SNAPSHOT_OK": ["GATES_OK", "DROPPED"],
+    "GATES_OK": ["PRE_ENTRY", "DROPPED"],
+    "PRE_ENTRY": ["ENTRY_SENT", "PAPER_OPENED", "DROPPED"],
+    "ENTRY_SENT": ["ENTRY_ACK", "DROPPED"],
+    "ENTRY_ACK": ["SETUP_EMITTED", "DROPPED"],
+    "SETUP_EMITTED": ["DONE", "DROPPED"],
+    "PAPER_OPENED": ["SETUP_EMITTED", "DONE", "DROPPED"],
+}
+
+_LIFECYCLE: Dict[str, str] = {}  # trade_id -> stage
+
+
+def _lifecycle_stage(trade_id: str) -> str:
+    return _LIFECYCLE.get(trade_id, "INIT")
+
+
+def _emit_lifecycle(
+    *,
+    trade_id: str,
+    account_label: str,
+    symbol: str,
+    mode: str,
+    stage: str,
+    transition: str,
+    extra: Optional[Dict[str, Any]] = None,
+    bound_log=None,
+) -> None:
+    ev: Dict[str, Any] = {
+        "ts_ms": _now_ms(),
+        "event_type": "executor_lifecycle",
+        "trade_id": str(trade_id),
+        "account_label": str(account_label),
+        "symbol": str(symbol),
+        "mode": str(mode),
+        "stage": str(stage),
+        "transition": str(transition),
+    }
+    if extra:
+        ev["extra"] = extra
+    _publish_ai_event_safe(
+        ev,
+        event_type_for_validation="executor_lifecycle",
+        stage=f"lifecycle:{stage}",
+        trade_id=trade_id,
+        account_label=account_label,
+        symbol=symbol,
+        mode=mode,
+        bound_log=bound_log,
+    )
+
+
+def _advance_lifecycle(
+    *,
+    trade_id: str,
+    account_label: str,
+    symbol: str,
+    mode: str,
+    next_stage: str,
+    bound_log=None,
+    extra: Optional[Dict[str, Any]] = None,
+) -> bool:
+    cur = _lifecycle_stage(trade_id)
+    allowed = _ALLOWED_NEXT.get(cur, [])
+    if next_stage not in allowed:
+        _emit_executor_error(
+            stage="lifecycle_invalid_transition",
+            trade_id=trade_id,
+            account_label=account_label,
+            symbol=symbol,
+            mode=mode,
+            error_code="LIFECYCLE_BAD_TRANSITION",
+            reason=f"{cur} -> {next_stage} not allowed",
+            exc=None,
+            extra={"cur": cur, "next": next_stage, "allowed": allowed},
+            bound_log=bound_log,
+        )
+        return False
+    _LIFECYCLE[trade_id] = next_stage
+    _emit_lifecycle(
+        trade_id=trade_id,
+        account_label=account_label,
+        symbol=symbol,
+        mode=mode,
+        stage=next_stage,
+        transition=f"{cur}->{next_stage}",
+        extra=extra,
+        bound_log=bound_log,
+    )
+    return True
+
+
+# ---------------------------------------------------------------------------
 # Phase 5 label normalization + enforcement (2025-12-20a)
 # ---------------------------------------------------------------------------
 
 _CANON_TF = {
     "1m", "3m", "5m", "15m", "30m",
-    '60m',
+    "60m",
     "1h", "2h", "4h",
     "1d",
 }
 
 _SETUP_TYPE_ALIASES: Dict[str, str] = {
-
     # --- added by patch_extend_setup_type_aliases_v1 ---
     "mm_spread_capture": "scalp",
     "spread_capture": "scalp",
@@ -174,6 +708,7 @@ _SETUP_TYPE_ALIASES: Dict[str, str] = {
 
     "breakout_pullback": "breakout_pullback",
     "breakout-pullback": "breakout_pullback",
+
     # --- added by patch_extend_setup_type_normalizer_v2 ---
     "ma_long_mm_spread_capture": "scalp",
     "ma_short_mm_spread_capture": "scalp",
@@ -181,6 +716,7 @@ _SETUP_TYPE_ALIASES: Dict[str, str] = {
     "ma_short_swing_reversion_extreme": "mean_reversion",
     # --- end patch_extend_setup_type_normalizer_v2 ---
 }
+
 
 def _clean_token(x: Any) -> str:
     try:
@@ -192,12 +728,16 @@ def _clean_token(x: Any) -> str:
         s = s.replace("__", "_")
     return s.strip("_")
 
+
 def _normalize_timeframe(raw: Any) -> Tuple[str, str]:
     s = _clean_token(raw)
     if not s:
         return "unknown", "empty"
 
     if s in _CANON_TF:
+        # canonicalize 60m -> 1h
+        if s == "60m":
+            return "1h", "canonical_60m_to_1h"
         return s, "canonical"
 
     s = s.replace("mins", "m").replace("min", "m")
@@ -212,15 +752,17 @@ def _normalize_timeframe(raw: Any) -> Tuple[str, str]:
             return "unknown", f"bad_suffix_number:{s}"
         if n <= 0:
             return "unknown", f"nonpositive:{s}"
+
         if s[-1] == "m":
             tf = f"{n}m"
-        if tf == "60m":
-            tf = "1h"  # canonicalize 60m -> 1h
+            if tf == "60m":
+                tf = "1h"
         elif s[-1] == "h":
             tf = f"{n}h"
         else:
             tf = f"{n}d"
-        if tf in _CANON_TF:
+
+        if tf in _CANON_TF or tf == "1h":
             return tf, "suffix_norm"
         return "unknown", f"unsupported_tf:{tf}"
 
@@ -239,6 +781,8 @@ def _normalize_timeframe(raw: Any) -> Tuple[str, str]:
         else:
             tf = f"{mins}m"
         if tf in _CANON_TF:
+            if tf == "60m":
+                tf = "1h"
             return tf, "seconds_norm"
         return "unknown", f"unsupported_tf:{tf}"
 
@@ -250,11 +794,14 @@ def _normalize_timeframe(raw: Any) -> Tuple[str, str]:
             tf = f"{n // 60}h"
         else:
             tf = f"{n}m"
-        if tf in _CANON_TF:
+        if tf == "60m":
+            tf = "1h"
+        if tf in _CANON_TF or tf == "1h":
             return tf, "numeric_norm"
         return "unknown", f"unsupported_tf:{tf}"
     except Exception:
         return "unknown", f"unparsed:{s}"
+
 
 def _normalize_setup_type(raw: Any) -> Tuple[str, str]:
     """
@@ -265,20 +812,23 @@ def _normalize_setup_type(raw: Any) -> Tuple[str, str]:
       (setup_type_family, reason)
     """
     s0 = _clean_token(raw)
-    s = str(raw or '').lower()
+    s = str(raw or "").lower()
     if not s0:
         return "unknown", "empty"
 
-    # Heuristics for verbose setup strings produced by Signal Engine
-    # NOTE: _clean_token normalizes ':' -> '_' so substring checks work.
+    # rich-label substring heuristics (keep these FIRST)
     if "trend_pullback" in s0:
         return "pullback", "substring:trend_pullback"
 
-    if "scalp" in s0 or "liquidity_sweep" in s0:
-        return "scalp", "substring:scalp_or_liquidity_sweep"
+    if "liquidity_sweep" in s0:
+        return "scalp", "substring:liquidity_sweep"
+
+    if "scalp" in s0:
+        return "scalp", "substring:scalp"
 
     if "pump_chase" in s0 or "momo" in s0 or "momentum" in s0:
-        return "momentum", "substring:pump_chase_momo"
+        # canonical family is breakout in this codebase (see aliases)
+        return "breakout", "substring:pump_chase_momo"
 
     if "range_fade" in s0 or "intraday_range_fade" in s0:
         return "range_fade", "substring:range_fade"
@@ -292,35 +842,26 @@ def _normalize_setup_type(raw: Any) -> Tuple[str, str]:
     if "breakout" in s0:
         return "breakout", "substring:breakout"
 
-    # --- added by patch_extend_setup_type_normalizer_v2 ---
-    if "mm_spread_capture" in s or "spread_capture" in s:
-        return "market_make", "substring:mm_spread_capture"
-
-    # swing reversion extreme is a mean-reversion family setup
-    if "swing_reversion_extreme" in s or "reversion_extreme" in s or "swing_reversion" in s:
-        return "mean_reversion", "substring:swing_reversion_extreme"
-    # --- end patch_extend_setup_type_normalizer_v2 ---
-
-    if "mm_spread_capture" in s:
-        return "market_make", "substring:mm_spread_capture"
-    if "reversion" in s:
-        return "mean_reversion", "substring:reversion"
-    # Exact aliases
+    # alias-based normalization (supports both exact and prefix)
     if s0 in _SETUP_TYPE_ALIASES:
         return _SETUP_TYPE_ALIASES[s0], "alias"
 
-    # Prefix fallback (covers 'ma_long_breakout_*' etc)
     for k, v in _SETUP_TYPE_ALIASES.items():
         if s0.startswith(k):
             return v, "prefix"
 
+    # more substring fallbacks (kept last to avoid false positives)
+    if "mm_spread_capture" in s or "spread_capture" in s:
+        return "scalp", "substring:mm_spread_capture"
+
+    if "swing_reversion_extreme" in s or "reversion_extreme" in s or "swing_reversion" in s:
+        return "mean_reversion", "substring:swing_reversion_extreme"
+
+    if "reversion" in s:
+        return "mean_reversion", "substring:reversion"
+
     return "unknown", "unrecognized"
 
-
-
-def _is_live_like(trade_mode: str) -> bool:
-    m = str(trade_mode or "").upper().strip()
-    return m in ("LIVE_CANARY", "LIVE_FULL")
 
 def _env_int(name: str, default: str) -> int:
     try:
@@ -328,15 +869,18 @@ def _env_int(name: str, default: str) -> int:
     except Exception:
         return int(default)
 
+
 def _env_float(name: str, default: str) -> float:
     try:
         return float(os.getenv(name, default).strip())
     except Exception:
         return float(default)
 
+
 def _env_bool(name: str, default: str = "true") -> bool:
     raw = os.getenv(name, default)
     return str(raw).strip().lower() in ("1", "true", "yes", "y", "on")
+
 
 EXEC_CURSOR_SELF_HEAL: bool = _env_bool("EXEC_CURSOR_SELF_HEAL", "true")
 EXEC_IDLE_HEARTBEAT_SEC: float = _env_float("EXEC_IDLE_HEARTBEAT_SEC", "10")
@@ -351,6 +895,7 @@ EXEC_CURSOR_BADLINE_RESET: bool = _env_bool("EXEC_CURSOR_BADLINE_RESET", "true")
 _TRADE_CLIENTS: Dict[str, Bybit] = {}
 _PAPER_BROKER_CACHE: Dict[str, PaperBroker] = {}
 
+
 def get_trade_client(sub_uid: Optional[str]) -> Bybit:
     key = str(sub_uid) if sub_uid else "main"
     client = _TRADE_CLIENTS.get(key)
@@ -360,6 +905,7 @@ def get_trade_client(sub_uid: Optional[str]) -> Bybit:
     _TRADE_CLIENTS[key] = client
     return client
 
+
 def get_paper_broker(account_label: str, starting_equity: float) -> PaperBroker:
     broker = _PAPER_BROKER_CACHE.get(account_label)
     if broker is not None:
@@ -367,6 +913,7 @@ def get_paper_broker(account_label: str, starting_equity: float) -> PaperBroker:
     broker = PaperBroker.load_or_create(account_label=account_label, starting_equity=starting_equity)
     _PAPER_BROKER_CACHE[account_label] = broker
     return broker
+
 
 def _paper_equity_usd(account_label: str, fallback: float = 1000.0) -> float:
     try:
@@ -384,7 +931,26 @@ def _paper_equity_usd(account_label: str, fallback: float = 1000.0) -> float:
         return float(fallback)
 
 
-# ---------- CURSOR HELPERS ---------- #
+# ---------------------------------------------------------------------------
+# LIVE equity helper (sub-aware, fail-soft)
+# ---------------------------------------------------------------------------
+
+def _live_equity_usdt_for_sub(sub_uid: str) -> float:
+    """
+    Fetch equity for the *actual* subaccount in LIVE paths if supported.
+    Falls back safely to global get_equity_usdt() if legacy signature.
+    """
+    try:
+        return float(get_equity_usdt(sub_uid=sub_uid or None))  # type: ignore[call-arg]
+    except TypeError:
+        return float(get_equity_usdt())
+    except Exception:
+        return float(get_equity_usdt())
+
+
+# ---------------------------------------------------------------------------
+# CURSOR HELPERS
+# ---------------------------------------------------------------------------
 
 def load_cursor() -> int:
     if not CURSOR_FILE.exists():
@@ -394,14 +960,14 @@ def load_cursor() -> int:
     except Exception:
         return 0
 
+
 def save_cursor(pos: int) -> None:
     try:
         CURSOR_FILE.write_text(str(pos))
-    except Exception as e:
-        pass  # auto-fix: empty except block
-    except Exception as e:
+    except Exception:
+        # fail-soft: cursor write should never crash executor
+        pass
 
-        pass  # auto-fix: empty except block
 
 def _cursor_heal_to_line_boundary(pos: int) -> int:
     try:
@@ -414,13 +980,10 @@ def _cursor_heal_to_line_boundary(pos: int) -> int:
 
         if pos < 0:
             pos = 0
-
         if pos == size:
             return pos
-
         if pos > size:
             return 0
-
         if pos == 0:
             return 0
 
@@ -469,9 +1032,18 @@ def _cursor_heal_to_line_boundary(pos: int) -> int:
         return 0
 
 
-# ---------- LATENCY HELPERS ---------- #
+# ---------------------------------------------------------------------------
+# LATENCY HELPERS
+# ---------------------------------------------------------------------------
 
-def record_latency(event: str, symbol: str, strat: str, mode: str, duration_ms: int, extra: Optional[Dict[str, Any]] = None) -> None:
+def record_latency(
+    event: str,
+    symbol: str,
+    strat: str,
+    mode: str,
+    duration_ms: int,
+    extra: Optional[Dict[str, Any]] = None
+) -> None:
     row: Dict[str, Any] = {
         "ts_ms": int(time.time() * 1000),
         "event": event,
@@ -485,16 +1057,8 @@ def record_latency(event: str, symbol: str, strat: str, mode: str, duration_ms: 
     try:
         with LATENCY_LOG_PATH.open("ab") as f:
             f.write(json.dumps(row).encode("utf-8") + b"\n")
-    except Exception as e:
-        pass  # auto-fix: empty except block
-    except Exception as e:
-
-
-# ---------------------------------------------------------------------------
-# Raw JSONL append helper (fallback only)
-# ---------------------------------------------------------------------------
-
-        pass  # auto-fix: empty except block
+    except Exception:
+        pass
 
 
 # ---------------------------------------------------------------------------
@@ -505,23 +1069,28 @@ def _append_jsonl(path: Path, payload: Dict[str, Any]) -> None:
     try:
         with path.open("ab") as f:
             f.write(json.dumps(payload, ensure_ascii=False).encode("utf-8") + b"\n")
-    except Exception as e:
-        pass  # auto-fix: empty except block
-    except Exception as e:
+    except Exception:
+        pass
 
 
 # ---------------------------------------------------------------------------
-# ✅ Decision-store append wrapper (prefer hardened logger)
-# ---------------------------------------------------------------------------
-
-        pass  # auto-fix: empty except block
-
-
-# ---------------------------------------------------------------------------
-# ✅ Decision-store append wrapper (prefer hardened logger)
+# Decision-store append wrapper (prefer hardened logger)
+# + Upgrade #3 dedupe guard on append side too
 # ---------------------------------------------------------------------------
 
 def _append_decision(payload: Dict[str, Any]) -> None:
+    # dedupe by event_type + trade_id + decision_code if available
+    try:
+        et = str(payload.get("event_type") or payload.get("decision") or "decision")
+        tid = str(payload.get("trade_id") or "")
+        code = str(payload.get("decision_code") or payload.get("decision") or "")
+        stage = str(payload.get("extra", {}).get("stage") if isinstance(payload.get("extra"), dict) else "") or "append"
+        k = _mk_dedupe_key(f"decision:{et}:{code}", tid, stage, str(payload.get("account_label") or ""), str(payload.get("symbol") or ""))
+        if _DEDUPE.seen_recently(k):
+            return
+    except Exception:
+        pass
+
     if _append_decision_hardened is not None:
         try:
             _append_decision_hardened(payload)  # type: ignore[arg-type]
@@ -530,21 +1099,16 @@ def _append_decision(payload: Dict[str, Any]) -> None:
             try:
                 _append_decision_hardened(payload, path=DECISIONS_PATH)  # type: ignore[arg-type]
                 return
-            except Exception as e:
-                pass  # auto-fix: empty except block
-            except Exception as e:
-                pass  # auto-fix: empty except block
-        except Exception as e:
-            pass  # auto-fix: empty except block
-        except Exception as e:
-
-            pass  # auto-fix: empty except block
+            except Exception:
+                pass
+        except Exception:
+            pass
 
     _append_jsonl(DECISIONS_PATH, payload)
 
 
 # ---------------------------------------------------------------------------
-# ✅ Trade-ID namespacing helpers (2025-12-14a)
+# Trade-ID namespacing helpers (2025-12-14a)
 # ---------------------------------------------------------------------------
 
 def _safe_str(x: Any) -> str:
@@ -552,6 +1116,7 @@ def _safe_str(x: Any) -> str:
         return str(x) if x is not None else ""
     except Exception:
         return ""
+
 
 def _make_effective_trade_id(source_trade_id: str, account_label: str, sub_uid: str, strategy_id: str) -> str:
     src = _safe_str(source_trade_id).strip() or "NO_SRC"
@@ -571,22 +1136,20 @@ def _make_effective_trade_id(source_trade_id: str, account_label: str, sub_uid: 
 
 
 # ---------------------------------------------------------------------------
-# ✅ Pilot decision emission (INPUT row that enforcer consumes)
+# Pilot decision emission (INPUT row that enforcer consumes)
 # ---------------------------------------------------------------------------
 
 def emit_pilot_input_decision(setup_event: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     if pilot_decide is None:
         return None
 
-    try:
-        raw = pilot_decide(setup_event)
-    except Exception as e:
-        pass  # auto-fix: empty except block
-    except Exception as e:
-        raw = None
-
     if not isinstance(setup_event, dict):
         return None
+
+    try:
+        raw = pilot_decide(setup_event)
+    except Exception:
+        raw = None
 
     trade_id = str(setup_event.get("trade_id") or "").strip()
     if not trade_id:
@@ -640,7 +1203,7 @@ def emit_pilot_input_decision(setup_event: Dict[str, Any]) -> Optional[Dict[str,
         "source_trade_id": source_trade_id,
         "symbol": symbol,
         "account_label": account_label,
-        "timeframe": str(tf),
+        "timeframe": timeframe,
         "decision": decision,
         "allow": bool(allow),
         "size_multiplier": float(sm_f),
@@ -653,7 +1216,7 @@ def emit_pilot_input_decision(setup_event: Dict[str, Any]) -> Optional[Dict[str,
 
 
 # ---------------------------------------------------------------------------
-# ✅ Pilot enforced decision emission (the thing you were missing/breaking)
+# Pilot enforced decision emission
 # ---------------------------------------------------------------------------
 
 def emit_pilot_enforced_decision(
@@ -709,7 +1272,7 @@ def emit_pilot_enforced_decision(
             "source_trade_id": source_trade_id,
             "symbol": symbol,
             "account_label": account_label,
-            "timeframe": str(tf),
+            "timeframe": timeframe,
             "decision": code,
             "allow": bool(allow),
             "size_multiplier": float(sm_f),
@@ -723,9 +1286,7 @@ def emit_pilot_enforced_decision(
 
         _append_decision(row)
         return row
-    except Exception as e:
-        pass  # auto-fix: empty except block
-    except Exception as e:
+    except Exception:
         return None
 
 
@@ -758,7 +1319,7 @@ def emit_ai_decision(
     extra: Optional[Dict[str, Any]] = None,
 ) -> None:
     row: Dict[str, Any] = {
-        "ts_ms": int(time.time() * 1000),
+        "ts_ms": _now_ms(),
         "event_type": "ai_decision",
         "trade_id": str(trade_id),
         "client_trade_id": str(client_trade_id),
@@ -787,15 +1348,36 @@ def emit_ai_decision(
     }
     if extra:
         row["extra"] = extra
+
+    ok, errs = _validate_event("ai_decision", row)
+    if not ok:
+        _emit_executor_error(
+            stage="emit_ai_decision:schema_invalid",
+            trade_id=str(trade_id),
+            account_label=str(account_label),
+            symbol=str(symbol),
+            mode=str(mode),
+            error_code="SCHEMA_INVALID",
+            reason=";".join(errs),
+            exc=None,
+            extra={"decision_code": decision_code},
+            bound_log=None,
+        )
+        # fail-fast on DRY/PAPER
+        if EXEC_FAIL_FAST_DRY and str(mode).upper() == "PAPER":
+            return
+
     _append_decision(row)
 
 
-# ---------- AI GATE WRAPPER ---------- #
+# ---------------------------------------------------------------------------
+# AI GATE WRAPPER
+# ---------------------------------------------------------------------------
 
-# Cache policy in-memory to avoid re-reading file for every signal
 _POLICY_CACHE: Optional[Dict[str, Any]] = None
 _POLICY_CACHE_TS: float = 0.0
-_POLICY_CACHE_TTL_SEC: float = 5.0  # light refresh so Telegram/UI edits apply quickly
+_POLICY_CACHE_TTL_SEC: float = 5.0
+
 
 def _get_policy_cached() -> Dict[str, Any]:
     global _POLICY_CACHE, _POLICY_CACHE_TS
@@ -806,18 +1388,23 @@ def _get_policy_cached() -> Dict[str, Any]:
     return _POLICY_CACHE
 
 
-def run_ai_gate(signal: Dict[str, Any], strat_id: str, bound_log, *, account_label: str, mode: str, trade_id: str, symbol: str) -> Dict[str, Any]:
+def run_ai_gate(
+    signal: Dict[str, Any],
+    strat_id: str,
+    bound_log,
+    *,
+    account_label: str,
+    mode: str,
+    trade_id: str,
+    symbol: str
+) -> Dict[str, Any]:
     """
     Canonical AI gate path:
       1) classifier produces score/features + optional hard allow/block
       2) ai_executor_gate enforces policy thresholds + logs decision
     """
-    decision: Dict[str, Any] = {"allow": True, "score": None, "reason": "default_allow_fallback", "features": {}}
-
     try:
         clf = classify_trade(signal, strat_id)
-    except Exception as e:
-        pass  # auto-fix: empty except block
     except Exception as e:
         clf = {"allow": True, "score": None, "reason": f"classifier_error:{e}", "features": {}}
 
@@ -840,7 +1427,6 @@ def run_ai_gate(signal: Dict[str, Any], strat_id: str, bound_log, *, account_lab
     policy = _get_policy_cached()
     policy_cfg = resolve_policy_cfg_for_strategy(policy, strat_id)
 
-    # This logs to state/ai_policy_log.jsonl (canonical) and returns allow/block
     gate = ai_gate_decide(
         strategy_name=strat_id,
         symbol=str(symbol),
@@ -854,16 +1440,17 @@ def run_ai_gate(signal: Dict[str, Any], strat_id: str, bound_log, *, account_lab
         precheck_reason=pre_reason,
     )
 
-    decision = {
+    return {
         "allow": bool(gate.get("allow", True)),
         "score": gate.get("score", score_f),
         "reason": str(gate.get("reason") or "ok"),
         "features": features,
     }
-    return decision
 
 
-# ---------- SIGNAL PROCESSOR ---------- #
+# ---------------------------------------------------------------------------
+# SIGNAL PROCESSOR
+# ---------------------------------------------------------------------------
 
 def _normalize_strategies_for_signal(strategies: Any) -> Iterable[Tuple[str, Dict[str, Any]]]:
     if not strategies:
@@ -891,20 +1478,30 @@ def _normalize_strategies_for_signal(strategies: Any) -> Iterable[Tuple[str, Dic
 async def process_signal_line(line: str) -> None:
     try:
         sig = json.loads(line)
-    except Exception:
-        log.warning("Invalid JSON in observed.jsonl: %r", line[:200])
+    except Exception as e:
+        _emit_executor_error(
+            stage="process_signal_line:json_decode",
+            trade_id="",
+            account_label="",
+            symbol="",
+            mode="PAPER" if EXEC_DRY_RUN else "",
+            error_code="BAD_JSON",
+            reason=str(e),
+            exc=e,
+            extra={"line_head": line[:200]},
+            bound_log=None,
+        )
         return
 
-    # --- HARD FILTER: drop test/junk signals permanently ---
+    # HARD FILTER: drop test/junk signals permanently
     try:
-        src = sig.get('source')
-        if src == 'emit_test_signal':
+        src = sig.get("source")
+        if src == "emit_test_signal":
             return
-        st = sig.get('setup_type') or sig.get('setup_type_raw') or sig.get('reason')
-        if isinstance(st, str) and st.strip().lower() == 'tick':
+        st = sig.get("setup_type") or sig.get("setup_type_raw") or sig.get("reason")
+        if isinstance(st, str) and st.strip().lower() == "tick":
             return
     except Exception:
-        # never crash ingestion over filtering
         pass
 
     symbol = sig.get("symbol")
@@ -929,22 +1526,30 @@ async def process_signal_line(line: str) -> None:
         try:
             await handle_strategy_signal(strat_name, strat_cfg, sig)
         except Exception as e:
-            pass  # auto-fix: empty except block
-        except Exception as e:
+            _emit_executor_error(
+                stage="process_signal_line:handle_strategy_signal",
+                trade_id=str(sig.get("trade_id") or sig.get("client_trade_id") or ""),
+                account_label=str(strat_cfg.get("account_label") or strat_cfg.get("label") or "main"),
+                symbol=str(symbol),
+                mode=str(strat_cfg.get("automation_mode") or ""),
+                error_code="HANDLE_STRATEGY_EXCEPTION",
+                reason=str(e),
+                exc=e,
+                extra={"strategy": str(strat_name)},
+                bound_log=None,
+            )
 
 
-# ---------- STRATEGY PROCESSOR ---------- #
-
-            pass  # auto-fix: empty except block
-
-
-# ---------- STRATEGY PROCESSOR ---------- #
+# ---------------------------------------------------------------------------
+# STRATEGY PROCESSOR
+# ---------------------------------------------------------------------------
 
 def _automation_mode_from_cfg(cfg: Dict[str, Any]) -> str:
     mode = str(cfg.get("automation_mode", "OFF")).upper().strip()
     if mode not in ("OFF", "LEARN_DRY", "LIVE_CANARY", "LIVE_FULL"):
         mode = "OFF"
     return mode
+
 
 def _normalize_paper_side(signal_side: str) -> str:
     s = str(signal_side or "").strip().lower()
@@ -955,11 +1560,46 @@ def _normalize_paper_side(signal_side: str) -> str:
     raise ValueError(f"Unsupported side value for paper entry: {signal_side!r}")
 
 
-async def handle_strategy_signal(strat_name: str, strat_cfg: Dict[str, Any], sig: Dict[str, Any]) -> None:
-    strat_id = strategy_label(strat_cfg)
-    bound = bind_context(log, strat=strat_id)
+def _strategy_key(strat_name: str, strat_cfg: Dict[str, Any]) -> str:
+    """
+    IMPORTANT:
+    Use a stable strategy identifier for:
+      - get_risk_multiplier()
+      - policy resolution
+      - decision logs
 
-    enabled = bool(strat_cfg.get("enabled", False))
+    DO NOT use strategy_label() here because it returns "Name (sub X)" which is unstable/noisy.
+    """
+    for k in ("strategy_id", "id", "strategy_name", "name"):
+        v = strat_cfg.get(k)
+        if isinstance(v, str) and v.strip():
+            return v.strip()
+    if isinstance(strat_name, str) and strat_name.strip():
+        return strat_name.strip()
+    return "unknown_strategy"
+
+
+async def handle_strategy_signal(strat_name: str, strat_cfg: Dict[str, Any], sig: Dict[str, Any]) -> None:
+    # HARD GUARD: some call paths feed strat_cfg as a string/alias; never allow crash
+    if not isinstance(strat_cfg, dict):
+        try:
+            _emit_executor_error(
+                stage="handle_strategy_signal:bad_strat_cfg",
+                code="BAD_STRAT_CFG",
+                trade_id=str(sig.get("trade_id") or ""),
+                reason=f"strat_cfg_not_dict type={type(strat_cfg).__name__} value={str(strat_cfg)[:200]}",
+            )
+        except Exception:
+            pass
+        return
+
+    strat_key = _strategy_key(strat_name, strat_cfg)
+    strat_pretty = strategy_label(strat_cfg)  # fine for logs/telegram
+
+    bound = bind_context(log, strat=strat_key, label=str(strat_pretty))
+
+    # IMPORTANT: enabled defaults True (otherwise “missing key” silently disables everything)
+    enabled = bool(strat_cfg.get("enabled", True))
     mode_raw = _automation_mode_from_cfg(strat_cfg)
 
     if not enabled or mode_raw == "OFF":
@@ -1019,7 +1659,7 @@ async def handle_strategy_signal(strat_name: str, strat_cfg: Dict[str, Any], sig
         breaker_on = False
 
     is_training_mode = EXEC_DRY_RUN or mode_raw == "LEARN_DRY"
-    started_ms = int(time.time() * 1000)
+    started_ms = _now_ms()
 
     bound.info(
         "label_norm symbol=%s tf_raw=%r tf=%s(tf_reason=%s) setup_type_raw=%r setup_type=%s(st_reason=%s) mode=%s",
@@ -1031,16 +1671,23 @@ async def handle_strategy_signal(strat_name: str, strat_cfg: Dict[str, Any], sig
             bound.info("Session Guard blocking new trades (limits reached).")
             return
     except Exception as e:
-        pass  # auto-fix: empty except block
-    except Exception as e:
+        _emit_executor_error(
+            stage="session_guard_exception",
+            trade_id="",
+            account_label=account_label,
+            symbol=symbol,
+            mode=trade_mode,
+            error_code="SESSION_GUARD_EXCEPTION",
+            reason=str(e),
+            exc=e,
+            extra=None,
+            bound_log=bound,
+        )
 
-        pass  # auto-fix: empty except block
+    ts_open_ms = _now_ms()
+    strat_safe = strat_key.replace(" ", "_").replace("(", "").replace(")", "")
+    default_source_trade_id = f"{strat_safe}-{str(symbol).upper()}-{str(tf_norm)}-{ts_open_ms}"
 
-    ts_open_ms = int(time.time() * 1000)
-    strat_safe = strat_id.replace(" ", "_").replace("(", "").replace(")", "")
-    default_source_trade_id = f"{strat_safe}-{ts_open_ms}"
-
-    sig_trade_id_raw = ""
     try:
         sig_trade_id_raw = str(sig.get("trade_id") or sig.get("client_trade_id") or "").strip()
     except Exception:
@@ -1060,28 +1707,57 @@ async def handle_strategy_signal(strat_name: str, strat_cfg: Dict[str, Any], sig
         source_trade_id = default_source_trade_id
         trade_id_source = "generated"
 
-    client_trade_id = _make_effective_trade_id(source_trade_id, account_label=account_label, sub_uid=sub_uid, strategy_id=strat_id)
+    client_trade_id = _make_effective_trade_id(source_trade_id, account_label=account_label, sub_uid=sub_uid, strategy_id=strat_key)
     trade_id = client_trade_id
+
+    _advance_lifecycle(
+        trade_id=client_trade_id,
+        account_label=account_label,
+        symbol=symbol,
+        mode=trade_mode,
+        next_stage="SIGNAL_PARSED",
+        bound_log=bound,
+        extra={"trade_id_source": trade_id_source},
+    )
+    _advance_lifecycle(
+        trade_id=client_trade_id,
+        account_label=account_label,
+        symbol=symbol,
+        mode=trade_mode,
+        next_stage="LABEL_NORMED",
+        bound_log=bound,
+        extra={"tf_norm": tf_norm, "setup_type_norm": setup_type_norm},
+    )
+    _advance_lifecycle(
+        trade_id=client_trade_id,
+        account_label=account_label,
+        symbol=symbol,
+        mode=trade_mode,
+        next_stage="TRADE_ID_ASSIGNED",
+        bound_log=bound,
+        extra={"source_trade_id": source_trade_id, "trade_id_source": trade_id_source},
+    )
 
     bound.info(
         "trade_id_map source=%s -> effective=%s account=%s sub_uid=%s strat=%s",
-        source_trade_id, client_trade_id, account_label, (sub_uid or None), strat_id
+        source_trade_id, client_trade_id, account_label, (sub_uid or None), strat_key
     )
 
+    # label-gates (LIVE-like only)
     if _is_live_like(trade_mode):
         if setup_type_norm == "unknown":
             emit_ai_decision(
                 trade_id=client_trade_id,
                 client_trade_id=client_trade_id,
                 source_trade_id=source_trade_id,
-                symbol=symbol,
-                account_label=account_label,
-                sub_uid=sub_uid,
-                strategy_id=strat_id,
-                strategy_name=strat_cfg.get("name", strat_name),
-                timeframe=tf_norm,
+                symbol=str(symbol),
+                account_label=str(account_label),
+                sub_uid=str(sub_uid),
+                strategy_id=str(strat_key),
+                strategy_name=str(strat_cfg.get("name", strat_name)),
+                timeframe=str(tf_norm),
                 side=str(side),
-                mode=trade_mode,
+                mode=str(trade_mode),
                 allow=False,
                 decision_code="BAD_LABEL_SETUP_TYPE",
                 reason=f"setup_type_missing_or_unknown (raw={setup_type_raw!r} reason={st_reason})",
@@ -1098,11 +1774,12 @@ async def handle_strategy_signal(strat_name: str, strat_cfg: Dict[str, Any], sig
                     "trade_id_source": trade_id_source,
                 },
             )
-            bound.info("⛔ BAD_LABEL setup_type (LIVE/CANARY) trade_id=%s raw=%r reason=%s", client_trade_id, setup_type_raw, st_reason)
+            bound.info("BAD_LABEL setup_type (LIVE/CANARY) trade_id=%s raw=%r reason=%s", client_trade_id, setup_type_raw, st_reason)
             try:
-                tg_send(f"⛔ BAD_LABEL (setup_type) blocked LIVE/CANARY trade: trade_id={client_trade_id} symbol={symbol} strat={strat_id} raw={setup_type_raw!r} reason={st_reason}")
+                tg_send(f"BAD_LABEL (setup_type) blocked LIVE/CANARY: trade_id={client_trade_id} symbol={symbol} strat={strat_key} raw={setup_type_raw!r} reason={st_reason}")
             except Exception:
                 pass
+            _advance_lifecycle(trade_id=client_trade_id, account_label=account_label, symbol=symbol, mode=trade_mode, next_stage="DROPPED", bound_log=bound, extra={"why": "bad_label_setup_type"})
             return
 
         if tf_norm == "unknown":
@@ -1110,14 +1787,14 @@ async def handle_strategy_signal(strat_name: str, strat_cfg: Dict[str, Any], sig
                 trade_id=client_trade_id,
                 client_trade_id=client_trade_id,
                 source_trade_id=source_trade_id,
-                symbol=symbol,
-                account_label=account_label,
-                sub_uid=sub_uid,
-                strategy_id=strat_id,
-                strategy_name=strat_cfg.get("name", strat_name),
-                timeframe=tf_norm,
+                symbol=str(symbol),
+                account_label=str(account_label),
+                sub_uid=str(sub_uid),
+                strategy_id=str(strat_key),
+                strategy_name=str(strat_cfg.get("name", strat_name)),
+                timeframe=str(tf_norm),
                 side=str(side),
-                mode=trade_mode,
+                mode=str(trade_mode),
                 allow=False,
                 decision_code="BAD_LABEL_TIMEFRAME",
                 reason=f"timeframe_unknown (raw={tf!r} reason={tf_reason})",
@@ -1134,10 +1811,26 @@ async def handle_strategy_signal(strat_name: str, strat_cfg: Dict[str, Any], sig
                     "trade_id_source": trade_id_source,
                 },
             )
-            bound.info("⛔ BAD_LABEL timeframe (LIVE/CANARY) trade_id=%s raw=%r reason=%s", client_trade_id, tf, tf_reason)
+            bound.info("BAD_LABEL timeframe (LIVE/CANARY) trade_id=%s raw=%r reason=%s", client_trade_id, tf, tf_reason)
+            _advance_lifecycle(trade_id=client_trade_id, account_label=account_label, symbol=symbol, mode=trade_mode, next_stage="DROPPED", bound_log=bound, extra={"why": "bad_label_timeframe"})
             return
+    # pilot setup event (for schema v1 decisions)
+    policy_hash = ""
+    try:
+        ph_direct = strat_cfg.get("policy_hash")
+        if isinstance(ph_direct, str) and ph_direct.strip():
+            policy_hash = ph_direct.strip()
+        else:
+            pol = strat_cfg.get("policy")
+            if isinstance(pol, dict):
+                ph = pol.get("policy_hash")
+                if isinstance(ph, str) and ph.strip():
+                    policy_hash = ph.strip()
+    except Exception:
+        policy_hash = ""
 
     pilot_setup_event = {
+
         "trade_id": client_trade_id,
         "client_trade_id": client_trade_id,
         "source_trade_id": source_trade_id,
@@ -1145,7 +1838,7 @@ async def handle_strategy_signal(strat_name: str, strat_cfg: Dict[str, Any], sig
         "timeframe": tf_norm,
         "setup_type": setup_type_norm,
         "account_label": account_label,
-        "policy": {"policy_hash": str(strat_cfg.get("policy_hash") or (strat_cfg.get("policy", {}) or {}).get("policy_hash") or "")},
+        "policy": {"policy_hash": str(policy_hash or "")},
         "payload": {
             "features": {
                 "memory_fingerprint": (
@@ -1158,7 +1851,6 @@ async def handle_strategy_signal(strat_name: str, strat_cfg: Dict[str, Any], sig
         },
     }
 
-    ph_sig = None
     try:
         ph_sig = (sig.get("policy", {}).get("policy_hash") if isinstance(sig.get("policy"), dict) else None)
     except Exception:
@@ -1167,6 +1859,15 @@ async def handle_strategy_signal(strat_name: str, strat_cfg: Dict[str, Any], sig
         pilot_setup_event["policy"]["policy_hash"] = str(ph_sig)
 
     pilot_row = emit_pilot_input_decision(pilot_setup_event)
+    _advance_lifecycle(
+        trade_id=client_trade_id,
+        account_label=account_label,
+        symbol=symbol,
+        mode=trade_mode,
+        next_stage="PILOT_EMITTED",
+        bound_log=bound,
+        extra={"pilot_emitted": bool(pilot_row)},
+    )
 
     size_multiplier_applied = 1.0
     enforced_reason = "not_enforced"
@@ -1176,10 +1877,19 @@ async def handle_strategy_signal(strat_name: str, strat_cfg: Dict[str, Any], sig
         try:
             enforced = enforce_decision(client_trade_id, account_label=account_label)
         except Exception as e:
-            pass  # auto-fix: empty except block
-        except Exception as e:
-
-            pass  # auto-fix: empty except block
+            enforced = {"allow": True, "reason": "enforcer_exception_allow", "decision_code": "ALLOW_TRADE", "size_multiplier": 1.0}
+            _emit_executor_error(
+                stage="enforce_decision_exception",
+                trade_id=client_trade_id,
+                account_label=account_label,
+                symbol=symbol,
+                mode=trade_mode,
+                error_code="ENFORCER_EXCEPTION",
+                reason=str(e),
+                exc=e,
+                extra=None,
+                bound_log=bound,
+            )
 
         allow = bool(enforced.get("allow", True))
         enforced_code = enforced.get("decision_code")
@@ -1191,19 +1901,29 @@ async def handle_strategy_signal(strat_name: str, strat_cfg: Dict[str, Any], sig
         except Exception:
             sm = 1.0
 
+        _advance_lifecycle(
+            trade_id=client_trade_id,
+            account_label=account_label,
+            symbol=symbol,
+            mode=trade_mode,
+            next_stage="DECISION_ENFORCED",
+            bound_log=bound,
+            extra={"allow": allow, "decision_code": enforced_code, "reason": enforced_reason, "size_multiplier": sm},
+        )
+
         if not allow:
             emit_ai_decision(
                 trade_id=client_trade_id,
                 client_trade_id=client_trade_id,
                 source_trade_id=source_trade_id,
-                symbol=symbol,
-                account_label=account_label,
-                sub_uid=sub_uid,
-                strategy_id=strat_id,
-                strategy_name=strat_cfg.get("name", strat_name),
-                timeframe=tf_norm,
+                symbol=str(symbol),
+                account_label=str(account_label),
+                sub_uid=str(sub_uid),
+                strategy_id=str(strat_key),
+                strategy_name=str(strat_cfg.get("name", strat_name)),
+                timeframe=str(tf_norm),
                 side=str(side),
-                mode=trade_mode,
+                mode=str(trade_mode),
                 allow=False,
                 decision_code=str(enforced_code or "BLOCK_TRADE"),
                 reason=enforced_reason,
@@ -1222,11 +1942,12 @@ async def handle_strategy_signal(strat_name: str, strat_cfg: Dict[str, Any], sig
                     "label_setup_type": setup_type_norm,
                 },
             )
-            bound.info("⛔ Decision enforcer BLOCKED (pre-sizing) trade_id=%s reason=%s", client_trade_id, enforced_reason)
+            bound.info("Decision enforcer BLOCKED (pre-sizing) trade_id=%s reason=%s", client_trade_id, enforced_reason)
             try:
-                tg_send(f"⛔ Trade BLOCKED by decision enforcer (pre-sizing): trade_id={client_trade_id} source_trade_id={source_trade_id} symbol={symbol} strat={strat_id} reason={enforced_reason}")
+                tg_send(f"Trade BLOCKED by decision enforcer (pre-sizing): trade_id={client_trade_id} source_trade_id={source_trade_id} symbol={symbol} strat={strat_key} reason={enforced_reason}")
             except Exception:
                 pass
+            _advance_lifecycle(trade_id=client_trade_id, account_label=account_label, symbol=symbol, mode=trade_mode, next_stage="DROPPED", bound_log=bound, extra={"why": "decision_enforcer_block"})
             return
 
         if sm > 0:
@@ -1241,42 +1962,76 @@ async def handle_strategy_signal(strat_name: str, strat_cfg: Dict[str, Any], sig
             enforced_reason=str(enforced_reason or "ok"),
         )
 
+    else:
+        _advance_lifecycle(
+            trade_id=client_trade_id,
+            account_label=account_label,
+            symbol=symbol,
+            mode=trade_mode,
+            next_stage="DECISION_ENFORCED",
+            bound_log=bound,
+            extra={"allow": True, "decision_code": "ALLOW_TRADE", "reason": "not_enforced"},
+        )
+
     effective_code = str(enforced_code) if enforced_code else "ALLOW_TRADE"
     effective_reason = str(enforced_reason) if (enforced_reason and enforced_reason != "not_enforced") else "passed"
 
-
-    # ---------------------------------------------------------------------------
-    # ✅ Phase 7: build one canonical AI snapshot for this candidate and enforce safety
-    # ---------------------------------------------------------------------------
+    # -----------------------------------------------------------------------
+    # Phase 7: build one canonical AI snapshot for this candidate and enforce safety
+    # -----------------------------------------------------------------------
     try:
-        snap = build_ai_snapshot(
+        try:
+            snap = _safe_build_ai_snapshot(
             focus_symbols=[symbol],
             include_trades=False,
             trades_limit=50,
             include_orderbook=True,
         )
-        snap_ok, snap_errs = validate_snapshot_v2(snap)
-    except Exception as e:
-        pass  # auto-fix: empty except block
+        except TypeError:
+            snap = _safe_build_ai_snapshot(include_trades=False,
+            trades_limit=50,
+            include_orderbook=True)
+
+        _v = validate_snapshot_v2(snap)
+        if isinstance(_v, tuple) and len(_v) == 2:
+            snap_ok, snap_errs = _v
+        elif isinstance(_v, bool):
+            snap_ok = _v
+            snap_errs = [] if snap_ok else ["validate_snapshot_v2 returned False"]
+        else:
+            snap_ok = False
+            snap_errs = [f"validate_snapshot_v2 returned unexpected type: {type(_v).__name__}"]
+
     except Exception as e:
         snap_ok, snap_errs = False, [f"snapshot_exception:{e}"]
+        snap = {}
+        _emit_executor_error(
+            stage="snapshot_exception",
+            trade_id=client_trade_id,
+            account_label=account_label,
+            symbol=symbol,
+            mode=trade_mode,
+            error_code="SNAPSHOT_EXCEPTION",
+            reason=str(e),
+            exc=e,
+            extra=None,
+            bound_log=bound,
+        )
 
-    # In LIVE/LIVE_CANARY, snapshot must be valid
     if trade_mode in ("LIVE_CANARY", "LIVE_FULL") and not snap_ok:
-        bound.info("⛔ SNAPSHOT_INVALID blocked trade_id=%s errs=%s", client_trade_id, snap_errs)
-
+        bound.info("SNAPSHOT_INVALID blocked trade_id=%s errs=%s", client_trade_id, snap_errs)
         emit_ai_decision(
             trade_id=client_trade_id,
             client_trade_id=client_trade_id,
             source_trade_id=source_trade_id,
-            symbol=symbol,
-            account_label=account_label,
-            sub_uid=sub_uid,
-            strategy_id=strat_id,
-            strategy_name=strat_cfg.get("name", strat_name),
-            timeframe=tf_norm,
+            symbol=str(symbol),
+            account_label=str(account_label),
+            sub_uid=str(sub_uid),
+            strategy_id=str(strat_key),
+            strategy_name=str(strat_cfg.get("name", strat_name)),
+            timeframe=str(tf_norm),
             side=str(side),
-            mode=trade_mode,
+            mode=str(trade_mode),
             allow=False,
             decision_code="SNAPSHOT_INVALID",
             reason="snapshot_invalid",
@@ -1299,32 +2054,31 @@ async def handle_strategy_signal(strat_name: str, strat_cfg: Dict[str, Any], sig
                 ),
             },
         )
+        _advance_lifecycle(trade_id=client_trade_id, account_label=account_label, symbol=symbol, mode=trade_mode, next_stage="SNAPSHOT_BLOCK", bound_log=bound, extra={"errs": snap_errs})
         try:
-            tg_send(f"⛔ SNAPSHOT_INVALID blocked LIVE/CANARY: trade_id={client_trade_id} symbol={symbol} errs={snap_errs}")
+            tg_send(f"SNAPSHOT_INVALID blocked LIVE/CANARY: trade_id={client_trade_id} symbol={symbol} errs={snap_errs}")
         except Exception:
             pass
         return
 
-    # In LIVE/LIVE_CANARY, snapshot must be safe (fresh enough)
     if trade_mode in ("LIVE_CANARY", "LIVE_FULL"):
         safety = snap.get("safety") if isinstance(snap, dict) else {}
         is_safe = bool(safety.get("is_safe")) if isinstance(safety, dict) else False
         reasons = safety.get("reasons") if isinstance(safety, dict) else None
         if not is_safe:
-            bound.info("⛔ SNAPSHOT_UNSAFE blocked trade_id=%s reasons=%s", client_trade_id, reasons)
-
+            bound.info("SNAPSHOT_UNSAFE blocked trade_id=%s reasons=%s", client_trade_id, reasons)
             emit_ai_decision(
                 trade_id=client_trade_id,
                 client_trade_id=client_trade_id,
                 source_trade_id=source_trade_id,
-                symbol=symbol,
-                account_label=account_label,
-                sub_uid=sub_uid,
-                strategy_id=strat_id,
-                strategy_name=strat_cfg.get("name", strat_name),
-                timeframe=tf_norm,
+                symbol=str(symbol),
+                account_label=str(account_label),
+                sub_uid=str(sub_uid),
+                strategy_id=str(strat_key),
+                strategy_name=str(strat_cfg.get("name", strat_name)),
+                timeframe=str(tf_norm),
                 side=str(side),
-                mode=trade_mode,
+                mode=str(trade_mode),
                 allow=False,
                 decision_code="SNAPSHOT_UNSAFE",
                 reason="snapshot_unsafe",
@@ -1347,16 +2101,18 @@ async def handle_strategy_signal(strat_name: str, strat_cfg: Dict[str, Any], sig
                     ),
                 },
             )
+            _advance_lifecycle(trade_id=client_trade_id, account_label=account_label, symbol=symbol, mode=trade_mode, next_stage="SNAPSHOT_BLOCK", bound_log=bound, extra={"reasons": reasons})
             try:
-                tg_send(f"⛔ SNAPSHOT_UNSAFE blocked LIVE/CANARY: trade_id={client_trade_id} symbol={symbol} reasons={reasons}")
+                tg_send(f"SNAPSHOT_UNSAFE blocked LIVE/CANARY: trade_id={client_trade_id} symbol={symbol} reasons={reasons}")
             except Exception:
                 pass
             return
 
-    
-    # ✅ Scoreboard evidence gate (optional)
+    _advance_lifecycle(trade_id=client_trade_id, account_label=account_label, symbol=symbol, mode=trade_mode, next_stage="SNAPSHOT_OK", bound_log=bound, extra={"snap_ok": True})
+
+    # Scoreboard evidence gate (optional)
     try:
-        use_scoreboard_gate = os.getenv("EXEC_SCOREBOARD_GATE", "true").strip().lower() in ("1","true","yes","y")
+        use_scoreboard_gate = os.getenv("EXEC_SCOREBOARD_GATE", "true").strip().lower() in ("1", "true", "yes", "y")
     except Exception:
         use_scoreboard_gate = True
 
@@ -1364,40 +2120,34 @@ async def handle_strategy_signal(strat_name: str, strat_cfg: Dict[str, Any], sig
     if use_scoreboard_gate:
         try:
             scoreboard_gate = scoreboard_gate_decide(
-                setup_type=str(setup_type),
-                timeframe=str(tf),
+                setup_type=str(setup_type_norm),
+                timeframe=str(tf_norm),
                 symbol=str(symbol),
                 account_label=str(account_label) if account_label is not None else None,
             )
             try:
-                _tid = locals().get('client_trade_id') or locals().get('trade_id') or '?'
-                _st_norm = locals().get('setup_type')
-                _st_raw = locals().get('setup_type_raw')
-                _tf = locals().get('tf')
-                _sym = locals().get('symbol')
-                _code = None if scoreboard_gate is None else scoreboard_gate.get('decision_code')
-                log.info("🧪 SCOREBOARD_GATE call trade_id=%s st_norm=%s st_raw=%s tf=%s sym=%s -> %s", _tid, _st_norm, _st_raw, _tf, _sym, _code)
+                _code = None if scoreboard_gate is None else scoreboard_gate.get("decision_code")
+                log.info("SCOREBOARD_GATE call trade_id=%s st_norm=%s st_raw=%s tf=%s sym=%s -> %s",
+                         client_trade_id, setup_type_norm, setup_type_raw, tf_norm, symbol, _code)
                 if scoreboard_gate is not None:
-                    log.info("🧪 SCOREBOARD_GATE decision allow=%s sm=%s reason=%s bucket=%s", scoreboard_gate.get('allow'), scoreboard_gate.get('size_multiplier'), scoreboard_gate.get('reason'), scoreboard_gate.get('bucket_key'))
+                    log.info("SCOREBOARD_GATE decision allow=%s sm=%s reason=%s bucket=%s",
+                             scoreboard_gate.get("allow"), scoreboard_gate.get("size_multiplier"),
+                             scoreboard_gate.get("reason"), scoreboard_gate.get("bucket_key"))
             except Exception as e:
                 log.warning("Scoreboard gate debug logging failed (non-fatal): %r", e)
-                if scoreboard_gate is not None:
-                    log.info("🧪 SCOREBOARD_GATE decision allow=%s sm=%s reason=%s bucket=%s", scoreboard_gate.get('allow'), scoreboard_gate.get('size_multiplier'), scoreboard_gate.get('reason'), scoreboard_gate.get('bucket_key'))
-            except Exception as e:
-                log.warning("Scoreboard gate debug logging failed (non-fatal): %r", e)
-                if scoreboard_gate is not None:
-                    bound.info(
-                        "✅ Scoreboard gate MATCH trade_id=%s bucket=%s code=%s sm=%s reason=%s",
-                        client_trade_id,
-                        scoreboard_gate.get("bucket_key"),
-                        scoreboard_gate.get("decision_code"),
-                        scoreboard_gate.get("size_multiplier"),
-                        scoreboard_gate.get("reason"),
-                    )
-            except Exception:
-                pass
         except Exception as e:
-            log.warning("Scoreboard gate failed (non-fatal): %r", e)
+            _emit_executor_error(
+                stage="scoreboard_gate_exception",
+                trade_id=client_trade_id,
+                account_label=account_label,
+                symbol=symbol,
+                mode=trade_mode,
+                error_code="SCOREBOARD_GATE_EXCEPTION",
+                reason=str(e),
+                exc=e,
+                extra=None,
+                bound_log=bound,
+            )
             scoreboard_gate = None
 
     if scoreboard_gate is not None:
@@ -1411,12 +2161,21 @@ async def handle_strategy_signal(strat_name: str, strat_cfg: Dict[str, Any], sig
         if not bool(scoreboard_gate.get("allow", True)):
             emit_ai_decision(
                 trade_id=client_trade_id,
-                account_label=account_label,
-                symbol=symbol,
+                client_trade_id=client_trade_id,
+                source_trade_id=source_trade_id,
+                symbol=str(symbol),
+                account_label=str(account_label),
+                sub_uid=str(sub_uid),
+                strategy_id=str(strat_key),
+                strategy_name=str(strat_cfg.get("name", strat_name)),
+                timeframe=str(tf_norm),
+                side=str(side),
+                mode=str(trade_mode),
                 allow=False,
                 decision_code=str(scoreboard_gate.get("decision_code") or "SCOREBOARD_BLOCK"),
-                size_multiplier=0.0,
                 reason=str(scoreboard_gate.get("reason") or "scoreboard_block"),
+                ai_score=None,
+                size_multiplier=0.0,
                 extra={
                     "stage": "scoreboard_gate_pre_policy",
                     "bucket_key": scoreboard_gate.get("bucket_key"),
@@ -1425,17 +2184,18 @@ async def handle_strategy_signal(strat_name: str, strat_cfg: Dict[str, Any], sig
                     "enforced_size_multiplier": float(size_multiplier_applied),
                 },
             )
-            bound.info("⛔ Scoreboard gate BLOCKED trade_id=%s reason=%s", client_trade_id, scoreboard_gate.get("reason"))
+            bound.info("Scoreboard gate BLOCKED trade_id=%s reason=%s", client_trade_id, scoreboard_gate.get("reason"))
             try:
-                tg_send(f"⛔ Scoreboard gate blocked: trade_id={client_trade_id} symbol={symbol} reason={scoreboard_gate.get('reason')}")
+                tg_send(f"Scoreboard gate blocked: trade_id={client_trade_id} symbol={symbol} reason={scoreboard_gate.get('reason')}")
             except Exception:
                 pass
+            _advance_lifecycle(trade_id=client_trade_id, account_label=account_label, symbol=symbol, mode=trade_mode, next_stage="DROPPED", bound_log=bound, extra={"why": "scoreboard_block"})
             return
 
-# ✅ NEW canonical policy gate (logs to ai_policy_log.jsonl and returns real allow/block)
+    # Canonical policy gate
     ai = run_ai_gate(
         sig,
-        strat_id,
+        strat_key,
         bound,
         account_label=account_label,
         mode=trade_mode,
@@ -1447,14 +2207,14 @@ async def handle_strategy_signal(strat_name: str, strat_cfg: Dict[str, Any], sig
             trade_id=client_trade_id,
             client_trade_id=client_trade_id,
             source_trade_id=source_trade_id,
-            symbol=symbol,
-            account_label=account_label,
-            sub_uid=sub_uid,
-            strategy_id=strat_id,
-            strategy_name=strat_cfg.get("name", strat_name),
-            timeframe=tf_norm,
+            symbol=str(symbol),
+            account_label=str(account_label),
+            sub_uid=str(sub_uid),
+            strategy_id=str(strat_key),
+            strategy_name=str(strat_cfg.get("name", strat_name)),
+            timeframe=str(tf_norm),
             side=str(side),
-            mode=trade_mode,
+            mode=str(trade_mode),
             allow=False,
             decision_code="REJECT_TRADE",
             reason=str(ai.get("reason") or "ai_reject"),
@@ -1472,42 +2232,40 @@ async def handle_strategy_signal(strat_name: str, strat_cfg: Dict[str, Any], sig
                 "label_setup_type": setup_type_norm,
             },
         )
+        _advance_lifecycle(trade_id=client_trade_id, account_label=account_label, symbol=symbol, mode=trade_mode, next_stage="DROPPED", bound_log=bound, extra={"why": "ai_gate_reject"})
         return
 
-    # --- rest of file unchanged from your version ---
-    # (I’m not repeating it here because it’s already in your pasted file and unchanged.)
-
-    # NOTE:
-    # The remainder of executor_v2.py should stay exactly as you pasted it after the AI gate call.
-    # If you want, I can re-post the full remainder too, but it is byte-for-byte unchanged.
-
-    # -----------------------------------------------------------------------
-    # IMPORTANT:
-    # Copy the rest of your existing executor_v2.py (everything after the old
-    # ai gate call site) directly below this point.
-    # -----------------------------------------------------------------------
-
-
+    # Corr gate
     try:
         allowed_corr, corr_reason = corr_allow(symbol)
     except Exception as e:
-        pass  # auto-fix: empty except block
-    except Exception as e:
         allowed_corr, corr_reason = True, "corr_gate_v2 exception, bypassed"
+        _emit_executor_error(
+            stage="corr_gate_exception",
+            trade_id=client_trade_id,
+            account_label=account_label,
+            symbol=symbol,
+            mode=trade_mode,
+            error_code="CORR_GATE_EXCEPTION",
+            reason=str(e),
+            exc=e,
+            extra=None,
+            bound_log=bound,
+        )
 
     if not allowed_corr:
         emit_ai_decision(
             trade_id=client_trade_id,
             client_trade_id=client_trade_id,
             source_trade_id=source_trade_id,
-            symbol=symbol,
-            account_label=account_label,
-            sub_uid=sub_uid,
-            strategy_id=strat_id,
-            strategy_name=strat_cfg.get("name", strat_name),
-            timeframe=tf_norm,
+            symbol=str(symbol),
+            account_label=str(account_label),
+            sub_uid=str(sub_uid),
+            strategy_id=str(strat_key),
+            strategy_name=str(strat_cfg.get("name", strat_name)),
+            timeframe=str(tf_norm),
             side=str(side),
-            mode=trade_mode,
+            mode=str(trade_mode),
             allow=False,
             decision_code="REJECT_TRADE",
             reason=f"corr_gate:{corr_reason}",
@@ -1525,14 +2283,17 @@ async def handle_strategy_signal(strat_name: str, strat_cfg: Dict[str, Any], sig
                 "label_setup_type": setup_type_norm,
             },
         )
+        _advance_lifecycle(trade_id=client_trade_id, account_label=account_label, symbol=symbol, mode=trade_mode, next_stage="DROPPED", bound_log=bound, extra={"why": "corr_gate_block"})
         return
 
+    # Risk: now sourced via strategy_gate.strategy_risk_pct (profile-aware) + multipliers
     try:
         base_risk_pct = Decimal(str(strategy_risk_pct(strat_cfg)))
     except Exception:
         base_risk_pct = Decimal("0")
 
-    risk_mult = Decimal(str(get_risk_multiplier(strat_id)))
+    # IMPORTANT: get_risk_multiplier should use stable strategy id, not "Name (sub X)"
+    risk_mult = Decimal(str(get_risk_multiplier(strat_key)))
     eff_risk_pct = base_risk_pct * risk_mult
 
     try:
@@ -1541,17 +2302,17 @@ async def handle_strategy_signal(strat_name: str, strat_cfg: Dict[str, Any], sig
         pass
 
     if eff_risk_pct <= 0:
-        bound.info("effective risk_pct <= 0 for %s; skipping.", strat_id)
+        bound.info("effective risk_pct <= 0 for %s; skipping.", strat_key)
+        _advance_lifecycle(trade_id=client_trade_id, account_label=account_label, symbol=symbol, mode=trade_mode, next_stage="DROPPED", bound_log=bound, extra={"why": "risk_pct_le_zero"})
         return
 
+    # ✅ FIX: use sub_uid equity for LIVE, paper equity for PAPER
     try:
         if EXEC_DRY_RUN or mode_raw == "LEARN_DRY" or trade_mode == "PAPER":
             equity_val = Decimal(str(_paper_equity_usd(account_label=account_label, fallback=1000.0)))
         else:
-            equity_val = Decimal(str(get_equity_usdt()))
-    except Exception as e:
-        pass  # auto-fix: empty except block
-    except Exception as e:
+            equity_val = Decimal(str(_live_equity_usdt_for_sub(sub_uid)))
+    except Exception:
         equity_val = Decimal("1000")
 
     stop_pct_for_size = 0.005
@@ -1565,7 +2326,8 @@ async def handle_strategy_signal(strat_name: str, strat_cfg: Dict[str, Any], sig
     )
 
     if qty_suggested <= 0 or risk_usd <= 0:
-        bound.info("bayesian_size returned non-positive sizing for %s; equity=%s risk_pct=%s", strat_id, equity_val, eff_risk_pct)
+        bound.info("bayesian_size returned non-positive sizing for %s; equity=%s risk_pct=%s", strat_key, equity_val, eff_risk_pct)
+        _advance_lifecycle(trade_id=client_trade_id, account_label=account_label, symbol=symbol, mode=trade_mode, next_stage="DROPPED", bound_log=bound, extra={"why": "bayesian_size_nonpositive"})
         return
 
     qty_capped, risk_capped = risk_capped_qty(
@@ -1578,41 +2340,63 @@ async def handle_strategy_signal(strat_name: str, strat_cfg: Dict[str, Any], sig
 
     if qty_capped <= 0 or risk_capped <= 0:
         bound.info("qty <= 0 after risk_capped_qty; skipping entry.")
+        _advance_lifecycle(trade_id=client_trade_id, account_label=account_label, symbol=symbol, mode=trade_mode, next_stage="DROPPED", bound_log=bound, extra={"why": "risk_capped_qty_nonpositive"})
         return
 
+    # ✅ FIX: portfolio guard gets float equity
     try:
         guard_ok, guard_reason = can_open_trade(
             sub_uid=sub_uid or None,
             strategy_name=strat_cfg.get("name", strat_name),
             risk_usd=risk_capped,
-            equity_now_usd=equity_val,
+            equity_now_usd=float(equity_val),
         )
     except TypeError:
         try:
             guard_ok = bool(can_open_trade(symbol, float(risk_capped)))
             guard_reason = "legacy_bool_guard"
         except Exception as e:
-            pass  # auto-fix: empty except block
-        except Exception as e:
             guard_ok, guard_reason = True, "guard_exception_bypass"
-    except Exception as e:
-        pass  # auto-fix: empty except block
+            _emit_executor_error(
+                stage="portfolio_guard_legacy_exception",
+                trade_id=client_trade_id,
+                account_label=account_label,
+                symbol=symbol,
+                mode=trade_mode,
+                error_code="PORTFOLIO_GUARD_EXCEPTION",
+                reason=str(e),
+                exc=e,
+                extra=None,
+                bound_log=bound,
+            )
     except Exception as e:
         guard_ok, guard_reason = True, "guard_exception_bypass"
+        _emit_executor_error(
+            stage="portfolio_guard_exception",
+            trade_id=client_trade_id,
+            account_label=account_label,
+            symbol=symbol,
+            mode=trade_mode,
+            error_code="PORTFOLIO_GUARD_EXCEPTION",
+            reason=str(e),
+            exc=e,
+            extra=None,
+            bound_log=bound,
+        )
 
     if not guard_ok:
         emit_ai_decision(
             trade_id=client_trade_id,
             client_trade_id=client_trade_id,
             source_trade_id=source_trade_id,
-            symbol=symbol,
-            account_label=account_label,
-            sub_uid=sub_uid,
-            strategy_id=strat_id,
-            strategy_name=strat_cfg.get("name", strat_name),
-            timeframe=tf_norm,
+            symbol=str(symbol),
+            account_label=str(account_label),
+            sub_uid=str(sub_uid),
+            strategy_id=str(strat_key),
+            strategy_name=str(strat_cfg.get("name", strat_name)),
+            timeframe=str(tf_norm),
             side=str(side),
-            mode=trade_mode,
+            mode=str(trade_mode),
             allow=False,
             decision_code="REJECT_TRADE",
             reason=f"portfolio_guard:{guard_reason}",
@@ -1631,13 +2415,17 @@ async def handle_strategy_signal(strat_name: str, strat_cfg: Dict[str, Any], sig
             },
         )
         bound.info("Portfolio guard blocked trade for %s: %s", symbol, guard_reason)
+        _advance_lifecycle(trade_id=client_trade_id, account_label=account_label, symbol=symbol, mode=trade_mode, next_stage="DROPPED", bound_log=bound, extra={"why": "portfolio_guard_block"})
         return
 
-    decision_done_ms = int(time.time() * 1000)
+    _advance_lifecycle(trade_id=client_trade_id, account_label=account_label, symbol=symbol, mode=trade_mode, next_stage="GATES_OK", bound_log=bound, extra=None)
+    _advance_lifecycle(trade_id=client_trade_id, account_label=account_label, symbol=symbol, mode=trade_mode, next_stage="PRE_ENTRY", bound_log=bound, extra={"qty": float(qty_capped), "risk_usd": float(risk_capped)})
+
+    decision_done_ms = _now_ms()
     record_latency(
         event="decision_pipeline",
         symbol=symbol,
-        strat=strat_id,
+        strat=strat_key,
         mode=trade_mode,
         duration_ms=decision_done_ms - started_ms,
         extra={
@@ -1710,14 +2498,23 @@ async def handle_strategy_signal(strat_name: str, strat_cfg: Dict[str, Any], sig
         ai_score = ai.get("score")
         ai_reason = ai.get("reason", "")
         ai_features = ai.get("features") or {}
-        features_payload.update(ai_features)
+        if isinstance(ai_features, dict):
+            features_payload.update(ai_features)
         features_payload["ai_score"] = float(ai_score) if ai_score is not None else None
         features_payload["ai_reason"] = str(ai_reason)
     except Exception as e:
-        pass  # auto-fix: empty except block
-    except Exception as e:
-
-        pass  # auto-fix: empty except block
+        _emit_executor_error(
+            stage="ai_features_merge_exception",
+            trade_id=client_trade_id,
+            account_label=account_label,
+            symbol=symbol,
+            mode=trade_mode,
+            error_code="AI_FEATURES_EXCEPTION",
+            reason=str(e),
+            exc=e,
+            extra=None,
+            bound_log=bound,
+        )
 
     live_mode_requested = mode_raw in ("LIVE_CANARY", "LIVE_FULL")
     live_allowed = live_mode_requested and not lock_active and not EXEC_DRY_RUN and not breaker_on
@@ -1726,14 +2523,14 @@ async def handle_strategy_signal(strat_name: str, strat_cfg: Dict[str, Any], sig
         trade_id=client_trade_id,
         client_trade_id=client_trade_id,
         source_trade_id=source_trade_id,
-        symbol=symbol,
-        account_label=account_label,
-        sub_uid=sub_uid,
-        strategy_id=strat_id,
-        strategy_name=strat_cfg.get("name", strat_name),
-        timeframe=tf_norm,
+        symbol=str(symbol),
+        account_label=str(account_label),
+        sub_uid=str(sub_uid),
+        strategy_id=str(strat_key),
+        strategy_name=str(strat_cfg.get("name", strat_name)),
+        timeframe=str(tf_norm),
         side=str(side),
-        mode=trade_mode,
+        mode=str(trade_mode),
         allow=True,
         decision_code=effective_code,
         reason=effective_reason,
@@ -1759,12 +2556,14 @@ async def handle_strategy_signal(strat_name: str, strat_cfg: Dict[str, Any], sig
     )
 
     if live_allowed:
+        _advance_lifecycle(trade_id=client_trade_id, account_label=account_label, symbol=symbol, mode=trade_mode, next_stage="ENTRY_SENT", bound_log=bound, extra=None)
+
         order_id = await execute_entry(
             symbol=symbol,
             signal_side=str(side),
             qty=float(qty_capped),
             price=price_f,
-            strat=strat_id,
+            strat=strat_key,
             mode=trade_mode,
             sub_uid=sub_uid,
             account_label=account_label,
@@ -1774,41 +2573,42 @@ async def handle_strategy_signal(strat_name: str, strat_cfg: Dict[str, Any], sig
         )
         if not order_id:
             bound.warning("LIVE entry failed; not emitting setup_context (no order_id).")
+            _advance_lifecycle(trade_id=client_trade_id, account_label=account_label, symbol=symbol, mode=trade_mode, next_stage="DROPPED", bound_log=bound, extra={"why": "live_entry_failed"})
             return
 
-        trade_id = str(order_id)
+        _advance_lifecycle(
+            trade_id=client_trade_id,
+            account_label=account_label,
+            symbol=symbol,
+            mode=trade_mode,
+            next_stage="ENTRY_ACK",
+            bound_log=bound,
+            extra={"order_id": str(order_id)},
+        )
 
-        if isinstance(pilot_row, dict):
-            pilot_row2 = dict(pilot_row)
-            pilot_row2["trade_id"] = trade_id
-            pilot_row2["client_trade_id"] = client_trade_id
-            pilot_row2["source_trade_id"] = source_trade_id
+        # LIVE uses orderId as trade_id for setup_context (legacy behavior), but we emit explicit mapping.
+        live_trade_id = str(order_id)
 
-        features_payload["trade_id"] = trade_id
-        features_payload["order_id"] = trade_id
+        features_payload["trade_id"] = live_trade_id
+        features_payload["order_id"] = live_trade_id
         features_payload["client_trade_id"] = client_trade_id
         features_payload["source_trade_id"] = source_trade_id
 
-        try:
-            log_features_at_open(
-                trade_id=trade_id,
-                ts_open_ms=ts_open_ms,
-                symbol=symbol,
-                sub_uid=sub_uid,
-                strategy_name=strat_cfg.get("name", strat_name),
-                setup_type=setup_type_val,
-                mode=trade_mode,
-                features=features_payload,
-            )
-        except Exception as e:
-            pass  # auto-fix: empty except block
-        except Exception as e:
-
-            pass  # auto-fix: empty except block
+        # Emit an explicit mapping lifecycle breadcrumb so joiners have receipts.
+        _emit_lifecycle(
+            trade_id=client_trade_id,
+            account_label=account_label,
+            symbol=symbol,
+            mode=trade_mode,
+            stage="ENTRY_ACK",
+            transition="client_trade_id->orderId_mapping",
+            extra={"client_trade_id": client_trade_id, "order_id": live_trade_id, "join_key": "orderId"},
+            bound_log=bound,
+        )
 
         try:
             setup_event = build_setup_context(
-                trade_id=trade_id,
+                trade_id=live_trade_id,
                 symbol=symbol,
                 account_label=account_label,
                 strategy=strat_cfg.get("name", strat_name),
@@ -1821,35 +2621,85 @@ async def handle_strategy_signal(strat_name: str, strat_cfg: Dict[str, Any], sig
                     "sub_uid": sub_uid or None,
                     "client_trade_id": client_trade_id,
                     "source_trade_id": source_trade_id,
-                    "order_id": trade_id,
+                    "order_id": live_trade_id,
                     "join_key": "orderId",
                 },
             )
-            publish_ai_event(setup_event)
-            setup_logged = True
-            bound.info("✅ LIVE setup_context emitted trade_id(orderId)=%s client_trade_id=%s source_trade_id=%s symbol=%s", trade_id, client_trade_id, source_trade_id, symbol)
-            # --- Integrity: ensure at least one decision exists for this trade (DEFAULT_OPEN fallback) ---
-            try:
-                ensure_default_ai_decision(
-                    trade_id=trade_id,
+
+            # Validate as setup_context (core keys)
+            ok_sc, errs_sc = _validate_event("setup_context", setup_event if isinstance(setup_event, dict) else {})
+            if not ok_sc:
+                _emit_executor_error(
+                    stage="live_setup_context_schema_invalid",
+                    trade_id=live_trade_id,
                     account_label=account_label,
                     symbol=symbol,
-                    mode=str(trade_mode) if 'trade_mode' in locals() else None,
-                    snapshot_fp=snapshot_fp if 'snapshot_fp' in locals() else None,
-                    snapshot_mode=snapshot_mode if 'snapshot_mode' in locals() else None,
-                    snapshot_schema_version=snapshot_schema_version if 'snapshot_schema_version' in locals() else None,
+                    mode=trade_mode,
+                    error_code="SCHEMA_INVALID",
+                    reason=";".join(errs_sc),
+                    exc=None,
+                    extra={"client_trade_id": client_trade_id},
+                    bound_log=bound,
+                )
+                return
+
+            published = _publish_ai_event_safe(
+                setup_event,
+                event_type_for_validation="setup_context",
+                stage="live_setup_context",
+                trade_id=live_trade_id,
+                account_label=account_label,
+                symbol=symbol,
+                mode=trade_mode,
+                bound_log=bound,
+            )
+            if published:
+                setup_logged = True
+                bound.info("LIVE setup_context emitted trade_id(orderId)=%s client_trade_id=%s source_trade_id=%s symbol=%s", live_trade_id, client_trade_id, source_trade_id, symbol)
+                _advance_lifecycle(trade_id=client_trade_id, account_label=account_label, symbol=symbol, mode=trade_mode, next_stage="SETUP_EMITTED", bound_log=bound, extra={"live_trade_id": live_trade_id})
+            else:
+                _advance_lifecycle(trade_id=client_trade_id, account_label=account_label, symbol=symbol, mode=trade_mode, next_stage="DROPPED", bound_log=bound, extra={"why": "setup_publish_failed_or_deduped"})
+
+            try:
+                # LIVE: keep this, because orderId-based trade_id may not have a decision partner.
+                ensure_default_ai_decision(
+                    trade_id=live_trade_id,
+                    account_label=account_label,
+                    symbol=symbol,
+                    mode=str(trade_mode) if "trade_mode" in locals() else None,
+                    snapshot_fp=None,
+                    snapshot_mode=None,
+                    snapshot_schema_version=None,
                     size_multiplier=1.0,
                     allow=True,
                     reason="DEFAULT_OPEN_missing_decision",
                 )
-            except Exception:
-                pass
-
+            except Exception as e:
+                _emit_executor_error(
+                    stage="ensure_default_ai_decision_failed",
+                    trade_id=live_trade_id,
+                    account_label=account_label,
+                    symbol=symbol,
+                    mode=trade_mode,
+                    error_code="DEFAULT_DECISION_FAIL",
+                    reason=str(e),
+                    exc=e,
+                    extra={"client_trade_id": client_trade_id},
+                    bound_log=bound,
+                )
         except Exception as e:
-            pass  # auto-fix: empty except block
-        except Exception as e:
-
-            pass  # auto-fix: empty except block
+            _emit_executor_error(
+                stage="live_setup_context_build_or_publish_exception",
+                trade_id=live_trade_id,
+                account_label=account_label,
+                symbol=symbol,
+                mode=trade_mode,
+                error_code="SETUP_CONTEXT_EXCEPTION",
+                reason=str(e),
+                exc=e,
+                extra={"client_trade_id": client_trade_id},
+                bound_log=bound,
+            )
 
         return
 
@@ -1865,11 +2715,24 @@ async def handle_strategy_signal(strat_name: str, strat_cfg: Dict[str, Any], sig
         paper_side = _normalize_paper_side(str(side))
     except ValueError as e:
         bound.warning("cannot normalize paper side %r for %s: %r", side, symbol, e)
+        _emit_executor_error(
+            stage="paper_side_invalid",
+            trade_id=client_trade_id,
+            account_label=account_label,
+            symbol=symbol,
+            mode=trade_mode,
+            error_code="BAD_SIDE",
+            reason=str(e),
+            exc=e,
+            extra=None,
+            bound_log=bound,
+        )
         return
 
     stop_distance_f = float(price_f * paper_stop_pct)
     if stop_distance_f <= 0:
         bound.warning("stop_distance <= 0 for %s; skipping PAPER entry.", symbol)
+        _advance_lifecycle(trade_id=client_trade_id, account_label=account_label, symbol=symbol, mode=trade_mode, next_stage="DROPPED", bound_log=bound, extra={"why": "paper_stop_distance_le_zero"})
         return
 
     if paper_side == "long":
@@ -1894,64 +2757,9 @@ async def handle_strategy_signal(strat_name: str, strat_cfg: Dict[str, Any], sig
     if str(setup_type_val).strip().lower() == "unknown":
         setup_logged = False
         bound.warning(
-            "label_quarantine: PAPER unknown setup_type; skipping log_features_at_open (trade_id=%s symbol=%s raw=%r reason=%s)",
-            trade_id, symbol, setup_type_raw, st_reason
-        )
-    else:
-        try:
-            log_features_at_open(
-                trade_id=trade_id,
-                ts_open_ms=ts_open_ms,
-                symbol=symbol,
-                sub_uid=sub_uid,
-                strategy_name=strat_cfg.get("name", strat_name),
-                setup_type=setup_type_val,
-                mode=trade_mode,
-                features=features_for_paper,
-            )
-        except Exception as e:
-            pass  # auto-fix: empty except block
-        except Exception as e:
-
-            pass  # auto-fix: empty except block
-
-    if str(setup_type_val).strip().lower() == "unknown":
-        setup_logged = False
-        bound.warning(
             "label_quarantine: PAPER unknown setup_type; skipping ai_event publish (trade_id=%s symbol=%s raw=%r reason=%s)",
             trade_id, symbol, setup_type_raw, st_reason
         )
-        try:
-            emit_ai_decision(
-                trade_id=client_trade_id,
-                client_trade_id=client_trade_id,
-                source_trade_id=source_trade_id,
-                symbol=symbol,
-                account_label=account_label,
-                sub_uid=sub_uid,
-                strategy_id=strat_id,
-                strategy_name=strat_cfg.get("name", strat_name),
-                timeframe=tf_norm,
-                side=str(side),
-                mode=trade_mode,
-                allow=True,
-                decision_code="LABEL_QUARANTINE_PAPER",
-                reason=f"unknown_setup_type_quarantined (raw={setup_type_raw!r} reason={st_reason})",
-                ai_score=features_payload.get("ai_score"),
-                size_multiplier=float(size_multiplier_applied) if size_multiplier_applied != 1.0 else None,
-                extra={
-                    "stage": "paper_label_quarantine",
-                    "setup_type_raw": setup_type_raw,
-                    "setup_type_norm": setup_type_val,
-                    "setup_type_reason": st_reason,
-                    "timeframe_norm": tf_norm,
-                    "timeframe_reason": tf_reason,
-                    "trade_id_source": trade_id_source,
-                    "source_trade_id": source_trade_id,
-                },
-            )
-        except Exception:
-            pass
     else:
         try:
             setup_event = build_setup_context(
@@ -1971,31 +2779,47 @@ async def handle_strategy_signal(strat_name: str, strat_cfg: Dict[str, Any], sig
                     "join_key": "client_trade_id",
                 },
             )
-            publish_ai_event(setup_event)
-            setup_logged = True
-            bound.info("✅ PAPER setup_context emitted trade_id=%s source_trade_id=%s symbol=%s", trade_id, source_trade_id, symbol)
-            # --- Integrity: ensure at least one decision exists for this trade (DEFAULT_OPEN fallback) ---
-            try:
-                ensure_default_ai_decision(
+            ok_sc, errs_sc = _validate_event("setup_context", setup_event if isinstance(setup_event, dict) else {})
+            if not ok_sc:
+                _emit_executor_error(
+                    stage="paper_setup_context_schema_invalid",
                     trade_id=trade_id,
                     account_label=account_label,
                     symbol=symbol,
-                    mode=str(trade_mode) if 'trade_mode' in locals() else None,
-                    snapshot_fp=snapshot_fp if 'snapshot_fp' in locals() else None,
-                    snapshot_mode=snapshot_mode if 'snapshot_mode' in locals() else None,
-                    snapshot_schema_version=snapshot_schema_version if 'snapshot_schema_version' in locals() else None,
-                    size_multiplier=1.0,
-                    allow=True,
-                    reason="DEFAULT_OPEN_missing_decision",
+                    mode=trade_mode,
+                    error_code="SCHEMA_INVALID",
+                    reason=";".join(errs_sc),
+                    exc=None,
+                    extra=None,
+                    bound_log=bound,
                 )
-            except Exception:
-                pass
-
+            else:
+                published = _publish_ai_event_safe(
+                    setup_event,
+                    event_type_for_validation="setup_context",
+                    stage="paper_setup_context",
+                    trade_id=trade_id,
+                    account_label=account_label,
+                    symbol=symbol,
+                    mode=trade_mode,
+                    bound_log=bound,
+                )
+                if published:
+                    setup_logged = True
+                    bound.info("PAPER setup_context emitted trade_id=%s source_trade_id=%s symbol=%s", trade_id, source_trade_id, symbol)
         except Exception as e:
-            pass  # auto-fix: empty except block
-        except Exception as e:
-
-            pass  # auto-fix: empty except block
+            _emit_executor_error(
+                stage="paper_setup_context_exception",
+                trade_id=trade_id,
+                account_label=account_label,
+                symbol=symbol,
+                mode=trade_mode,
+                error_code="SETUP_CONTEXT_EXCEPTION",
+                reason=str(e),
+                exc=e,
+                extra=None,
+                bound_log=bound,
+            )
 
     try:
         broker = get_paper_broker(account_label=account_label, starting_equity=float(equity_val) if equity_val > 0 else 1000.0)
@@ -2020,16 +2844,27 @@ async def handle_strategy_signal(strat_name: str, strat_cfg: Dict[str, Any], sig
             log_setup=(not setup_logged),
         )
 
+        _advance_lifecycle(trade_id=client_trade_id, account_label=account_label, symbol=symbol, mode=trade_mode, next_stage="PAPER_OPENED", bound_log=bound, extra={"paper_side": paper_side})
+        if setup_logged:
+            _advance_lifecycle(trade_id=client_trade_id, account_label=account_label, symbol=symbol, mode=trade_mode, next_stage="SETUP_EMITTED", bound_log=bound, extra={"paper": True})
+
         bound.info(
             "PAPER entry [%s]: %s %s qty=%s @ ~%s (risk_pct=%s stop=%s tp=%s trade_id=%s source_trade_id=%s setup_logged=%s)",
-            strat_id, symbol, paper_side, qty_capped, price_f, eff_risk_pct, stop_price, take_profit_price, trade_id, source_trade_id, setup_logged
+            strat_key, symbol, paper_side, qty_capped, price_f, eff_risk_pct, stop_price, take_profit_price, trade_id, source_trade_id, setup_logged
         )
     except Exception as e:
-        pass  # auto-fix: empty except block
-    except Exception as e:
-
-
-        pass  # auto-fix: empty except block
+        _emit_executor_error(
+            stage="paper_open_position_exception",
+            trade_id=trade_id,
+            account_label=account_label,
+            symbol=symbol,
+            mode=trade_mode,
+            error_code="PAPER_OPEN_EXCEPTION",
+            reason=str(e),
+            exc=e,
+            extra=None,
+            bound_log=bound,
+        )
 
 
 def _normalize_order_side(signal_side: str) -> str:
@@ -2059,11 +2894,23 @@ async def execute_entry(
         order_side = _normalize_order_side(signal_side)
     except ValueError as e:
         bound_log.error("cannot normalize side %r for %s: %r", signal_side, symbol, e)
+        _emit_executor_error(
+            stage="execute_entry:bad_side",
+            trade_id=trade_id,
+            account_label=account_label,
+            symbol=symbol,
+            mode=mode,
+            error_code="BAD_SIDE",
+            reason=str(e),
+            exc=e,
+            extra={"signal_side": signal_side},
+            bound_log=bound_log,
+        )
         return None
 
     order_link_id = trade_id
     success = False
-    start_ms = started_ms or int(time.time() * 1000)
+    start_ms = started_ms or _now_ms()
     order_id_out: Optional[str] = None
 
     try:
@@ -2116,26 +2963,41 @@ async def execute_entry(
                 raw={"api_response": r, "sub_uid": sub_uid, "mode": mode, "strategy": strat},
             )
         except Exception as e:
-            pass  # auto-fix: empty except block
-        except Exception as e:
-
-            pass  # auto-fix: empty except block
+            _emit_executor_error(
+                stage="execute_entry:record_order_event_failed",
+                trade_id=trade_id,
+                account_label=account_label,
+                symbol=symbol,
+                mode=mode,
+                error_code="ORDER_EVENT_FAIL",
+                reason=str(e),
+                exc=e,
+                extra={"order_id_out": order_id_out},
+                bound_log=bound_log,
+            )
 
         try:
-            tg_send(f"🚀 Entry placed [{mode}/{strat}] {symbol} {order_side} qty={qty} client_trade_id={trade_id} order_id={order_id_out}")
-        except Exception as e:
-            pass  # auto-fix: empty except block
-        except Exception as e:
+            tg_send(f"Entry placed [{mode}/{strat}] {symbol} {order_side} qty={qty} client_trade_id={trade_id} order_id={order_id_out}")
+        except Exception:
+            pass
 
-            pass  # auto-fix: empty except block
-
-    except Exception as e:
-        pass  # auto-fix: empty except block
     except Exception as e:
         order_id_out = None
+        _emit_executor_error(
+            stage="execute_entry:place_order_exception",
+            trade_id=trade_id,
+            account_label=account_label,
+            symbol=symbol,
+            mode=mode,
+            error_code="PLACE_ORDER_FAIL",
+            reason=str(e),
+            exc=e,
+            extra={"qty": qty, "price": price, "orderLinkId": order_link_id},
+            bound_log=bound_log,
+        )
 
     finally:
-        end_ms = int(time.time() * 1000)
+        end_ms = _now_ms()
         duration = end_ms - start_ms
         try:
             record_latency(
@@ -2149,14 +3011,11 @@ async def execute_entry(
             if duration > LATENCY_WARN_MS:
                 log.warning("High executor latency for %s (%s): %d ms (threshold=%d ms)", symbol, strat, duration, LATENCY_WARN_MS)
                 try:
-                    tg_send(f"⚠️ High executor latency [{mode}/{strat}] {symbol} {duration} ms (threshold={LATENCY_WARN_MS} ms)")
+                    tg_send(f"High executor latency [{mode}/{strat}] {symbol} {duration} ms (threshold={LATENCY_WARN_MS} ms)")
                 except Exception:
                     pass
-        except Exception as e:
-            pass  # auto-fix: empty except block
-        except Exception as e:
-
-            pass  # auto-fix: empty except block
+        except Exception:
+            pass
 
     return order_id_out
 
@@ -2171,7 +3030,10 @@ async def executor_loop() -> None:
             pos = healed
             save_cursor(pos)
 
-    log.info("executor_v2 starting at cursor=%s (EXEC_DRY_RUN=%s)", pos, EXEC_DRY_RUN)
+    log.info(
+        "executor_v2 starting at cursor=%s (EXEC_DRY_RUN=%s) SIGNAL_FILE=%s CURSOR_FILE=%s",
+        pos, EXEC_DRY_RUN, str(SIGNAL_FILE), str(CURSOR_FILE)
+    )
 
     last_idle_log = time.time()
 
@@ -2205,9 +3067,7 @@ async def executor_loop() -> None:
                     pos = f.tell()
                     try:
                         line = raw.decode("utf-8").strip()
-                    except Exception as e:
-                        pass  # auto-fix: empty except block
-                    except Exception as e:
+                    except Exception:
                         continue
                     if not line:
                         continue
@@ -2231,8 +3091,18 @@ async def executor_loop() -> None:
             await asyncio.sleep(0.25)
 
         except Exception as e:
-            pass  # auto-fix: empty except block
-        except Exception as e:
+            _emit_executor_error(
+                stage="executor_loop_exception",
+                trade_id="",
+                account_label="",
+                symbol="",
+                mode="PAPER" if EXEC_DRY_RUN else "",
+                error_code="EXECUTOR_LOOP_EXCEPTION",
+                reason=str(e),
+                exc=e,
+                extra=None,
+                bound_log=None,
+            )
             await asyncio.sleep(1.0)
 
 

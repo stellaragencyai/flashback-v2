@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+﻿#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
 Flashback — Subaccount Registry & Round-Robin (v2, YAML-driven)
@@ -11,61 +11,34 @@ and how to rotate through them for DRIP / profit distribution / canary tests.
 Primary source of truth:
     config/subaccounts.yaml
 
-This file declares entries like:
+Supports BOTH YAML shapes:
+  A) List form:
+      accounts:
+        - account_label: flashback01
+          sub_uid: 524630315
+          ...
 
-    - account_label: flashback01
-      sub_uid: 524630315
-      role: trend_follow
-      strategy_name: Sub1_Trend
-      enabled: true
-      telegram_channel: sub1
-      risk_profile: default_sub
-      enable_tp_sl: true
-      enable_journal: true
-      enable_ai_stack: true
-      ai_profile: trend_v1
-      automation_mode: LEARN_DRY
-      notes: ...
+  B) Mapping form (canonical in your repo):
+      main:
+        sub_uid: null
+        ...
+      flashback01:
+        sub_uid: 524630315
+        ...
 
 Public API
 ----------
 all_subs() -> List[dict]
-    Each dict contains at least:
-        {
-          "uid": str | None,           # sub_uid or None for main
-          "label": str,                # human-friendly label (strategy_name or account_label)
-          "account_label": str,        # "main", "flashback01", ...
-          "enabled": bool,
-          "role": str | "",
-          "strategy_name": str | "",
-          "risk_profile": str | None,
-          "ai_profile": str | None,
-          "automation_mode": str | None,
-          "telegram_channel": str | None,
-          "enable_tp_sl": bool,
-          "enable_journal": bool,
-          "enable_ai_stack": bool,
-        }
-
 rr_next() -> dict | None
-    Round-robin next subaccount:
-        {
-          "uid": str,
-          "label": str,
-          "account_label": str,
-        }
-
 peek_current() -> dict | None
 reset_rr() -> None
 
 Backward compatibility
 ----------------------
-If config/subaccounts.yaml is missing or invalid, we fall back to the older
-env-based behavior:
-
-    SUB_UID_1..SUB_UID_10       -> individual sub UIDs
-    SUB_UIDS_ROUND_ROBIN        -> explicit rotation list
-    SUB_LABELS                  -> "uid:Label,uid:Label,..."
+If config/subaccounts.yaml is missing or invalid, we fall back to env-based behavior:
+    SUB_UID_1..SUB_UID_10
+    SUB_UIDS_ROUND_ROBIN
+    SUB_LABELS=uid:Label,uid:Label,...
 """
 
 from __future__ import annotations
@@ -182,21 +155,61 @@ def _yaml_accounts_list() -> List[Dict[str, Any]]:
     """
     Return the normalized list of accounts from YAML.
 
+    Supports:
+      1) cfg['accounts'] as a list (older expectation)
+      2) top-level mapping keys (main/flashback01/...) (canonical in your repo)
+      3) cfg['legacy']['accounts_list'] as a list (older compatibility)
+
     If YAML is missing or invalid, returns [].
     """
     cfg = _load_subaccounts_yaml()
-    accounts = cfg.get("accounts") or []
-    if not isinstance(accounts, list):
+    if not cfg:
         return []
 
-    out: List[Dict[str, Any]] = []
-    for entry in accounts:
-        if not isinstance(entry, dict):
+    # 1) Primary: explicit accounts list
+    accounts_any = cfg.get("accounts", None)
+    if isinstance(accounts_any, list):
+        out: List[Dict[str, Any]] = []
+        for entry in accounts_any:
+            if not isinstance(entry, dict):
+                continue
+            norm = _normalize_account_entry(entry)
+            if norm is not None:
+                out.append(norm)
+        return out
+
+    # 2) Compatibility: legacy.accounts_list
+    legacy = cfg.get("legacy")
+    if isinstance(legacy, dict):
+        legacy_list = legacy.get("accounts_list")
+        if isinstance(legacy_list, list):
+            out2: List[Dict[str, Any]] = []
+            for entry in legacy_list:
+                if not isinstance(entry, dict):
+                    continue
+                norm = _normalize_account_entry(entry)
+                if norm is not None:
+                    out2.append(norm)
+            if out2:
+                return out2
+
+    # 3) Canonical: top-level mapping keys
+    # Ignore known meta keys
+    meta_keys = {"version", "notes", "legacy"}
+    out3: List[Dict[str, Any]] = []
+    for k, v in cfg.items():
+        if k in meta_keys:
             continue
+        if not isinstance(v, dict):
+            continue
+        # Inject account_label from the key if missing
+        entry = dict(v)
+        entry.setdefault("account_label", str(k))
         norm = _normalize_account_entry(entry)
         if norm is not None:
-            out.append(norm)
-    return out
+            out3.append(norm)
+
+    return out3
 
 
 _YAML_ACCOUNTS: List[Dict[str, Any]] = _yaml_accounts_list()
@@ -443,7 +456,6 @@ def peek_current() -> Optional[Dict[str, str]]:
 
 def reset_rr() -> None:
     """
-    Reset the round-robin index to 0.
-    Useful in tests or when re-seeding rotation.
+    Reset RR pointer to 0.
     """
     _save_rr_state({"index": 0})

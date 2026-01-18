@@ -1,0 +1,95 @@
+﻿# app/api/subaccounts_api.py
+import json
+import os
+from fastapi import APIRouter
+
+router = APIRouter()
+
+HERE = os.path.dirname(__file__)
+
+STATE_FILE = os.path.join(HERE, "..", "state", "subaccounts_state.json")
+GOV_FILE = os.path.join(HERE, "..", "state", "governance_state.json")
+
+# This is the missing piece in your current file.
+DASH_SNAPSHOT_FILE = os.path.join(HERE, "..", "..", "state", "dashboard_snapshot.json")
+
+
+def _safe_read_json(path: str):
+    try:
+        if not os.path.exists(path):
+            return None
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return None
+
+
+def _merge_dashboard_truth(subaccounts: list, dash: dict) -> None:
+    """
+    Merge outcomes-derived truth from dashboard_snapshot.json into each subaccount row.
+    This is the ONLY reliable source for:
+      - total_trades (windowed outcomes count)
+      - win_rate (windowed outcomes winrate)
+      - pnl_usd_total
+      - outcomes freshness + last timestamp
+
+    We keep field names aligned with what your dashboard template expects.
+    """
+    if not isinstance(dash, dict):
+        return
+
+    accounts = dash.get("accounts") or {}
+    if not isinstance(accounts, dict):
+        return
+
+    for sa in subaccounts:
+        try:
+            uid = sa.get("subaccount_uid") or sa.get("subaccount_name")
+            if not uid:
+                continue
+
+            a = accounts.get(uid)
+            if not isinstance(a, dict):
+                continue
+
+            # Outcomes-derived truth
+            sa["total_trades"] = int(a.get("n") or 0)
+            sa["win_rate"] = float(a.get("winrate") or 0.0)
+            sa["pnl_usd_total"] = a.get("pnl_sum")
+            sa["outcomes_freshness_sec"] = a.get("freshness_sec")
+            sa["outcomes_last_ts_iso"] = a.get("last_ts_iso")
+
+            # Optional extras if you want them later (harmless)
+            sa["outcomes_top_symbols"] = a.get("top_symbols")
+            sa["outcomes_top_setups"] = a.get("top_setups")
+            sa["outcomes_top_timeframes"] = a.get("top_timeframes")
+            sa["outcomes_top_close_reasons"] = a.get("top_close_reasons")
+        except Exception:
+            # Never allow API to die because one row is malformed
+            continue
+
+
+@router.get("/subaccounts")
+def get_subaccounts():
+    state = _safe_read_json(STATE_FILE) or {}
+    subaccounts = state.get("subaccounts", []) or []
+    if not isinstance(subaccounts, list):
+        subaccounts = []
+
+    # Governance overlay (districts)
+    governance = _safe_read_json(GOV_FILE) or {}
+    districts = governance.get("districts", {}) if isinstance(governance, dict) else {}
+    if isinstance(districts, dict):
+        for sa in subaccounts:
+            try:
+                gid = sa.get("subaccount_uid")
+                if gid and gid in districts and isinstance(districts[gid], dict):
+                    sa.update(districts[gid])
+            except Exception:
+                continue
+
+    # Dashboard snapshot overlay (outcomes truth)
+    dash = _safe_read_json(DASH_SNAPSHOT_FILE)
+    _merge_dashboard_truth(subaccounts, dash)
+
+    return subaccounts

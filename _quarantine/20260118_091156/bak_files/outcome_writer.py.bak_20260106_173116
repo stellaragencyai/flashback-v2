@@ -1,0 +1,73 @@
+﻿from __future__ import annotations
+
+"""
+Flashback — Outcome Writer (v1)
+
+Writes ONLY canonical v1 outcomes.
+
+Routing (per-account isolation):
+- If AI_EVENTS_DIR is set (env), write to: <AI_EVENTS_DIR>/outcomes.v1.jsonl
+- Else (default), write to: <ROOT>/state/ai_events/outcomes.v1.jsonl
+
+Public API (do not break):
+- write_outcome_from_paper_close(**kwargs)  # used by paper_broker
+- append_outcome_v1(outcome: dict)          # direct writer
+
+This module must stay boring and stable.
+"""
+
+import os
+import json
+import time
+from pathlib import Path
+from typing import Any, Dict
+
+from app.ai.outcome_contract import OUTCOME_SCHEMA_VERSION, validate_outcome_v1
+
+# Resolve repo root robustly from this file path: <ROOT>/app/ai/outcome_writer.py
+_ROOT: Path = Path(__file__).resolve().parents[2]
+
+
+def _resolve_out_path() -> Path:
+    ai_events_dir = (os.environ.get("AI_EVENTS_DIR") or "").strip()
+
+    if ai_events_dir:
+        base = Path(ai_events_dir)
+        if not base.is_absolute():
+            base = (_ROOT / base).resolve()
+        out_path = base / "outcomes.v1.jsonl"
+    else:
+        out_path = _ROOT / "state" / "ai_events" / "outcomes.v1.jsonl"
+
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    return out_path
+
+
+def append_outcome_v1(outcome: Dict[str, Any]) -> None:
+    validate_outcome_v1(outcome)
+    outcome["schema_version"] = OUTCOME_SCHEMA_VERSION
+
+    out_path = _resolve_out_path()
+    line = json.dumps(outcome, ensure_ascii=False)
+    with out_path.open("a", encoding="utf-8", newline="\n") as f:
+        f.write(line + "\n")
+
+
+def write_outcome_from_paper_close(**kwargs: Any) -> None:
+    """
+    Legacy API expected by app.sim.paper_broker.
+    Accepts flexible kwargs, normalizes, validates, appends.
+    """
+    payload = dict(kwargs)
+
+    # Merge any nested extra dict without clobbering core fields
+    extra = payload.get("extra")
+    if isinstance(extra, dict):
+        for k, v in extra.items():
+            payload.setdefault(k, v)
+
+    payload.setdefault("schema_version", OUTCOME_SCHEMA_VERSION)
+    payload.setdefault("event_type", "trade_outcome")
+    payload.setdefault("ts_ms", int(time.time() * 1000))
+
+    append_outcome_v1(payload)

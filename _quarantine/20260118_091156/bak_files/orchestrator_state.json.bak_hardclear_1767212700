@@ -1,0 +1,39 @@
+{
+  "procs": {
+    "flashback01": {
+      "alive": false,
+      "backoff_sec": 60.0,
+      "blocked": true,
+      "blocked_reason": "too_many_restarts",
+      "cmd": [
+        "C:\\Users\\nolan\\AppData\\Local\\Programs\\Python\\Python312\\python.exe",
+        "-m",
+        "app.bots.supervisor_ai_stack"
+      ],
+      "last_checked_ts_ms": 1767212598037,
+      "pid": null,
+      "restart_count": 5,
+      "started_ts_ms": 1767212279322,
+      "stderr_log": "C:\\Flashback\\state\\orchestrator_logs\\flashback01.stderr.log",
+      "stdout_log": "C:\\Flashback\\state\\orchestrator_logs\\flashback01.stdout.log"
+    },
+    "flashback02": {
+      "alive": false,
+      "backoff_sec": 60.0,
+      "blocked": true,
+      "blocked_reason": "too_many_restarts",
+      "cmd": [
+        "C:\\Users\\nolan\\AppData\\Local\\Programs\\Python\\Python312\\python.exe",
+        "-m",
+        "app.bots.supervisor_ai_stack"
+      ],
+      "last_checked_ts_ms": 1767212598037,
+      "pid": null,
+      "restart_count": 5,
+      "started_ts_ms": 1767212279779,
+      "stderr_log": "C:\\Flashback\\state\\orchestrator_logs\\flashback02.stderr.log",
+      "stdout_log": "C:\\Flashback\\state\\orchestrator_logs\\flashback02.stdout.log"
+    }
+  },
+  "ts_ms": 1767212598037
+}

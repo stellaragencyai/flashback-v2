@@ -1,19 +1,31 @@
-#!/usr/bin/env python3
+﻿#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Flashback - AI Events Spine (disk-logging version, v2.8.2 Phase4->5 learning hardened)
+Flashback — AI Events Spine (disk-logging + inbox-draining version, v3.0.0)
 
-v2.8.2 Patch Summary (2025-12-20)
----------------------------------
-CRITICAL: memory_fingerprint stability and real aggregation.
+What this file is (now):
+- The canonical consumer that drains the per-account AI events inbox:
+      state/ai_events_inbox_<ACCOUNT_LABEL>.jsonl
+  using a byte-offset cursor file:
+      state/ai_events_inbox_<ACCOUNT_LABEL>.cursor
 
-Problem (observed):
-- memory_fingerprint still drifted because nested OHLC-ish debug fields leaked through scrubber:
-  e.g. signal.debug.last_close
+- Appends every accepted event to the per-lane ledger:
+      state/ai_events/<ACCOUNT_LABEL>/spine_events.jsonl
 
-Fix:
-- Expand recursive scrubber drops for OHLC-ish keys (close/open/high/low variants)
-- Add suffix rule for *_close/_open/_high/_low to avoid future whack-a-mole
+- Also performs Phase 4 glue:
+  - setup_context -> pending_setups registry (alias-aware)
+  - outcome_record -> reconciliation against pending_setups
+  - outcome_enriched -> memory emission + memory snapshot update
+  - decision enforcement (pilot_decide / fallback decision)
+
+Producer contract:
+- Other workers should call publish_ai_event(event)
+  which ONLY enqueues into the correct inbox file (lane-safe).
+  The spine drains and processes.
+
+CLI:
+- Default: loop forever, draining and heartbeating.
+- --once: drain once and exit (useful for tests).
 """
 
 from __future__ import annotations
@@ -22,6 +34,7 @@ import argparse
 import hashlib
 import json
 import os
+import re
 import time
 from pathlib import Path
 from typing import Any, Dict, Optional, Tuple, Set, List
@@ -55,7 +68,6 @@ except Exception:  # pragma: no cover
         logger_.setLevel(logging.INFO)
         return logger_
 
-
 log = get_logger("ai_events_spine")
 
 try:
@@ -64,7 +76,6 @@ except Exception:  # pragma: no cover
     def record_heartbeat(name: str) -> None:  # type: ignore[override]
         return None
 
-
 try:
     from app.core.config import settings  # type: ignore
     ROOT: Path = settings.ROOT  # type: ignore
@@ -72,56 +83,107 @@ except Exception:
     ROOT = Path(__file__).resolve().parents[2]
 
 
-
-# Centralized Spine API paths/helpers (Phase 8+ hygiene)
-try:
-    from app.core.spine_api import (
-        STATE_DIR as _STATE_DIR,
-        AI_EVENTS_DIR as _AI_EVENTS_DIR,
-        AI_MEMORY_DIR as _AI_MEMORY_DIR,
-        AI_DECISIONS_PATH as _AI_DECISIONS_PATH,
-    )
-except Exception:  # pragma: no cover
-    _STATE_DIR = None  # type: ignore
-    _AI_EVENTS_DIR = None  # type: ignore
-    _AI_MEMORY_DIR = None  # type: ignore
-    _AI_DECISIONS_PATH = None  # type: ignore
-
 def _now_ms() -> int:
     return int(time.time() * 1000)
 
 
+def _env_bool(key: str, default: str = "false") -> bool:
+    v = str(os.getenv(key, default)).strip().lower()
+    return v in ("1", "true", "yes", "y", "on")
+
+
+def _safe_str(x: Any) -> str:
+    try:
+        return ("" if x is None else str(x)).strip()
+    except Exception:
+        return ""
+
+
 # ---------------------------------------------------------------------------
-# Paths for AI event logs
+# Lane identity + directories
 # ---------------------------------------------------------------------------
 
-STATE_DIR: Path = (_STATE_DIR if _STATE_DIR is not None else (ROOT / "state"))
-AI_EVENTS_DIR: Path = (_AI_EVENTS_DIR if _AI_EVENTS_DIR is not None else (STATE_DIR / "ai_events"))
+ACCOUNT_LABEL: str = _safe_str(os.getenv("ACCOUNT_LABEL") or "main") or "main"
+IS_MAIN: bool = ACCOUNT_LABEL.lower() in ("main", "global")
 
-STATE_DIR.mkdir(parents=True, exist_ok=True)
+
+STATE_DIR: Path = ROOT / "state"
+
+# AI_EVENTS_DIR supports env override; if relative, resolve under STATE_DIR.
+_env_events_dir = _safe_str(os.getenv("AI_EVENTS_DIR"))
+if _env_events_dir:
+    _tmp = Path(_env_events_dir)
+    AI_EVENTS_DIR = _tmp if _tmp.is_absolute() else (STATE_DIR / _tmp)
+else:
+    # canonical per-lane path
+    AI_EVENTS_DIR = (STATE_DIR / "ai_events") if IS_MAIN else (STATE_DIR / "ai_events" / ACCOUNT_LABEL)
+
 AI_EVENTS_DIR.mkdir(parents=True, exist_ok=True)
+STATE_DIR.mkdir(parents=True, exist_ok=True)
 
-SETUPS_PATH: Path = AI_EVENTS_DIR / "setups.jsonl"
-OUTCOMES_PATH: Path = AI_EVENTS_DIR / "outcomes.jsonl"           # enriched-only guardrail
-OUTCOMES_RAW_PATH: Path = AI_EVENTS_DIR / "outcomes_raw.jsonl"   # raw execution outcomes
-OUTCOMES_ORPHANS_PATH: Path = AI_EVENTS_DIR / "outcomes_orphans.jsonl"
+# Memory dir supports env override; if relative, resolve under STATE_DIR.
+_env_mem_dir = _safe_str(os.getenv("AI_MEMORY_DIR"))
+if _env_mem_dir:
+    _tmpm = Path(_env_mem_dir)
+    AI_MEMORY_DIR = _tmpm if _tmpm.is_absolute() else (STATE_DIR / _tmpm)
+else:
+    AI_MEMORY_DIR = (STATE_DIR / "ai_memory") if IS_MAIN else (STATE_DIR / "ai_memory" / ACCOUNT_LABEL)
+AI_MEMORY_DIR.mkdir(parents=True, exist_ok=True)
+
+# ---------------------------------------------------------------------------
+# Canonical file outputs (lane-scoped)
+# ---------------------------------------------------------------------------
+
+SPINE_EVENTS_PATH: Path = AI_EVENTS_DIR / "spine_events.jsonl"         # all accepted events ledger
+SETUPS_PATH: Path = AI_EVENTS_DIR / "setups.jsonl"                    # setup_context (optional convenience)
+OUTCOMES_PATH: Path = AI_EVENTS_DIR / "outcomes.jsonl"                # legacy enriched/flat outcomes
+OUTCOMES_RAW_PATH: Path = AI_EVENTS_DIR / "outcomes_raw.jsonl"        # raw outcome_record events
 
 PENDING_REGISTRY_PATH: Path = AI_EVENTS_DIR / "pending_setups.json"
+
+MEMORY_SNAPSHOT_PATH: Path = AI_MEMORY_DIR / "memory_snapshot.json"
+MEMORY_RECORDS_PATH: Path = AI_MEMORY_DIR / "memory_records.jsonl"
+
+# ---------------------------------------------------------------------------
+# Inbox + cursor (lane-scoped, but overridable)
+# ---------------------------------------------------------------------------
+
+# Inbox path: main keeps legacy name ai_events_inbox.jsonl; subs use ai_events_inbox_<label>.jsonl
+_env_inbox = _safe_str(os.getenv("AI_EVENTS_INBOX_PATH"))
+if _env_inbox:
+    _p = Path(_env_inbox)
+    AI_EVENTS_INBOX_PATH = _p if _p.is_absolute() else (STATE_DIR / _p)
+else:
+    AI_EVENTS_INBOX_PATH = (STATE_DIR / "ai_events_inbox.jsonl") if IS_MAIN else (STATE_DIR / f"ai_events_inbox_{ACCOUNT_LABEL}.jsonl")
+
+# Cursor path: main keeps legacy name ai_events_inbox.cursor; subs use ai_events_inbox_<label>.cursor
+_env_cursor = _safe_str(os.getenv("AI_EVENTS_INBOX_CURSOR_PATH"))
+if _env_cursor:
+    _c = Path(_env_cursor)
+    AI_EVENTS_INBOX_CURSOR_PATH = _c if _c.is_absolute() else (STATE_DIR / _c)
+else:
+    AI_EVENTS_INBOX_CURSOR_PATH = (STATE_DIR / "ai_events_inbox.cursor") if IS_MAIN else (STATE_DIR / f"ai_events_inbox_{ACCOUNT_LABEL}.cursor")
+
+# Badlines quarantine (so one garbage line doesn't kill the lane forever)
+AI_EVENTS_INBOX_BADLINES_PATH: Path = (
+    (STATE_DIR / "ai_events_inbox.bad.jsonl") if IS_MAIN else (STATE_DIR / f"ai_events_inbox_{ACCOUNT_LABEL}.bad.jsonl")
+)
+
+# ---------------------------------------------------------------------------
+# Config / policy stamping
+# ---------------------------------------------------------------------------
 
 CONFIG_DIR: Path = ROOT / "config"
 STRATEGIES_PATH: Path = CONFIG_DIR / "strategies.yaml"
 EXIT_PROFILES_PATH: Path = CONFIG_DIR / "exit_profiles.yaml"
 RISK_PROFILES_PATH: Path = CONFIG_DIR / "risk_profiles.yaml"
 
+_POLICY_CACHE: Dict[str, Any] = {"policy": None, "loaded_ms": 0}
+_POLICY_CACHE_TTL_MS = 10_000
+
 # ---------------------------------------------------------------------------
 # Phase 4: Memory store (bounded + reversible)
 # ---------------------------------------------------------------------------
-
-AI_MEMORY_DIR: Path = (_AI_MEMORY_DIR if _AI_MEMORY_DIR is not None else (STATE_DIR / "ai_memory"))
-AI_MEMORY_DIR.mkdir(parents=True, exist_ok=True)
-
-MEMORY_SNAPSHOT_PATH: Path = AI_MEMORY_DIR / "memory_snapshot.json"
-MEMORY_RECORDS_PATH: Path = AI_MEMORY_DIR / "memory_records.jsonl"
 
 MEMORY_SCHEMA_VERSION = 1
 
@@ -136,15 +198,18 @@ PEND_MAX_AGE_DAYS = 14
 # Phase 4: Decisions (enforced)
 # ---------------------------------------------------------------------------
 
-AI_DECISIONS_PATH: Path = (_AI_DECISIONS_PATH if _AI_DECISIONS_PATH is not None else (STATE_DIR / "ai_decisions.jsonl"))
-AI_EVENTS_ENFORCE_DECISION: bool = str(os.getenv("AI_EVENTS_ENFORCE_DECISION", "true")).strip().lower() in (
-    "1", "true", "yes", "y", "on"
-)
+AI_DECISIONS_PATH: Path = (STATE_DIR / "ai_decisions.jsonl")
+AI_EVENTS_ENFORCE_DECISION: bool = _env_bool("AI_EVENTS_ENFORCE_DECISION", "true")
 AI_DECISION_TAIL_BYTES: int = int(os.getenv("AI_DECISION_TAIL_BYTES", "1048576") or "1048576")  # default 1MB
 
 
+# ---------------------------------------------------------------------------
+# IO helpers
+# ---------------------------------------------------------------------------
+
 def _append_jsonl(path: Path, payload: Dict[str, Any]) -> None:
     try:
+        path.parent.mkdir(parents=True, exist_ok=True)
         with path.open("ab") as f:
             f.write(orjson.dumps(payload))
             f.write(b"\n")
@@ -156,13 +221,34 @@ def _append_jsonl(path: Path, payload: Dict[str, Any]) -> None:
 
 
 def _atomic_write_text(path: Path, text: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(path.suffix + ".tmp")
     tmp.write_text(text, encoding="utf-8")
     tmp.replace(path)
 
 
+def _read_cursor(path: Path) -> int:
+    try:
+        if not path.exists():
+            return 0
+        raw = path.read_text(encoding="utf-8", errors="ignore").strip()
+        if not raw:
+            return 0
+        v = int(raw)
+        return max(0, v)
+    except Exception:
+        return 0
+
+
+def _write_cursor(path: Path, pos: int) -> None:
+    try:
+        _atomic_write_text(path, str(max(0, int(pos))))
+    except Exception:
+        return
+
+
 # ---------------------------------------------------------------------------
-# Timeframe normalization + stable json
+# Timeframe normalization + fingerprinting
 # ---------------------------------------------------------------------------
 
 def _normalize_timeframe(tf: Any) -> Optional[str]:
@@ -198,181 +284,24 @@ def _stable_json(obj: Any) -> str:
             return ""
 
 
-def _safe_str(x: Any) -> str:
-    try:
-        return ("" if x is None else str(x)).strip()
-    except Exception:
-        return ""
-
-
-def _coerce_setup_type(st: Any) -> str:
-    s = _safe_str(st)
-    return s if s else "unknown"
-
-
-# ---------------------------------------------------------------------------
-# Fingerprint feature filtering (Phase 5 critical)
-# ---------------------------------------------------------------------------
-
-# Exact keys to drop anywhere in the features tree
-_FP_DROP_KEYS: Set[str] = {
-    # identity / ids
-    "trade_id",
-    "client_trade_id",
-    "source_trade_id",
-    "order_id",
-    "orderid",
-    "orderlinkid",
-    "sub_uid",
-    "uid",
-    # time
-    "ts",
-    "ts_ms",
-    "ts_open_ms",
-    "timestamp",
-    "updated_ms",
-    "time",
-    # sizing / account state
-    "qty",
-    "size",
-    "equity_usd",
-    "risk_usd",
-    "risk_pct",
-    # price derived (changes constantly)
-    "price",
-    "last",
-    "mark",
-    "index",
-    "best_bid",
-    "best_ask",
-    "stop_price",
-    "take_profit_price",
-    # OHLC-ish / debug price fields (also volatile)
-    "open",
-    "high",
-    "low",
-    "close",
-    "last_close",
-    "ohlc",
-    "ohlcv",
-    "hlc3",
-    # execution / modes / policy artifacts
-    "trade_mode",
-    "automation_mode",
-    "train_mode",
-    "execution_lock_active",
-    "execution_global_breaker_on",
-    "decision_size_multiplier",
-    "decision_enforced",
-    "decision_reason",
-    "decision_code",
-    "trade_id_source",
-    "forced_trade_id",
-    "sig_trade_id_present",
-    # duplicates of fields already stored in fingerprint core
-    "symbol",
-    "account_label",
-    "strategy_name",
-    "timeframe",
-    "setup_type",
-    "setup_fingerprint",
-    "memory_fingerprint",
-}
-
-# Substring drops for keys that show up with varying naming styles
-_FP_DROP_SUBSTRINGS: List[str] = [
-    "order",       # orderId/orderLinkId/etc
-    "client",      # client_trade_id variants
-    "source",      # source_trade_id variants
-    "uuid",        # any uuid-ish
-    "guid",        # guid-ish
-]
-
-
-def _scrub_for_fingerprint(obj: Any, *, depth: int = 0, max_depth: int = 12) -> Any:
-    """
-    Recursively remove volatile keys from arbitrary JSON-like objects.
-    Keeps structure but strips fields that cause per-trade uniqueness.
-    """
-    if depth > max_depth:
-        return None
-
-    if isinstance(obj, dict):
-        out: Dict[str, Any] = {}
-        for k, v in obj.items():
-            try:
-                ks = str(k)
-            except Exception:
-                continue
-            kl = ks.strip().lower()
-
-            # explicit drop
-            if kl in _FP_DROP_KEYS:
-                continue
-
-            # suffix drop (catches last_close, prev_close, session_close, etc.)
-            if kl.endswith(("_close", "_open", "_high", "_low")):
-                continue
-
-            # substring drop for id-ish keys
-            if any(sub in kl for sub in _FP_DROP_SUBSTRINGS):
-                # keep "trend_dir" etc; only drop obvious id-ish substrings
-                if kl.startswith(("order", "client", "source")) or kl.endswith(("id", "uid")):
-                    continue
-
-            out[ks] = _scrub_for_fingerprint(v, depth=depth + 1, max_depth=max_depth)
-        return out
-
-    if isinstance(obj, list):
-        return [_scrub_for_fingerprint(x, depth=depth + 1, max_depth=max_depth) for x in obj]
-
-    # primitives
-    return obj
-
-
 def _filter_features_for_fingerprint(features: Dict[str, Any]) -> Dict[str, Any]:
     if not isinstance(features, dict):
         return {}
-    try:
-        scrubbed = _scrub_for_fingerprint(features)
-        return scrubbed if isinstance(scrubbed, dict) else {}
-    except Exception:
-        # fail-soft
-        f = dict(features)
-        # old minimal behavior fallback
-        for k in ("setup_fingerprint", "memory_fingerprint"):
-            f.pop(k, None)
-        return f
+    f = dict(features)
 
+    for k in (
+        "ts", "timestamp", "updated_ms",
+        "price", "last", "mark", "index",
+        "best_bid", "best_ask",
+        "orderbook", "trades",
+    ):
+        f.pop(k, None)
 
-def _extract_side(event: Dict[str, Any]) -> Optional[str]:
-    """
-    Try to recover trade side in a consistent way.
-    We want side in the fingerprint core to prevent long/short collisions.
-    """
-    if not isinstance(event, dict):
-        return None
-    payload = event.get("payload") if isinstance(event.get("payload"), dict) else {}
-    feats = payload.get("features") if isinstance(payload.get("features"), dict) else {}
-    extra = payload.get("extra") if isinstance(payload.get("extra"), dict) else {}
+    f.pop("setup_fingerprint", None)
+    f.pop("memory_fingerprint", None)
 
-    side = _safe_str(feats.get("side")) or _safe_str(extra.get("side"))
-    if not side and isinstance(feats.get("signal"), dict):
-        side = _safe_str(feats["signal"].get("side"))  # type: ignore[index]
-    if not side:
-        return None
+    return f
 
-    s = side.lower()
-    if s in ("buy", "long"):
-        return "buy"
-    if s in ("sell", "short"):
-        return "sell"
-    return s
-
-
-# ---------------------------------------------------------------------------
-# Fingerprinting
-# ---------------------------------------------------------------------------
 
 def _compute_setup_fingerprint(
     *,
@@ -382,7 +311,6 @@ def _compute_setup_fingerprint(
     strategy: str,
     setup_type: Optional[str],
     timeframe: Optional[str],
-    side: Optional[str],
     features: Dict[str, Any],
 ) -> str:
     core = {
@@ -392,7 +320,6 @@ def _compute_setup_fingerprint(
         "strategy": str(strategy),
         "setup_type": str(setup_type) if setup_type is not None else None,
         "timeframe": timeframe,
-        "side": side,
         "features": _filter_features_for_fingerprint(features),
     }
     h = hashlib.sha256()
@@ -407,7 +334,6 @@ def _compute_memory_fingerprint(
     strategy: str,
     setup_type: Optional[str],
     timeframe: Optional[str],
-    side: Optional[str],
     features: Dict[str, Any],
 ) -> str:
     core = {
@@ -416,7 +342,6 @@ def _compute_memory_fingerprint(
         "strategy": str(strategy),
         "setup_type": str(setup_type) if setup_type is not None else None,
         "timeframe": timeframe,
-        "side": side,
         "features": _filter_features_for_fingerprint(features),
     }
     h = hashlib.sha256()
@@ -452,7 +377,6 @@ def _ensure_setup_fingerprint(event: Dict[str, Any]) -> None:
     acct = _safe_str(event.get("account_label") or "main") or "main"
     strat = _safe_str(event.get("strategy") or event.get("strategy_name") or "unknown") or "unknown"
     stype = event.get("setup_type")
-    side = _extract_side(event)
     tf_final = tf
 
     if not features.get("setup_fingerprint"):
@@ -463,7 +387,6 @@ def _ensure_setup_fingerprint(event: Dict[str, Any]) -> None:
             strategy=strat,
             setup_type=str(stype) if stype is not None else None,
             timeframe=tf_final,
-            side=side,
             features=features,
         )
         features["setup_fingerprint"] = fp
@@ -475,7 +398,6 @@ def _ensure_setup_fingerprint(event: Dict[str, Any]) -> None:
             strategy=strat,
             setup_type=str(stype) if stype is not None else None,
             timeframe=tf_final,
-            side=side,
             features=features,
         )
         features["memory_fingerprint"] = mfp
@@ -485,148 +407,8 @@ def _ensure_setup_fingerprint(event: Dict[str, Any]) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Outcome fingerprinting (integrity-critical)
-# ---------------------------------------------------------------------------
-
-def _ensure_outcome_fingerprints(event: Dict[str, Any]) -> None:
-    """
-    Guarantee that outcome_record/outcome_enriched written to outcomes.jsonl carries a canonical setup_fingerprint.
-
-    Rules:
-    - If we can recover setup_fingerprint/memory_fingerprint from embedded setup/payload/extra, use it.
-    - If missing (or orphan/test outcome), synthesize a deterministic setup_fingerprint so integrity checks do not fail.
-    - Mark synthetic fingerprints via extra.synthetic_setup_fingerprint = True for downstream filtering.
-    """
-    try:
-        if not isinstance(event, dict):
-            return
-        et = event.get("event_type")
-        if et not in ("outcome_record", "outcome_enriched"):
-            return
-
-        # -------------------------
-        # outcome_enriched
-        # -------------------------
-        if et == "outcome_enriched":
-            sp = event.get("setup_fingerprint")
-            mp = event.get("memory_fingerprint")
-
-            setup = event.get("setup") if isinstance(event.get("setup"), dict) else {}
-            try:
-                setup_payload = setup.get("payload") if isinstance(setup.get("payload"), dict) else {}
-                feats = setup_payload.get("features") if isinstance(setup_payload.get("features"), dict) else {}
-                if not sp and isinstance(feats, dict):
-                    sp = feats.get("setup_fingerprint")
-                if not mp and isinstance(feats, dict):
-                    mp = feats.get("memory_fingerprint")
-            except Exception:
-                pass
-
-            extra = event.get("extra") if isinstance(event.get("extra"), dict) else {}
-            if not sp and isinstance(extra, dict):
-                sp = extra.get("setup_fingerprint")
-            if not mp and isinstance(extra, dict):
-                mp = extra.get("memory_fingerprint")
-
-            # promote to canonical
-            if sp and not event.get("setup_fingerprint"):
-                event["setup_fingerprint"] = sp
-            if mp and not event.get("memory_fingerprint"):
-                event["memory_fingerprint"] = mp
-
-            # keep in extra
-            if isinstance(extra, dict):
-                if sp and not extra.get("setup_fingerprint"):
-                    extra["setup_fingerprint"] = sp
-                if mp and not extra.get("memory_fingerprint"):
-                    extra["memory_fingerprint"] = mp
-                event["extra"] = extra
-
-            # synthesize if still missing
-            if not event.get("setup_fingerprint"):
-                tid = _safe_str(event.get("trade_id"))
-                sym = _safe_str(event.get("symbol"))
-                acct = _safe_str(event.get("account_label") or "main") or "main"
-                strat = _safe_str(event.get("strategy") or "unknown") or "unknown"
-                tf = _normalize_timeframe(event.get("timeframe")) or "unknown"
-
-                fp = _compute_setup_fingerprint(
-                    trade_id=tid,
-                    symbol=sym,
-                    account_label=acct,
-                    strategy=strat,
-                    setup_type=str(event.get("setup_type")) if event.get("setup_type") is not None else None,
-                    timeframe=tf,
-                    side=None,
-                    features={},
-                )
-                event["setup_fingerprint"] = fp
-                extra = event.get("extra") if isinstance(event.get("extra"), dict) else {}
-                extra["setup_fingerprint"] = fp
-                extra["synthetic_setup_fingerprint"] = True
-                event["extra"] = extra
-
-            return
-
-        # -------------------------
-        # outcome_record (raw)
-        # -------------------------
-        payload = event.get("payload") if isinstance(event.get("payload"), dict) else {}
-        extra = payload.get("extra") if isinstance(payload.get("extra"), dict) else {}
-
-        sp = event.get("setup_fingerprint") or payload.get("setup_fingerprint") or (
-            extra.get("setup_fingerprint") if isinstance(extra, dict) else None
-        )
-        mp = event.get("memory_fingerprint") or payload.get("memory_fingerprint") or (
-            extra.get("memory_fingerprint") if isinstance(extra, dict) else None
-        )
-
-        if sp:
-            event["setup_fingerprint"] = sp
-            payload["setup_fingerprint"] = sp
-        if mp:
-            event["memory_fingerprint"] = mp
-            payload["memory_fingerprint"] = mp
-
-        if not event.get("setup_fingerprint"):
-            tid = _safe_str(event.get("trade_id"))
-            sym = _safe_str(event.get("symbol"))
-            acct = _safe_str(event.get("account_label") or "main") or "main"
-            strat = _safe_str(event.get("strategy") or "unknown") or "unknown"
-            tf = _normalize_timeframe(event.get("timeframe"))
-            if tf is None and isinstance(extra, dict):
-                tf = _normalize_timeframe(extra.get("timeframe"))
-            tf = tf or "unknown"
-
-            fp = _compute_setup_fingerprint(
-                trade_id=tid,
-                symbol=sym,
-                account_label=acct,
-                strategy=strat,
-                setup_type=None,
-                timeframe=tf,
-                side=None,
-                features={},
-            )
-            event["setup_fingerprint"] = fp
-            payload["setup_fingerprint"] = fp
-            if isinstance(extra, dict):
-                extra["setup_fingerprint"] = fp
-                extra["synthetic_setup_fingerprint"] = True
-
-        payload["extra"] = extra if isinstance(extra, dict) else {}
-        event["payload"] = payload
-    except Exception:
-        return
-
-
-# ---------------------------------------------------------------------------
 # Policy stamping (versions + hash)
 # ---------------------------------------------------------------------------
-
-_POLICY_CACHE: Dict[str, Any] = {"policy": None, "loaded_ms": 0}
-_POLICY_CACHE_TTL_MS = 10_000
-
 
 def _safe_read_bytes(path: Path) -> bytes:
     try:
@@ -713,7 +495,7 @@ def _stamp_policy(event: Dict[str, Any]) -> None:
 
 def _decisions_file_has_trade_id(trade_id: str) -> bool:
     try:
-        tid = str(trade_id).strip()
+        tid = _safe_str(trade_id)
         if not tid:
             return False
         if not AI_DECISIONS_PATH.exists():
@@ -738,9 +520,9 @@ def _decisions_file_has_trade_id(trade_id: str) -> bool:
             if not isinstance(d, dict):
                 continue
             if tid in (
-                str(d.get("trade_id") or ""),
-                str(d.get("client_trade_id") or ""),
-                str(d.get("source_trade_id") or ""),
+                _safe_str(d.get("trade_id")),
+                _safe_str(d.get("client_trade_id")),
+                _safe_str(d.get("source_trade_id")),
             ):
                 return True
 
@@ -761,7 +543,7 @@ def _write_fallback_decision(setup_event: Dict[str, Any], reason: str) -> None:
         acct = _safe_str(setup_event.get("account_label") or "main") or "main"
         tf = _normalize_timeframe(setup_event.get("timeframe")) or "unknown"
         pol = setup_event.get("policy") if isinstance(setup_event.get("policy"), dict) else {}
-        policy_hash = str(pol.get("policy_hash") or "").strip() or None
+        policy_hash = _safe_str(pol.get("policy_hash")) or None
 
         payload: Dict[str, Any] = {
             "schema_version": 1,
@@ -798,7 +580,7 @@ def _ensure_decision_for_setup(setup_event: Dict[str, Any]) -> None:
         return
 
     try:
-        from app.bots.ai_pilot import pilot_decide
+        from app.bots.ai_pilot import pilot_decide  # type: ignore
         pilot_decide(setup_event)
     except Exception as e:
         log.warning("[phase4] pilot_decide failed for trade_id=%s: %r (writing fallback)", tid, e)
@@ -813,7 +595,7 @@ def _load_pending() -> Dict[str, Any]:
     if not PENDING_REGISTRY_PATH.exists():
         return {}
     try:
-        txt = PENDING_REGISTRY_PATH.read_text(encoding="utf-8")
+        txt = PENDING_REGISTRY_PATH.read_text(encoding="utf-8", errors="ignore")
         data = json.loads(txt or "{}")
         return data if isinstance(data, dict) else {}
     except Exception:
@@ -825,7 +607,7 @@ def _prune_pending(reg: Dict[str, Any]) -> Dict[str, Any]:
         now = _now_ms()
         max_age_ms = int(PEND_MAX_AGE_DAYS * 24 * 60 * 60 * 1000)
 
-        items = []
+        items: List[Tuple[str, int, Any]] = []
         for k, v in reg.items():
             ts = None
             if isinstance(v, dict):
@@ -847,10 +629,7 @@ def _prune_pending(reg: Dict[str, Any]) -> Dict[str, Any]:
 def _save_pending(reg: Dict[str, Any]) -> None:
     try:
         reg2 = _prune_pending(reg)
-        _atomic_write_text(
-            PENDING_REGISTRY_PATH,
-            json.dumps(reg2, indent=2, sort_keys=True),
-        )
+        _atomic_write_text(PENDING_REGISTRY_PATH, json.dumps(reg2, indent=2, sort_keys=True))
     except Exception as e:
         log.warning("[ai_events] Failed to save pending registry: %r", e)
 
@@ -888,11 +667,6 @@ def _extract_setup_alias_keys(setup_event: Dict[str, Any]) -> Set[str]:
 
 
 def _find_pending_setup(pending: Dict[str, Any], trade_id: str) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
-    """
-    Returns (setup_event, matched_key).
-    1) direct key
-    2) alias scan: find any setup whose alias set contains trade_id
-    """
     tid = _safe_str(trade_id)
     if not tid:
         return None, None
@@ -939,8 +713,6 @@ def _merge_setup_and_outcome(setup_event: Dict[str, Any], outcome_event: Dict[st
         if r_multiple is not None:
             win = r_multiple > 0
 
-        final_status = "CLOSED"
-
         enriched: Dict[str, Any] = {
             "event_type": "outcome_enriched",
             "ts": _now_ms(),
@@ -956,7 +728,7 @@ def _merge_setup_and_outcome(setup_event: Dict[str, Any], outcome_event: Dict[st
             "outcome": outcome_event,
             "extra": {
                 "is_terminal": True,
-                "final_status": final_status,
+                "final_status": "CLOSED",
                 "setup_fingerprint": (features.get("setup_fingerprint") if isinstance(features, dict) else None),
                 "memory_fingerprint": (features.get("memory_fingerprint") if isinstance(features, dict) else None),
             },
@@ -967,15 +739,6 @@ def _merge_setup_and_outcome(setup_event: Dict[str, Any], outcome_event: Dict[st
                 "is_terminal": True,
             },
         }
-
-        try:
-            if "setup_fingerprint" not in enriched:
-                enriched["setup_fingerprint"] = (enriched.get("extra") or {}).get("setup_fingerprint")
-            if "memory_fingerprint" not in enriched:
-                enriched["memory_fingerprint"] = (enriched.get("extra") or {}).get("memory_fingerprint")
-        except Exception:
-            pass
-
         return enriched
     except Exception as e:
         log.warning("[ai_events] Failed to merge setup/outcome: %r", e)
@@ -990,7 +753,7 @@ def _load_memory_snapshot() -> Dict[str, Any]:
     if not MEMORY_SNAPSHOT_PATH.exists():
         return {}
     try:
-        txt = MEMORY_SNAPSHOT_PATH.read_text(encoding="utf-8")
+        txt = MEMORY_SNAPSHOT_PATH.read_text(encoding="utf-8", errors="ignore")
         data = json.loads(txt or "{}")
         return data if isinstance(data, dict) else {}
     except Exception:
@@ -1024,23 +787,24 @@ def _prune_memory_snapshot(snapshot: Dict[str, Any]) -> Dict[str, Any]:
 def _save_memory_snapshot(snapshot: Dict[str, Any]) -> None:
     try:
         snap2 = _prune_memory_snapshot(snapshot)
-        _atomic_write_text(
-            MEMORY_SNAPSHOT_PATH,
-            json.dumps(snap2, indent=2, sort_keys=True),
-        )
+        _atomic_write_text(MEMORY_SNAPSHOT_PATH, json.dumps(snap2, indent=2, sort_keys=True))
     except Exception as e:
         log.warning("[ai_memory] Failed to save snapshot: %r", e)
 
 
 def _compute_memory_id(memory_fingerprint: str, policy_hash: str, account_scope: str, symbol_scope: str, timeframe: str) -> str:
     h = hashlib.sha256()
-    h.update(_stable_json({
-        "memory_fingerprint": memory_fingerprint,
-        "policy_hash": policy_hash,
-        "account_scope": account_scope,
-        "symbol_scope": symbol_scope,
-        "timeframe": timeframe,
-    }).encode("utf-8", errors="ignore"))
+    h.update(
+        _stable_json(
+            {
+                "memory_fingerprint": memory_fingerprint,
+                "policy_hash": policy_hash,
+                "account_scope": account_scope,
+                "symbol_scope": symbol_scope,
+                "timeframe": timeframe,
+            }
+        ).encode("utf-8", errors="ignore")
+    )
     return h.hexdigest()
 
 
@@ -1139,20 +903,17 @@ def _emit_memory_from_enriched(enriched: Dict[str, Any]) -> None:
 
         setup = enriched.get("setup") if isinstance(enriched.get("setup"), dict) else {}
         policy = enriched.get("policy") if isinstance(enriched.get("policy"), dict) else {}
-        policy_hash = str(policy.get("policy_hash") or "").strip()
+        policy_hash = _safe_str(policy.get("policy_hash"))
 
         setup_payload = setup.get("payload") if isinstance(setup.get("payload"), dict) else {}
         features = setup_payload.get("features") if isinstance(setup_payload.get("features"), dict) else {}
 
-        setup_fp = str((features.get("setup_fingerprint") if isinstance(features, dict) else "") or "").strip()
-        mem_fp = str((features.get("memory_fingerprint") if isinstance(features, dict) else "") or "").strip()
+        setup_fp = _safe_str(features.get("setup_fingerprint"))
+        mem_fp = _safe_str(features.get("memory_fingerprint"))
 
         tf = _normalize_timeframe(enriched.get("timeframe") or setup.get("timeframe")) or "unknown"
 
-        symbol = str(enriched.get("symbol") or setup.get("symbol") or "").strip().upper()
-        if not symbol:
-            symbol = "UNKNOWN"
-
+        symbol = _safe_str(enriched.get("symbol") or setup.get("symbol")).upper() or "UNKNOWN"
         account_scope = "global"
 
         if not mem_fp or not policy_hash:
@@ -1210,10 +971,42 @@ def _emit_memory_from_enriched(enriched: Dict[str, Any]) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Publisher
+# Inbox routing helpers (lane-safe) for producers
 # ---------------------------------------------------------------------------
 
+_LABEL_SAFE_RE = re.compile(r"^[a-z0-9_]+$")
+
+
+def _normalize_label(v: str) -> str:
+    v = (v or "").strip().lower()
+    if v in ("", "main", "global"):
+        return ""
+    return v
+
+
+def _inbox_path_for_label(label: str) -> Path:
+    lab = _normalize_label(label)
+    if not lab:
+        return (STATE_DIR / "ai_events_inbox.jsonl")
+    return (STATE_DIR / f"ai_events_inbox_{lab}.jsonl")
+
+
+def _resolve_inbox_target_for_event(event: Dict[str, Any]) -> Path:
+    try:
+        evt_lab = _normalize_label(str(event.get("account_label") or event.get("label") or ""))
+        if evt_lab and _LABEL_SAFE_RE.match(evt_lab):
+            return _inbox_path_for_label(evt_lab)
+        return AI_EVENTS_INBOX_PATH
+    except Exception:
+        return AI_EVENTS_INBOX_PATH
+
+
 def publish_ai_event(event: Dict[str, Any]) -> None:
+    """
+    Producer-safe enqueue.
+    Writes to the appropriate inbox file. Does NOT do merges/reconciliation.
+    The spine process drains + processes.
+    """
     if not isinstance(event, dict):
         return
     if "event_type" not in event:
@@ -1221,42 +1014,33 @@ def publish_ai_event(event: Dict[str, Any]) -> None:
     if "ts" not in event:
         event["ts"] = _now_ms()
 
+    try:
+        target = _resolve_inbox_target_for_event(event)
+        _append_jsonl(target, event)
+    except Exception:
+        return
+
+
+# ---------------------------------------------------------------------------
+# Consumer: processing events drained from inbox
+# ---------------------------------------------------------------------------
+
+def _handle_event(event: Dict[str, Any]) -> None:
+    if not isinstance(event, dict):
+        return
+    etype = event.get("event_type")
+    if not etype:
+        return
+
+    # Stamp + fingerprint for setup events (consumer side)
     _stamp_policy(event)
     _ensure_setup_fingerprint(event)
 
-    etype = event.get("event_type")
-    # Guardrail: drop taxonomy-unknown setup_context at the source.
-    # If this ever hits disk, training data is contaminated.
-    try:
-        if str(etype or "").strip().lower() == "setup_context":
-            st = (
-                event.get("setup_type")
-                or ((event.get("payload") or {}).get("setup_type") if isinstance(event.get("payload"), dict) else None)
-                or (
-                    (((event.get("payload") or {}).get("features") or {}).get("setup_type"))
-                    if isinstance((event.get("payload") or {}).get("features"), dict)
-                    else None
-                )
-            )
-            if str(st or "").strip().lower() == "unknown":
-                try:
-                    log.warning(
-                        "spine_drop_unknown_setup: trade_id=%s symbol=%s account=%s",
-                        event.get("trade_id"),
-                        event.get("symbol"),
-                        event.get("account_label"),
-                    )
-                except Exception:
-                    pass
-                return
-    except Exception:
-        # Fail-soft: never crash publisher
-        pass
-
+    # Ledger append first (truth source)
+    _append_jsonl(SPINE_EVENTS_PATH, event)
 
     if etype == "setup_context":
         _append_jsonl(SETUPS_PATH, event)
-
         _ensure_decision_for_setup(event)
 
         trade_id = event.get("trade_id")
@@ -1278,36 +1062,97 @@ def publish_ai_event(event: Dict[str, Any]) -> None:
                 pending = _load_pending()
                 setup_evt, _matched_key = _find_pending_setup(pending, str(trade_id))
             except Exception:
-                setup_evt, _matched_key = (None, None)
+                setup_evt = None
 
             if setup_evt:
                 enriched = _merge_setup_and_outcome(setup_evt, event)
-                _ensure_outcome_fingerprints(enriched)
                 _append_jsonl(OUTCOMES_PATH, enriched)
                 _emit_memory_from_enriched(enriched)
 
                 try:
-                    _remove_pending_setup(pending, setup_evt)
-                    _save_pending(pending)
+                    pending2 = _load_pending()
+                    _remove_pending_setup(pending2, setup_evt)
+                    _save_pending(pending2)
                 except Exception as e:
                     log.warning("[ai_events] Failed to remove trade_id=%r from pending registry: %r", trade_id, e)
             else:
-                # orphan: never write raw outcome_record into outcomes.jsonl
-                _ensure_outcome_fingerprints(event)
-                _append_jsonl(OUTCOMES_ORPHANS_PATH, event)
-
+                _append_jsonl(OUTCOMES_PATH, event)
         else:
-            # missing trade_id => orphan by definition
-            _append_jsonl(OUTCOMES_ORPHANS_PATH, event)
+            _append_jsonl(OUTCOMES_PATH, event)
 
+    # best-effort bus publish (for in-proc dashboards/tests)
     try:
         ai_events_bus.append(event)
     except Exception:
         pass
 
 
+def _drain_inbox_once(drain_max: int = 10_000) -> int:
+    """
+    Drains up to drain_max events from the inbox starting at cursor byte position.
+    Cursor is a byte offset into the inbox file.
+    Bad JSON lines are quarantined into AI_EVENTS_INBOX_BADLINES_PATH.
+    """
+    inbox = AI_EVENTS_INBOX_PATH
+    if not inbox.exists():
+        return 0
+
+    cursor_path = AI_EVENTS_INBOX_CURSOR_PATH
+    pos = _read_cursor(cursor_path)
+
+    drained = 0
+    bad = 0
+
+    try:
+        with inbox.open("rb") as f:
+            f.seek(max(0, pos))
+            while drained < drain_max:
+                line_pos = f.tell()
+                raw = f.readline()
+                if not raw:
+                    break
+
+                raw_stripped = raw.strip()
+                if not raw_stripped:
+                    _write_cursor(cursor_path, f.tell())
+                    pos = f.tell()
+                    continue
+
+                try:
+                    evt = orjson.loads(raw_stripped)
+                    if not isinstance(evt, dict):
+                        raise ValueError("non-dict event")
+                except Exception as e:
+                    bad += 1
+                    _append_jsonl(AI_EVENTS_INBOX_BADLINES_PATH, {
+                        "ts": _now_ms(),
+                        "account_label": ACCOUNT_LABEL,
+                        "error": repr(e),
+                        "raw": raw_stripped.decode("utf-8", errors="replace")[:4000],
+                        "inbox": str(inbox),
+                        "offset": int(line_pos),
+                    })
+                    _write_cursor(cursor_path, f.tell())
+                    pos = f.tell()
+                    continue
+
+                _handle_event(evt)
+                drained += 1
+                _write_cursor(cursor_path, f.tell())
+                pos = f.tell()
+
+    except Exception as e:
+        log.warning("[ai_events_spine] drain failed: %r", e)
+        return drained
+
+    if bad:
+        log.warning("[ai_events_spine] quarantined %d bad inbox lines for %s", bad, ACCOUNT_LABEL)
+
+    return drained
+
+
 # ---------------------------------------------------------------------------
-# Builders
+# Builders (kept for compatibility)
 # ---------------------------------------------------------------------------
 
 def build_setup_context(
@@ -1322,16 +1167,8 @@ def build_setup_context(
     ai_profile: Optional[str] = None,
     extra: Optional[Dict[str, Any]] = None,
 ) -> SetupRecord:
-    # Enforce valid-shape contract: setup_type + timeframe must exist & be non-empty
-    st = _coerce_setup_type(setup_type)
-
     tf = _normalize_timeframe(timeframe)
-    if tf is None and isinstance(extra, dict):
-        tf = _normalize_timeframe(extra.get("timeframe"))
-    if tf is None:
-        tf = "unknown"
 
-    feats = features if isinstance(features, dict) else {}
     payload: SetupRecord = {
         "event_type": "setup_context",
         "ts": _now_ms(),
@@ -1339,17 +1176,20 @@ def build_setup_context(
         "symbol": symbol,
         "account_label": account_label,
         "strategy": strategy,
-        "setup_type": st,
-        "timeframe": tf,
-        "payload": {"features": feats or {}},
+        "payload": {"features": features or {}},
     }
 
+    if setup_type is not None:
+        payload["setup_type"] = setup_type
+    if tf is not None:
+        payload["timeframe"] = tf
     if ai_profile is not None:
         payload["ai_profile"] = ai_profile
 
     if extra or tf is not None:
         payload_extra = dict(extra or {})
-        payload_extra["timeframe"] = tf
+        if tf is not None:
+            payload_extra["timeframe"] = tf
         payload["payload"]["extra"] = payload_extra
 
     _stamp_policy(payload)  # type: ignore[arg-type]
@@ -1362,38 +1202,20 @@ def build_outcome_record(
     trade_id: str,
     symbol: str,
     account_label: str,
-    strategy: str = "",
-    pnl_usd: float = 0.0,
+    strategy: str,
+    pnl_usd: float,
     r_multiple: Optional[float] = None,
     win: Optional[bool] = None,
     exit_reason: Optional[str] = None,
     extra: Optional[Dict[str, Any]] = None,
-    # --- backward-compat inputs (legacy producers) ---
-    strategy_name: Optional[str] = None,
-    timeframe: Optional[str] = None,
-    # swallow anything else without exploding the pipeline
-    **_ignored: Any,
 ) -> OutcomeRecord:
-    """
-    Backward-compatible OutcomeRecord builder.
-
-    Canonical fields:
-      - strategy (preferred)
-    Compatibility:
-      - strategy_name -> strategy (only if strategy not provided)
-      - timeframe is stored top-level and also echoed into payload.extra["timeframe"]
-      - extra dict is preserved
-      - unknown kwargs are ignored safely
-    """
-    strat = _safe_str(strategy) or _safe_str(strategy_name) or "unknown"
-
     payload: OutcomeRecord = {
         "event_type": "outcome_record",
         "ts": _now_ms(),
         "trade_id": trade_id,
         "symbol": symbol,
         "account_label": account_label,
-        "strategy": strat,
+        "strategy": strategy,
         "payload": {
             "pnl_usd": float(pnl_usd),
             "r_multiple": float(r_multiple) if r_multiple is not None else None,
@@ -1402,74 +1224,73 @@ def build_outcome_record(
         },
     }
 
-    # Optional timeframe
-    tf = _normalize_timeframe(timeframe)
-    if tf is not None:
-        payload["timeframe"] = tf
-
-    # Preserve/merge extra
-    ex = dict(extra or {})
-    if tf is not None and "timeframe" not in ex:
-        ex["timeframe"] = tf
-
-    if ex:
-        payload["payload"]["extra"] = ex
+    if extra:
+        payload["payload"]["extra"] = extra
 
     _stamp_policy(payload)  # type: ignore[arg-type]
     return payload
-def _env_bool(name: str, default: str = "true") -> bool:
-    raw = str(os.getenv(name, default)).strip().lower()
-    return raw in ("1", "true", "yes", "y", "on")
 
 
-def run_once_tick() -> None:
-    """Phase 8: deterministic single tick for health refresh + orchestration."""
-    try:
-        record_heartbeat("ai_events_spine")
-    except Exception:
-        pass
+# ---------------------------------------------------------------------------
+# Main loop
+# ---------------------------------------------------------------------------
 
-    # Refresh memory snapshot mtime safely (schema stays dict-of-records)
-    try:
-        if _env_bool("AI_EVENTS_SPINE_TICK_MEMORY_SNAPSHOT", "true"):
-            snap = _load_memory_snapshot()
-            _save_memory_snapshot(snap)
-    except Exception as e:
-        try:
-            log.warning("[ai_events_spine] tick memory_snapshot failed: %r", e)
-        except Exception:
-            pass
-
-    # Prune pending registry (keeps it bounded + refreshes file mtime)
-    try:
-        if _env_bool("AI_EVENTS_SPINE_TICK_PENDING", "true"):
-            reg = _load_pending()
-            _save_pending(reg)
-    except Exception as e:
-        try:
-            log.warning("[ai_events_spine] tick pending failed: %r", e)
-        except Exception:
-            pass
-
-
-def loop(interval_sec: float = 10.0) -> None:
-    log.info("AI Events Spine loop started (disk logger + heartbeat, v2.8.2).")
-    while True:
-        run_once_tick()
-        time.sleep(max(0.5, float(interval_sec)))
+def _parse_args() -> argparse.Namespace:
+    ap = argparse.ArgumentParser(description="Flashback AI Events Spine (inbox drainer + disk ledger)")
+    ap.add_argument("--once", action="store_true", help="Drain once then exit")
+    ap.add_argument("--sleep", type=float, default=float(os.getenv("SPINE_SLEEP_SECS", "1.0") or "1.0"),
+                    help="Loop sleep seconds (default 1.0)")
+    ap.add_argument("--drain-max", type=int, default=int(os.getenv("SPINE_DRAIN_MAX", "10000") or "10000"),
+                    help="Max events to drain per tick")
+    ap.add_argument("--heartbeat-secs", type=float, default=float(os.getenv("SPINE_HEARTBEAT_SECS", "10") or "10"),
+                    help="Heartbeat interval seconds (default 10)")
+    return ap.parse_args()
 
 
 def main() -> None:
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--once", action="store_true", help="Run one ops tick (heartbeat + snapshot refresh) and exit")
-    ap.add_argument("--interval", type=float, default=float(os.getenv("AI_EVENTS_SPINE_INTERVAL", "10") or "10"), help="Loop interval seconds")
-    args = ap.parse_args()
+    args = _parse_args()
+
+    log.info(
+        "AI Events Spine started v3.0.0 | label=%s | inbox=%s | cursor=%s | events_dir=%s",
+        ACCOUNT_LABEL,
+        str(AI_EVENTS_INBOX_PATH),
+        str(AI_EVENTS_INBOX_CURSOR_PATH),
+        str(AI_EVENTS_DIR),
+    )
+
+    last_hb = 0.0
+
+    def tick() -> int:
+        return _drain_inbox_once(drain_max=int(args.drain_max))
 
     if args.once:
-        run_once_tick()
+        drained = tick()
+        now = time.time()
+        if (now - last_hb) >= float(args.heartbeat_secs):
+            try:
+                record_heartbeat("ai_events_spine")
+            except Exception:
+                pass
+        log.info("AI Events Spine --once drained=%d", drained)
         return
 
-    loop(interval_sec=float(args.interval))
+    while True:
+        try:
+            drained = tick()
+            if drained:
+                log.info("drained=%d (label=%s)", drained, ACCOUNT_LABEL)
+        except Exception as e:
+            log.warning("[ai_events_spine] tick exception: %r", e)
+
+        now = time.time()
+        if (now - last_hb) >= float(args.heartbeat_secs):
+            last_hb = now
+            try:
+                record_heartbeat("ai_events_spine")
+            except Exception:
+                pass
+
+        time.sleep(float(args.sleep))
 
 
 if __name__ == "__main__":

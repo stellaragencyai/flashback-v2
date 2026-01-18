@@ -1,0 +1,440 @@
+﻿import json
+import os
+import time
+from pathlib import Path
+from typing import Any, Dict, List, Optional
+
+# ------------------------------------------------------------
+# Pathing: ALWAYS anchor from repo root (C:\Flashback)
+# ------------------------------------------------------------
+_THIS_FILE = Path(__file__).resolve()
+REPO_ROOT = _THIS_FILE.parents[2]  # ...\Flashback
+STATE_ROOT = REPO_ROOT / "state"
+STATE_APP = REPO_ROOT / "app" / "state"  # legacy / existing in your repo
+
+OUTCOMES_V1 = STATE_ROOT / "ai_events" / "outcomes.v1.jsonl"
+
+# Some of your state lives under app/state (subaccounts_state.json)
+SUBACCOUNTS_STATE_CANDIDATES = [
+    STATE_APP / "subaccounts_state.json",
+    STATE_ROOT / "subaccounts_state.json",
+]
+GOV_STATE_CANDIDATES = [
+    STATE_APP / "governance_state.json",
+    STATE_ROOT / "governance_state.json",
+]
+
+SCHEMA_VERSION = 3
+
+# TTL used for ONLINE determination (supervisor freshness)
+ONLINE_TTL_SEC = float(os.getenv("SUBACCOUNTS_ONLINE_TTL_SEC", "60"))
+
+# These are "critical" for live trading integrity. If dead while AI stack is enabled => RED.
+CRITICAL_WORKERS = {
+    "ws_switchboard",
+    "trade_outcomes",
+    "tp_sl_manager",
+    "risk_daemon",
+}
+# "noncritical" can degrade UX/learning but isn't immediate execution-kill
+NONCRITICAL_WORKERS = {
+    "ai_pilot",
+    "ai_action_router",
+    "paper_price_feeder",
+    "ai_journal",
+}
+
+
+def _now_ms() -> int:
+    return int(time.time() * 1000)
+
+
+def _safe_read_json(path: Path) -> Dict[str, Any]:
+    if not path.exists():
+        return {}
+    try:
+        return json.loads(path.read_text(encoding="utf-8", errors="ignore"))
+    except Exception:
+        return {}
+
+
+def _pick_first_existing(candidates: List[Path]) -> Optional[Path]:
+    for p in candidates:
+        try:
+            if p.exists():
+                return p
+        except Exception:
+            continue
+    return None
+
+
+def _iter_jsonl(path: Path):
+    if not path.exists():
+        return
+    try:
+        with path.open("r", encoding="utf-8", errors="ignore") as f:
+            for line in f:
+                line = (line or "").strip()
+                if not line:
+                    continue
+                try:
+                    obj = json.loads(line)
+                except Exception:
+                    continue
+                if isinstance(obj, dict):
+                    yield obj
+    except Exception:
+        return
+
+
+def _parse_window_to_start_ms(window: str, now_ms: int) -> Optional[int]:
+    """
+    Returns start_ms (inclusive) or None for 'all'.
+    """
+    w = (window or "all").strip().lower()
+    if w in ("all", "full", "max", ""):
+        return None
+    if w == "7d":
+        return now_ms - 7 * 86400 * 1000
+    if w == "30d":
+        return now_ms - 30 * 86400 * 1000
+    if w == "1y":
+        return now_ms - 365 * 86400 * 1000
+    # Unknown window -> treat as all (fail-soft)
+    return None
+
+
+def _load_outcomes_stats(window: str) -> Dict[str, Dict[str, Any]]:
+    """
+    Outcomes-backed stats keyed by account_label.
+    Filters by window using closed_ts_ms (preferred) then ts_ms.
+    """
+    now = _now_ms()
+    start_ms = _parse_window_to_start_ms(window, now)
+
+    stats: Dict[str, Dict[str, Any]] = {}
+
+    for row in _iter_jsonl(OUTCOMES_V1):
+        if row.get("schema_version") != "outcome.v1":
+            continue
+
+        acct = row.get("account_label")
+        if not isinstance(acct, str) or not acct.strip():
+            continue
+        acct = acct.strip()
+
+        ts = row.get("closed_ts_ms") or row.get("ts_ms") or 0
+        try:
+            ts_i = int(ts)
+        except Exception:
+            ts_i = 0
+
+        if start_ms is not None and ts_i < start_ms:
+            continue
+
+        try:
+            pnl = float(row.get("pnl_usd") or 0.0)
+        except Exception:
+            pnl = 0.0
+
+        try:
+            fees = float(row.get("fees_usd") or 0.0)
+        except Exception:
+            fees = 0.0
+
+        s = stats.get(acct)
+        if s is None:
+            s = {
+                "total": 0,
+                "wins": 0,
+                "losses": 0,
+                "pnl_usd_total": 0.0,
+                "fees_usd_total": 0.0,
+                "last_ts_ms": 0,
+            }
+            stats[acct] = s
+
+        s["total"] += 1
+        if pnl > 0:
+            s["wins"] += 1
+        elif pnl < 0:
+            s["losses"] += 1
+
+        s["pnl_usd_total"] += pnl
+        s["fees_usd_total"] += fees
+        if ts_i > int(s.get("last_ts_ms", 0) or 0):
+            s["last_ts_ms"] = ts_i
+
+    # finalize derived fields
+    for acct, s in stats.items():
+        t = int(s.get("total", 0) or 0)
+        w = int(s.get("wins", 0) or 0)
+        pnl_total = float(s.get("pnl_usd_total", 0.0) or 0.0)
+        last_ts = int(s.get("last_ts_ms", 0) or 0)
+
+        win_rate = (w / t) if t > 0 else 0.0  # 0..1
+        s["win_rate"] = win_rate
+        s["win_rate_pct"] = round(win_rate * 100.0, 2)
+        s["pnl_usd_avg"] = (pnl_total / t) if t > 0 else 0.0
+        s["outcomes_last_ts_iso"] = (
+            time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(last_ts / 1000.0))
+            if last_ts > 0
+            else None
+        )
+        s["outcomes_freshness_sec"] = round((now - last_ts) / 1000.0, 3) if last_ts > 0 else None
+
+        # LTM: trades in last 24h (independent of window)
+        s["ltm_trades_24h"] = 0
+
+    # LTM pass (last 24h)
+    ltm_start = now - 24 * 3600 * 1000
+    for row in _iter_jsonl(OUTCOMES_V1):
+        if row.get("schema_version") != "outcome.v1":
+            continue
+        acct = row.get("account_label")
+        if not isinstance(acct, str) or not acct.strip():
+            continue
+        acct = acct.strip()
+
+        ts = row.get("closed_ts_ms") or row.get("ts_ms") or 0
+        try:
+            ts_i = int(ts)
+        except Exception:
+            ts_i = 0
+        if ts_i < ltm_start:
+            continue
+
+        if acct in stats:
+            stats[acct]["ltm_trades_24h"] = int(stats[acct].get("ltm_trades_24h", 0) or 0) + 1
+        else:
+            stats[acct] = {
+                "total": 0,
+                "wins": 0,
+                "losses": 0,
+                "pnl_usd_total": 0.0,
+                "fees_usd_total": 0.0,
+                "last_ts_ms": 0,
+                "win_rate": 0.0,
+                "win_rate_pct": 0.0,
+                "pnl_usd_avg": 0.0,
+                "outcomes_last_ts_iso": None,
+                "outcomes_freshness_sec": None,
+                "ltm_trades_24h": 1,
+            }
+
+    return stats
+
+
+def _load_subaccounts_state() -> List[Dict[str, Any]]:
+    state_path = _pick_first_existing(SUBACCOUNTS_STATE_CANDIDATES)
+    if not state_path:
+        return []
+
+    state = _safe_read_json(state_path)
+    subs = state.get("subaccounts", [])
+    return subs if isinstance(subs, list) else []
+
+
+def _merge_governance(subaccounts: List[Dict[str, Any]]) -> None:
+    gov_path = _pick_first_existing(GOV_STATE_CANDIDATES)
+    if not gov_path:
+        return
+    gov = _safe_read_json(gov_path).get("districts", {})
+    if not isinstance(gov, dict):
+        return
+
+    for sa in subaccounts:
+        try:
+            gid = sa.get("subaccount_uid")
+            if gid and gid in gov and isinstance(gov[gid], dict):
+                sa.update(gov[gid])
+        except Exception:
+            continue
+
+
+def _compute_online(enable_ai_stack: bool, enabled: bool, supervisor_ok: Any, supervisor_age_sec: Any, critical_dead: List[str], workers_running: int) -> bool:
+    """
+    Truth rules:
+    - If AI stack enabled: online = supervisor_ok true AND supervisor_age_sec <= TTL AND no critical worker dead
+    - If AI stack disabled (manual/main): online = enabled AND workers_running > 0
+    """
+    if not enable_ai_stack:
+        return bool(enabled) and int(workers_running or 0) > 0
+
+    try:
+        ok = bool(supervisor_ok)
+        age = float(supervisor_age_sec)
+    except Exception:
+        return False
+    if not ok:
+        return False
+    if age > ONLINE_TTL_SEC:
+        return False
+    if critical_dead:
+        return False
+    return True
+
+
+def _dead_worker_sets(workers_dead: Any) -> (List[str], List[str], List[str]):
+    """
+    Returns (all_dead, critical_dead, noncritical_dead) as lists.
+    """
+    dead_list: List[str] = []
+    if isinstance(workers_dead, list):
+        dead_list = [str(x) for x in workers_dead if str(x).strip()]
+
+    critical = [w for w in dead_list if w in CRITICAL_WORKERS]
+    noncritical = [w for w in dead_list if w in NONCRITICAL_WORKERS and w not in critical]
+    return dead_list, critical, noncritical
+
+
+def _status_tier_and_reason(enable_ai_stack: bool, enabled: bool, supervisor_ok: Any, supervisor_age_sec: Any, critical_dead: List[str], noncritical_dead: List[str]) -> (str, str):
+    """
+    Tier mapping (deterministic):
+    - If account disabled: GRAY / DISABLED
+    - If AI stack disabled: GREEN if enabled else GRAY (do NOT punish with supervisor down)
+    - AI stack enabled:
+        RED: supervisor_ok False OR critical_dead non-empty
+        YELLOW: supervisor_ok True but age > TTL OR noncritical_dead non-empty
+        GREEN: ok True, age <= TTL, no critical dead
+        GRAY: fallback
+    """
+    if not bool(enabled):
+        return ("gray", "DISABLED")
+
+    if not enable_ai_stack:
+        return ("green", "MANUAL_MODE")  # main/manual uses workers, not supervisor
+
+    ok = bool(supervisor_ok) if supervisor_ok is not None else False
+    age = None
+    try:
+        age = float(supervisor_age_sec) if supervisor_age_sec is not None else None
+    except Exception:
+        age = None
+
+    if critical_dead:
+        return ("red", "CRITICAL_WORKER_DEAD:" + ",".join(critical_dead))
+
+    if supervisor_ok is False:
+        return ("red", "SUPERVISOR_DOWN")
+
+    if ok and age is not None and age > ONLINE_TTL_SEC:
+        return ("yellow", f"SUPERVISOR_STALE:{age:.1f}s")
+
+    if noncritical_dead:
+        return ("yellow", "NONCRITICAL_WORKER_DEAD:" + ",".join(noncritical_dead))
+
+    if ok and age is not None and age <= ONLINE_TTL_SEC:
+        return ("green", "OK")
+
+    return ("gray", "UNKNOWN")
+
+
+def hydrate_dashboard_rows(window: str = "all") -> List[Dict[str, Any]]:
+    """
+    Dashboard rows hydrator.
+    Base truth = subaccounts_state.json (identity + workers + mode + role).
+    Canonical trade stats = outcomes.v1.jsonl (filtered by window).
+    """
+    now = _now_ms()
+    subs = _load_subaccounts_state()
+    _merge_governance(subs)
+
+    outcomes = _load_outcomes_stats(window)
+
+    rows: List[Dict[str, Any]] = []
+
+    for sa in subs:
+        uid = sa.get("subaccount_uid") or sa.get("subaccount_name") or sa.get("account_label") or "unknown"
+        uid = str(uid)
+
+        o = outcomes.get(uid, {})
+
+        supervisor_ok = sa.get("supervisor_ok", None)
+        supervisor_age = sa.get("supervisor_age_sec", None)
+
+        enabled = bool(sa.get("enabled", False))
+        enable_ai_stack = bool(sa.get("enable_ai_stack", False))
+
+        workers_running = int(sa.get("workers_running", 0) or 0)
+        workers_dead_raw = sa.get("workers_dead") or []
+        workers_dead_all, critical_dead, noncritical_dead = _dead_worker_sets(workers_dead_raw)
+
+        is_online = _compute_online(
+            enable_ai_stack=enable_ai_stack,
+            enabled=enabled,
+            supervisor_ok=supervisor_ok,
+            supervisor_age_sec=supervisor_age,
+            critical_dead=critical_dead,
+            workers_running=workers_running,
+        )
+
+        status_tier, status_reason = _status_tier_and_reason(
+            enable_ai_stack=enable_ai_stack,
+            enabled=enabled,
+            supervisor_ok=supervisor_ok,
+            supervisor_age_sec=supervisor_age,
+            critical_dead=critical_dead,
+            noncritical_dead=noncritical_dead,
+        )
+
+        total_trades = int(o.get("total", 0) or 0)
+        win_rate = float(o.get("win_rate", 0.0) or 0.0)  # 0..1
+        pnl_total = float(o.get("pnl_usd_total", 0.0) or 0.0)
+
+        row = {
+            # Identifiers (template-friendly)
+            "account": uid,
+            "account_label": uid,
+
+            # Strategy / mode / role
+            "strategy": sa.get("current_strategy") or sa.get("strategy_name") or "unknown",
+            "automation_mode": sa.get("automation_mode") or "unknown",
+            "role": sa.get("role") or "unknown",
+
+            # Online/offline truth
+            "online_ttl_sec": ONLINE_TTL_SEC,
+            "is_online": is_online,
+            "status": "online" if is_online else "offline",
+            "status_tier": status_tier,
+            "status_reason": status_reason,
+            "supervisor_ok": (bool(supervisor_ok) if supervisor_ok is not None else None),
+            "supervisor_age_sec": supervisor_age,
+
+            # Workers
+            "workers_running": workers_running,
+            "workers_enabled": sa.get("workers_enabled") or [],
+            "workers_dead": workers_dead_all,
+            "critical_workers_dead": critical_dead,
+            "noncritical_workers_dead": noncritical_dead,
+            "workers": sa.get("workers") or {},
+
+            # Account metrics (best effort)
+            "balance": float(sa.get("balance", 0.0) or 0.0),
+            "n_bucket": int(sa.get("n_bucket", 0) or 0),
+            "autonomy_ready": bool(sa.get("autonomy_ready", False)),
+            "telegram_enabled": bool(sa.get("telegram_enabled", False)),
+            "enabled": enabled,
+            "enable_ai_stack": enable_ai_stack,
+
+            # Outcomes-backed trade stats (windowed)
+            "total_trades": total_trades,
+            "win_rate": win_rate,  # 0..1
+            "win_rate_pct": float(o.get("win_rate_pct", round(win_rate * 100.0, 2)) if total_trades else 0.0),
+            "pnl_usd_total": pnl_total,
+            "pnl_usd_avg": float(o.get("pnl_usd_avg", 0.0) or 0.0),
+            "outcomes_last_ts_iso": o.get("outcomes_last_ts_iso", None),
+            "outcomes_freshness_sec": o.get("outcomes_freshness_sec", None),
+
+            # Learning throughput proxy
+            "ltm_trades_24h": int(o.get("ltm_trades_24h", 0) or 0),
+
+            # Metadata
+            "window": (window or "all").lower(),
+            "updated_ms": now,
+            "schema_version": SCHEMA_VERSION,
+        }
+
+        rows.append(row)
+
+    return rows

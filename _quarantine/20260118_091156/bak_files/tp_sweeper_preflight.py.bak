@@ -1,0 +1,289 @@
+# -*- coding: utf-8 -*-
+"""
+TP Sweeper Preflight Validator (Windows)
+
+Checks:
+1) Loads C:\Flashback\.env (dotenv)
+2) Expands ${VAR} references (simple expansion)
+3) Ensures required vars exist
+4) Telegram sendMessage test
+5) Bybit auth test (wallet balance)
+6) Sub UID + accountType probe: which accountType works for each sub?
+7) Optional: transfer endpoint sanity (dry-run by default)
+
+Usage (PowerShell):
+python "C:\Flashback\tools\tp_sweeper_preflight.py"
+
+Optional env overrides:
+PREFLIGHT_ENV_PATH=C:\Flashback\.env
+PREFLIGHT_COIN=USDT
+PREFLIGHT_TEST_TRANSFER=0  (default 0)
+PREFLIGHT_TEST_AMOUNT=0.01 (only used if PREFLIGHT_TEST_TRANSFER=1)
+PREFLIGHT_FROM_ACCOUNT_TYPE=UNIFIED
+PREFLIGHT_TO_ACCOUNT_TYPE=UNIFIED
+"""
+
+from __future__ import annotations
+
+import os
+import re
+import sys
+import uuid
+from typing import Dict, List, Tuple, Any
+
+import requests
+from pybit.unified_trading import HTTP
+
+try:
+    from dotenv import load_dotenv  # type: ignore
+except Exception:
+    print("[FATAL] python-dotenv not installed. Run: python -m pip install python-dotenv")
+    raise
+
+
+ENV_PATH = os.environ.get("PREFLIGHT_ENV_PATH", r"C:\Flashback\.env")
+COIN = os.environ.get("PREFLIGHT_COIN", "USDT")
+
+FROM_ACCOUNT_TYPE = os.environ.get("PREFLIGHT_FROM_ACCOUNT_TYPE", "UNIFIED")
+TO_ACCOUNT_TYPE = os.environ.get("PREFLIGHT_TO_ACCOUNT_TYPE", "UNIFIED")
+
+TEST_TRANSFER = os.environ.get("PREFLIGHT_TEST_TRANSFER", "0").strip() == "1"
+TEST_AMOUNT = os.environ.get("PREFLIGHT_TEST_AMOUNT", "0.01").strip()
+
+RR_ORDER = [1, 2, 4, 5, 6, 7, 8, 9]
+
+
+def die(msg: str, code: int = 1) -> None:
+    print(f"[FATAL] {msg}", flush=True)
+    raise SystemExit(code)
+
+
+def info(msg: str) -> None:
+    print(f"[INFO] {msg}", flush=True)
+
+
+def ok(msg: str) -> None:
+    print(f"[OK] {msg}", flush=True)
+
+
+def warn(msg: str) -> None:
+    print(f"[WARN] {msg}", flush=True)
+
+
+def expand_env_vars_once(value: str, env: Dict[str, str]) -> str:
+    # Expand ${NAME} once (not recursive loops forever)
+    def repl(m: re.Match) -> str:
+        k = m.group(1)
+        return env.get(k, "")
+
+    return re.sub(r"\$\{([A-Za-z0-9_]+)\}", repl, value)
+
+
+def expand_all_placeholders(max_passes: int = 3) -> None:
+    # Expand ${VARS} for every env var we care about
+    # (dotenv loads them literally; we want the expanded value for validation)
+    env_snapshot = dict(os.environ)
+    for _ in range(max_passes):
+        changed = False
+        for k, v in list(env_snapshot.items()):
+            if isinstance(v, str) and "${" in v:
+                nv = expand_env_vars_once(v, env_snapshot)
+                if nv != v:
+                    env_snapshot[k] = nv
+                    changed = True
+        if not changed:
+            break
+    # push back to os.environ
+    for k, v in env_snapshot.items():
+        os.environ[k] = v
+
+
+def require_vars(keys: List[str]) -> None:
+    missing = []
+    for k in keys:
+        v = os.environ.get(k, "").strip()
+        if not v:
+            missing.append(k)
+    if missing:
+        die("Missing required env vars:\n  - " + "\n  - ".join(missing))
+
+
+def telegram_test(token: str, chat_id: str) -> None:
+    info("Testing Telegram sendMessage...")
+    url = f"https://api.telegram.org/bot{token}/sendMessage"
+    payload = {"chat_id": chat_id, "text": "TP Sweeper preflight: Telegram OK ✅", "disable_web_page_preview": True}
+    r = requests.post(url, json=payload, timeout=10)
+    if r.status_code != 200:
+        die(f"Telegram failed: HTTP {r.status_code} body={r.text}")
+    data = r.json()
+    if not data.get("ok"):
+        die(f"Telegram failed: {data}")
+    ok("Telegram token + chat id are valid (message sent).")
+
+
+def bybit_http_client(api_key: str, api_secret: str, testnet: bool) -> HTTP:
+    return HTTP(testnet=testnet, api_key=api_key, api_secret=api_secret)
+
+
+def bybit_auth_test(http: HTTP) -> None:
+    info("Testing Bybit auth (wallet balance call)...")
+    # Unified account wallet balance check
+    # We ask for USDT to keep output small.
+    try:
+        resp = http.get_wallet_balance(accountType="UNIFIED", coin=COIN)
+    except Exception as e:
+        die(f"Bybit auth test exception: {repr(e)}")
+
+    rc = resp.get("retCode")
+    rm = resp.get("retMsg")
+    if rc != 0:
+        die(f"Bybit auth test failed: retCode={rc} retMsg={rm} raw={resp}")
+    ok("Bybit API key/secret authenticated successfully.")
+
+
+def parse_uids() -> Tuple[int, Dict[int, int]]:
+    main_uid = int(os.environ["BYBIT_MAIN_UID"])
+    subs: Dict[int, int] = {}
+    for n in RR_ORDER:
+        subs[n] = int(os.environ[f"SUB_UID_{n}"])
+    return main_uid, subs
+
+
+def probe_sub_account_types(http: HTTP, subs: Dict[int, int]) -> Dict[int, str]:
+    """
+    Probe which accountType works for each sub UID using the sub-member balance query style call.
+    Different pybit versions may expose different method names; we try common ones.
+    """
+    info("Probing which accountType works for each sub UID (UNIFIED/CONTRACT/SPOT/FUND)...")
+
+    candidates = ["UNIFIED", "CONTRACT", "SPOT", "FUND", "OPTION", "INVESTMENT"]
+    resolved: Dict[int, str] = {}
+
+    # Try the most common pybit method name first.
+    # If your pybit version doesn't have it, you'll see an error and we fall back.
+    def call_balance(member_id: int, acct: str) -> Dict[str, Any]:
+        if hasattr(http, "get_all_coins_balance"):
+            return http.get_all_coins_balance(memberId=str(member_id), accountType=acct, coin=COIN)
+        if hasattr(http, "get_coin_balance"):
+            return http.get_coin_balance(memberId=str(member_id), accountType=acct, coin=COIN)
+        # If neither exists, we can't probe via SDK.
+        raise AttributeError("pybit HTTP client missing get_all_coins_balance/get_coin_balance methods")
+
+    for slot, uid in subs.items():
+        found = None
+        for acct in candidates:
+            try:
+                resp = call_balance(uid, acct)
+                rc = resp.get("retCode")
+                if rc == 0:
+                    found = acct
+                    break
+            except Exception as e:
+                # ignore; keep probing
+                continue
+        if found:
+            resolved[slot] = found
+            ok(f"sub#{slot} uid={uid} => accountType={found}")
+        else:
+            warn(f"Could not confirm accountType for sub#{slot} uid={uid} via SDK methods. You can still try UNIFIED.")
+    return resolved
+
+
+def transfer_dry_run(http: HTTP, main_uid: int, subs: Dict[int, int]) -> None:
+    if not TEST_TRANSFER:
+        info("Transfer test: DRY-RUN (no money moved). Set PREFLIGHT_TEST_TRANSFER=1 to send a tiny test transfer.")
+        ok("Transfer credentials present. (Not executing transfer.)")
+        return
+
+    # tiny test transfer to first RR slot
+    slot = RR_ORDER[0]
+    to_uid = subs[slot]
+    transfer_id = str(uuid.uuid4())
+
+    info(f"Executing TEST transfer {TEST_AMOUNT} {COIN} from main_uid={main_uid} -> sub#{slot} uid={to_uid} ...")
+    try:
+        resp = http.create_universal_transfer(
+            transferId=transfer_id,
+            coin=COIN,
+            amount=str(TEST_AMOUNT),
+            fromMemberId=main_uid,
+            toMemberId=to_uid,
+            fromAccountType=FROM_ACCOUNT_TYPE,
+            toAccountType=TO_ACCOUNT_TYPE,
+        )
+    except Exception as e:
+        die(f"Transfer test exception: {repr(e)}")
+
+    rc = resp.get("retCode")
+    rm = resp.get("retMsg")
+    if rc != 0:
+        die(f"Transfer test failed: retCode={rc} retMsg={rm} raw={resp}")
+    ok(f"Transfer test succeeded (moved {TEST_AMOUNT} {COIN} to sub#{slot}).")
+
+
+def main() -> None:
+    if not os.path.exists(ENV_PATH):
+        die(f".env not found at: {ENV_PATH}")
+
+    info(f"Loading env: {ENV_PATH}")
+    load_dotenv(ENV_PATH, override=False)
+    expand_all_placeholders()
+
+    # Required variables for your TP sweeper
+    required = [
+        "BYBIT_MAIN_UID",
+        "SUB_UID_1", "SUB_UID_2", "SUB_UID_4", "SUB_UID_5", "SUB_UID_6", "SUB_UID_7", "SUB_UID_8", "SUB_UID_9",
+    ]
+
+    # Telegram: prefer DRIP, else compatibility
+    tg_token = os.environ.get("TG_TOKEN_DRIP", "").strip() or os.environ.get("TG_BOT_TOKEN", "").strip()
+    tg_chat = os.environ.get("TG_CHAT_DRIP", "").strip() or os.environ.get("TG_CHAT_ID", "").strip()
+    if tg_token:
+        os.environ["__TG_TOKEN_RESOLVED"] = tg_token
+    if tg_chat:
+        os.environ["__TG_CHAT_RESOLVED"] = tg_chat
+    required += ["__TG_TOKEN_RESOLVED", "__TG_CHAT_RESOLVED"]
+
+    # Bybit creds: prefer transfer key pair for transfer validation
+    transfer_key = os.environ.get("BYBIT_MAIN_TRANSFER_KEY", "").strip() or os.environ.get("BYBIT_API_KEY", "").strip()
+    transfer_secret = os.environ.get("BYBIT_MAIN_TRANSFER_SECRET", "").strip() or os.environ.get("BYBIT_API_SECRET", "").strip()
+    if transfer_key:
+        os.environ["__BYBIT_KEY_RESOLVED"] = transfer_key
+    if transfer_secret:
+        os.environ["__BYBIT_SECRET_RESOLVED"] = transfer_secret
+    required += ["__BYBIT_KEY_RESOLVED", "__BYBIT_SECRET_RESOLVED"]
+
+    require_vars(required)
+
+    # Print sanitized summary
+    ok("Required env vars found.")
+    info(f"Telegram chat id resolved: {tg_chat}")
+    info(f"Rotation order: {RR_ORDER}")
+
+    # Telegram test
+    telegram_test(tg_token, tg_chat)
+
+    # Bybit tests
+    testnet = os.environ.get("BYBIT_TESTNET", "0").strip() == "1"
+    http = bybit_http_client(transfer_key, transfer_secret, testnet=testnet)
+    bybit_auth_test(http)
+
+    main_uid, subs = parse_uids()
+    ok(f"Main UID: {main_uid}")
+    for slot in RR_ORDER:
+        ok(f"Sub#{slot} UID: {subs[slot]}")
+
+    # Probe sub account types (best-effort)
+    try:
+        probe_sub_account_types(http, subs)
+    except Exception as e:
+        warn(f"AccountType probe skipped/failed: {repr(e)}")
+
+    # Transfer test (dry-run by default)
+    transfer_dry_run(http, main_uid, subs)
+
+    ok("Preflight complete ✅ If this passed, the TP sweeper has what it needs.")
+
+
+if __name__ == "__main__":
+    main()

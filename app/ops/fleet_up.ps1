@@ -40,8 +40,8 @@ for lbl in labels:
 
 function OnePass() {
   if ($OnlyLabels -ne "") {
-    $Env:ORCH_ONLY_LABELS = $OnlyLabels
-    Write-Host "ORCH_ONLY_LABELS=$OnlyLabels"
+if ($OnlyLabels -and $OnlyLabels.Trim().Length -gt 0) { $Env:ORCH_ONLY_LABELS = $OnlyLabels }
+if ($OnlyLabels -and $OnlyLabels.Trim().Length -gt 0) { Write-Host "ORCH_ONLY_LABELS=$OnlyLabels" }
   } else {
     Remove-Item Env:ORCH_ONLY_LABELS -ErrorAction SilentlyContinue | Out-Null
   }
@@ -70,3 +70,4 @@ if ($IntervalSec -gt 0) {
 } else {
   OnePass
 }
+

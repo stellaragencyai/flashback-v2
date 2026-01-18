@@ -1,0 +1,88 @@
+﻿# tools\start_dashboard.ps1
+# Canonical launcher for Flashback Dashboard (Flask-SocketIO) on port 5000.
+# 1) Kill any listeners on 5000
+# 2) Start dashboard_server.py
+# 3) Log stdout/stderr
+# 4) Health-check /health
+# 5) Open browser on success
+
+Set-StrictMode -Version Latest
+$ErrorActionPreference = "SilentlyContinue"
+
+Set-Location C:\flashback
+
+# --- Config ---
+$Port   = 5000
+$Host   = "127.0.0.1"
+$DashPy = "C:\flashback\app\dashboard\dashboard_server.py"
+
+$LogDir = "C:\flashback\state"
+$StdOut = Join-Path $LogDir "dashboard_stdout.log"
+$StdErr = Join-Path $LogDir "dashboard_stderr.log"
+
+# --- Ensure state dir exists ---
+New-Item -ItemType Directory -Force -Path $LogDir | Out-Null
+
+# --- Kill any listeners on port ---
+$ListenerPids = @(
+  Get-NetTCPConnection -State Listen -LocalPort $Port -ErrorAction SilentlyContinue |
+    Select-Object -ExpandProperty OwningProcess -Unique
+)
+
+if ($ListenerPids.Count -gt 0) {
+  Write-Host ("Killing listeners on port {0}: {1}" -f $Port, ($ListenerPids -join ", "))
+  foreach ($ProcId in $ListenerPids) {
+    Stop-Process -Id $ProcId -Force -ErrorAction SilentlyContinue
+  }
+  Start-Sleep -Seconds 1
+}
+
+# --- Clean logs ---
+Remove-Item -Force -ErrorAction SilentlyContinue $StdOut, $StdErr
+
+# --- Validate dashboard file exists ---
+if (-not (Test-Path $DashPy)) {
+  Write-Host ("ERROR: Dashboard entry not found: {0}" -f $DashPy)
+  exit 2
+}
+
+# --- Start dashboard (new window) ---
+Write-Host ("Starting dashboard: {0}" -f $DashPy)
+
+Start-Process -FilePath "python" -ArgumentList @("-u", $DashPy) `
+  -WorkingDirectory "C:\flashback" `
+  -WindowStyle Normal `
+  -RedirectStandardOutput $StdOut `
+  -RedirectStandardError $StdErr
+
+Start-Sleep -Seconds 2
+
+# --- Verify listener is up ---
+$Conn = Get-NetTCPConnection -State Listen -LocalPort $Port -ErrorAction SilentlyContinue | Select-Object -First 1
+if ($null -eq $Conn) {
+  Write-Host ("ERROR: Nothing is listening on port {0}" -f $Port)
+  Write-Host "---- dashboard_stderr.log (tail) ----"
+  Get-Content $StdErr -Tail 120 -ErrorAction SilentlyContinue
+  exit 3
+}
+
+Write-Host ("Listener OK: {0}:{1} PID={2}" -f $Conn.LocalAddress, $Conn.LocalPort, $Conn.OwningProcess)
+
+# --- Health check ---
+try {
+  $HealthUrl = ("http://{0}:{1}/health" -f $Host, $Port)
+  $Resp = Invoke-RestMethod $HealthUrl -TimeoutSec 3
+  Write-Host ("Health OK: {0}" -f ($Resp | ConvertTo-Json -Depth 4))
+
+  $UiUrl = ("http://{0}:{1}/" -f $Host, $Port)
+  Start-Process $UiUrl
+
+} catch {
+  Write-Host ("WARN: Health check failed: {0}" -f $_.Exception.Message)
+  Write-Host "---- dashboard_stdout.log (tail) ----"
+  Get-Content $StdOut -Tail 120 -ErrorAction SilentlyContinue
+  Write-Host "---- dashboard_stderr.log (tail) ----"
+  Get-Content $StdErr -Tail 120 -ErrorAction SilentlyContinue
+}
+
+exit 0

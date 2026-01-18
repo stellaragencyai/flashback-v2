@@ -71,6 +71,39 @@ AI_DECISIONS_PATH = STATE_DIR / "ai_decisions.jsonl"
 STUB_INDEX_PATH = STATE_DIR / "ai_decision_stub_index.json"
 
 
+def _decisions_file_has_trade_id(tid: str, *, tail_bytes: int = 250_000) -> bool:
+    """
+    Defensive de-dupe:
+    If ai_decisions.jsonl already contains this trade_id, do NOT emit a DEFAULT_EMITTED stub.
+
+    We do a cheap tail scan to avoid reading a 20MB+ file into memory.
+    This is "best effort"; false negatives are possible if the row is far in the past,
+    but in that case we still have STUB_INDEX as the primary guard.
+    """
+    try:
+        if not tid:
+            return False
+        p = AI_DECISIONS_PATH
+        if not p.exists():
+            return False
+
+        size = p.stat().st_size
+        if size <= 0:
+            return False
+
+        read_n = min(int(tail_bytes), int(size))
+        with p.open("rb") as f:
+            if size > read_n:
+                f.seek(size - read_n)
+            chunk = f.read(read_n)
+
+        # match the canonical JSON fragment: "trade_id":"<tid>"
+        needle = (f"\"trade_id\":\"{tid}\"").encode("utf-8")
+        return needle in chunk
+    except Exception:
+        return False
+
+
 def ensure_default_ai_decision(
     *,
     trade_id: str,
@@ -94,6 +127,10 @@ def ensure_default_ai_decision(
     if not tid:
         return False
 
+    # Defensive check: if a real decision already exists, don't emit a stub.
+    if _decisions_file_has_trade_id(tid):
+        return False
+
     acct = _safe_str(account_label)
     sym = _safe_str(symbol).upper()
     md = _safe_str(mode)
@@ -108,7 +145,6 @@ def ensure_default_ai_decision(
         return False
 
     # If the canonical decisions file is missing, don't emit into the void.
-    # (But in your system it should exist once restored.)
     if not AI_DECISIONS_PATH.parent.exists():
         return False
 
@@ -149,7 +185,6 @@ def ensure_default_ai_decision(
     # Hard cap to avoid infinite growth
     MAX = 100000
     if len(emitted) > MAX:
-        # Drop oldest by insertion order
         drop = len(emitted) - MAX
         for k in list(emitted.keys())[:drop]:
             emitted.pop(k, None)

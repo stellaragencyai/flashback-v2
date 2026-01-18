@@ -1,0 +1,96 @@
+﻿from __future__ import annotations
+
+import os
+import time
+import uuid
+from typing import Any, Dict, Optional
+
+from app.sim.paper_broker import PaperBroker
+
+
+def _safe_str(x: Any) -> str:
+    try:
+        return str(x).strip()
+    except Exception:
+        return ""
+
+
+def _normalize_timeframe(tf: Any, default: str = "5m") -> str:
+    s = ""
+    try:
+        s = str(tf).strip().lower()
+    except Exception:
+        s = ""
+    if not s:
+        return default
+    if s.endswith(("m", "h", "d", "w")):
+        return s
+    if s.isdigit():
+        return f"{s}m"
+    return s or default
+
+
+def main() -> None:
+    # Use env-driven account label (critical for multi-sub testing)
+    account_label = _safe_str(os.getenv("ACCOUNT_LABEL", "flashback01")) or "flashback01"
+
+    # Load ledger for that account label
+    broker = PaperBroker.load_or_create(account_label, starting_equity=1000.0)
+
+    # Defaults can be overridden via env if you want quick iteration
+    symbol = (_safe_str(os.getenv("PAPER_TEST_SYMBOL", "XRPUSDT")) or "XRPUSDT").upper()
+    side_raw = _safe_str(os.getenv("PAPER_TEST_SIDE", "long")).lower()
+    timeframe = _normalize_timeframe(os.getenv("PAPER_TEST_TIMEFRAME", "5m"), default="5m")
+    setup_type = _safe_str(os.getenv("PAPER_TEST_SETUP_TYPE", "scalp")) or "scalp"
+
+    # Deterministic-ish pricing for a test open (keeps paper broker happy)
+    entry_price = float(os.getenv("PAPER_TEST_ENTRY_PRICE", "1.0000"))
+    stop_price = float(os.getenv("PAPER_TEST_STOP_PRICE", "0.9900"))
+    take_profit_price = float(os.getenv("PAPER_TEST_TP_PRICE", "1.0100"))
+
+    # Map side into expected enum values used by the broker ("long"/"short" is typical)
+    # If your PaperBroker expects "buy"/"sell", it should already coerce internally.
+    side = "long" if side_raw in ("long", "buy") else ("short" if side_raw in ("short", "sell") else side_raw)
+
+    # Features payload used downstream by learning/bucketization
+    features: Dict[str, Any] = {
+        "source": "paper_open_one_test",
+        "memory_fingerprint": "",
+        "timeframe": timeframe,
+        "setup_type": setup_type,
+    }
+
+    # Extra metadata used for join/debugging
+    trade_id = f"{account_label}-{symbol}-{uuid.uuid4().hex[:10]}"
+    extra: Dict[str, Any] = {
+        "mode": "PAPER",
+        "join_key": "trade_id",
+        "requested_by": "paper_open_one_test",
+        "ts_ms": int(time.time() * 1000),
+    }
+
+    opened = broker.open_position(
+        symbol=symbol,
+        side=side,  # type: ignore[arg-type]
+        entry_price=entry_price,
+        stop_price=stop_price,
+        take_profit_price=take_profit_price,
+        setup_type=setup_type,
+        timeframe=timeframe,
+        features=features,
+        extra=extra,
+        trade_id=trade_id,
+        log_setup=True,  # IMPORTANT: ensures setup context gets recorded
+    )
+
+    print("OK: OPENED")
+    print("  account_label:", account_label)
+    print("  trade_id     :", opened.trade_id if hasattr(opened, "trade_id") else trade_id)
+    print("  symbol       :", symbol)
+    print("  side         :", side)
+    print("  timeframe    :", timeframe)
+    print("  setup_type   :", setup_type)
+
+
+if __name__ == "__main__":
+    main()

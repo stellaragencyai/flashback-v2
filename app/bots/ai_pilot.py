@@ -4,7 +4,7 @@
 """
 Flashback — AI Pilot v2.9 ✅ (Truth Canon + Action Bus enforced)
 
-PATCH v2.9.4 (THIS PATCH):
+PATCH v2.9.4:
 - Decisions: FAIL CLOSED if ai_decision_logger is unavailable (single-writer law).
 - Actions: FAIL CLOSED if ai_action_bus is unavailable (single choke-point law).
 - Decision row shape hardened:
@@ -12,11 +12,17 @@ PATCH v2.9.4 (THIS PATCH):
     • ts_ms always present (ts kept for backward compatibility)
     • meta.source/meta.stage always present
 
-PATCH v2.9.5 (THIS PATCH):
+PATCH v2.9.5:
 - Timeframe normalization hardened:
     • Always emit timeframe in canonical form (e.g., "5m", "15m", "1h")
     • Default timeframe is "5m" (NOT "5")
     • Normalize join keys to prevent Phase 6 bucket mismatches
+
+PATCH v2.9.6 (THIS PATCH):
+- Canonical stamping hardened everywhere:
+    • Decision rows ALWAYS contain canonical: symbol (upper), account_label, timeframe (normalized)
+    • Best-effort normalization applied to setup_context.timeframe in actions (sample + core)
+    • Decision join keys are never allowed to drift from canonical forms
 """
 
 from __future__ import annotations
@@ -24,7 +30,6 @@ from __future__ import annotations
 import argparse
 import os
 import time
-from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 from app.core.ai_action_builder import build_trade_action_from_sample
@@ -133,6 +138,7 @@ def _normalize_timeframe(tf: Any, default: str = "5m") -> str:
     - "5m" -> "5m"
     - "1h" -> "1h"
     - None/"" -> default
+
     This prevents Phase 6 bucket mismatches (Phase 6 uses "5m", not "5").
     """
     s = ""
@@ -143,16 +149,25 @@ def _normalize_timeframe(tf: Any, default: str = "5m") -> str:
     if not s:
         return default
 
-    # Already canonical-like
     if s.endswith(("m", "h", "d", "w")):
         return s
 
-    # Pure digits => minutes
     if s.isdigit():
         return f"{s}m"
 
-    # Very defensive fallback: keep as-is but do not emit empty
     return s or default
+
+
+def _safe_str(x: Any) -> str:
+    try:
+        return str(x).strip()
+    except Exception:
+        return ""
+
+
+def _canon_symbol(x: Any) -> str:
+    s = _safe_str(x).upper()
+    return s
 
 
 ACCOUNT_LABEL: str = os.getenv("ACCOUNT_LABEL", "main").strip() or "main"
@@ -251,7 +266,6 @@ def _safe_first_match(r: Dict[str, Any]) -> Optional[Dict[str, Any]]:
 
 
 def _decision_base(ts_ms: int) -> PilotDecision:
-    # Canonical-ish pilot decision row (logger can normalize further, but we don’t rely on it)
     return {
         "schema_version": int(DECISION_SCHEMA_VERSION),
         "ts_ms": int(ts_ms),
@@ -268,16 +282,9 @@ def _decision_base(ts_ms: int) -> PilotDecision:
     }
 
 
-def _safe_str(x: Any) -> str:
-    try:
-        return str(x).strip()
-    except Exception:
-        return ""
-
-
 def _extract_decision_join_keys(setup_event: Dict[str, Any]) -> Dict[str, Any]:
     trade_id = _safe_str(setup_event.get("trade_id") or "")
-    symbol = _safe_str(setup_event.get("symbol") or "").upper()
+    symbol = _canon_symbol(setup_event.get("symbol") or "")
     account_label = _safe_str(setup_event.get("account_label") or setup_event.get("label") or "") or ACCOUNT_LABEL
 
     timeframe_raw = _safe_str(setup_event.get("timeframe") or "")
@@ -305,7 +312,29 @@ def _extract_decision_join_keys(setup_event: Dict[str, Any]) -> Dict[str, Any]:
         "policy_hash": policy_hash,
         "memory_fingerprint": memory_fingerprint,
     }
-    return {k: v for k, v in out.items() if v != "" or k == "trade_id"}
+    # trade_id may be empty; we keep it to preserve shape, but do not drop canonical keys
+    return {k: v for k, v in out.items() if v != "" or k in ("trade_id", "symbol", "account_label", "timeframe")}
+
+
+def _stamp_canon_keys_on_decision(out: PilotDecision) -> None:
+    """
+    v2.9.6: make drift impossible.
+    Decision rows must always contain canonical join keys.
+    """
+    try:
+        out["account_label"] = _safe_str(out.get("account_label") or ACCOUNT_LABEL) or ACCOUNT_LABEL
+    except Exception:
+        out["account_label"] = ACCOUNT_LABEL
+
+    try:
+        out["symbol"] = _canon_symbol(out.get("symbol") or "")
+    except Exception:
+        out["symbol"] = ""
+
+    try:
+        out["timeframe"] = _normalize_timeframe(out.get("timeframe") or "", default="5m")
+    except Exception:
+        out["timeframe"] = "5m"
 
 
 def _set_allow_and_size(out: PilotDecision) -> None:
@@ -368,8 +397,10 @@ def pilot_decide(setup_event: Dict[str, Any]) -> PilotDecision:
     try:
         out.update(_extract_decision_join_keys(setup_event))
     except Exception:
+        # Still stamp canon keys after this.
         pass
 
+    _stamp_canon_keys_on_decision(out)
     acct = str(out.get("account_label") or ACCOUNT_LABEL)
 
     if not _memory_gating_active_for_account(acct):
@@ -378,6 +409,7 @@ def pilot_decide(setup_event: Dict[str, Any]) -> PilotDecision:
         out["memory"] = None
         out["gates"] = {"reason": "memory_gates_disabled_or_not_canary"}
         _set_allow_and_size(out)
+        _stamp_canon_keys_on_decision(out)
         _write_decision(dict(out))
         return out
 
@@ -385,6 +417,7 @@ def pilot_decide(setup_event: Dict[str, Any]) -> PilotDecision:
         out["decision"] = "BLOCKED_BY_GATES"
         out["gates"] = {"reason": "ai_memory_store_missing"}
         _set_allow_and_size(out)
+        _stamp_canon_keys_on_decision(out)
         _write_decision(dict(out))
         return out
 
@@ -392,6 +425,7 @@ def pilot_decide(setup_event: Dict[str, Any]) -> PilotDecision:
         out["decision"] = "BLOCKED_BY_GATES"
         out["gates"] = {"reason": "ai_gatekeeper_missing"}
         _set_allow_and_size(out)
+        _stamp_canon_keys_on_decision(out)
         _write_decision(dict(out))
         return out
 
@@ -418,6 +452,7 @@ def pilot_decide(setup_event: Dict[str, Any]) -> PilotDecision:
                 out["decision"] = "COLD_START" if AI_PILOT_ALLOW_COLD_START else "BLOCKED_BY_GATES"
                 out["gates"] = {"reason": "no_matches"}
             _set_allow_and_size(out)
+            _stamp_canon_keys_on_decision(out)
             _write_decision(dict(out))
             return out
 
@@ -444,6 +479,7 @@ def pilot_decide(setup_event: Dict[str, Any]) -> PilotDecision:
         out["decision"] = "ALLOW_TRADE" if ok else ("BLOCKED_BY_GATES" if AI_PILOT_BLOCK_ON_BAD_MEMORY else "COLD_START")
 
         _set_allow_and_size(out)
+        _stamp_canon_keys_on_decision(out)
         _write_decision(dict(out))
         return out
 
@@ -453,6 +489,7 @@ def pilot_decide(setup_event: Dict[str, Any]) -> PilotDecision:
         out["memory"] = None
         out["gates"] = {"reason": "error", "error": str(e)}
         _set_allow_and_size(out)
+        _stamp_canon_keys_on_decision(out)
         _write_decision(dict(out))
         return out
 
@@ -469,6 +506,41 @@ def _extract_setup_from_action(action: Dict[str, Any]) -> Optional[Dict[str, Any
     if isinstance(ctx, dict) and isinstance(ctx.get("setup_context"), dict):
         return ctx["setup_context"]  # type: ignore[return-value]
     return None
+
+
+def _normalize_setup_context_in_action(a: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    v2.9.6: Best-effort normalize setup_context join keys on outgoing actions.
+    This prevents downstream (Phase 6+) drift if policy authors emitted non-canonical keys.
+    """
+    aa = dict(a)
+    sc = _extract_setup_from_action(aa)
+    if not sc or not isinstance(sc, dict):
+        return aa
+
+    sc2 = dict(sc)
+    sc2["account_label"] = _safe_str(sc2.get("account_label") or ACCOUNT_LABEL) or ACCOUNT_LABEL
+    sc2["symbol"] = _canon_symbol(sc2.get("symbol") or "")
+    sc2["timeframe"] = _normalize_timeframe(sc2.get("timeframe") or "", default="5m")
+
+    # Write back to the most direct location available
+    if isinstance(aa.get("setup_context"), dict):
+        aa["setup_context"] = sc2
+        return aa
+    extra = aa.get("extra")
+    if isinstance(extra, dict) and isinstance(extra.get("setup_context"), dict):
+        extra2 = dict(extra)
+        extra2["setup_context"] = sc2
+        aa["extra"] = extra2
+        return aa
+    ctx = aa.get("context")
+    if isinstance(ctx, dict) and isinstance(ctx.get("setup_context"), dict):
+        ctx2 = dict(ctx)
+        ctx2["setup_context"] = sc2
+        aa["context"] = ctx2
+        return aa
+
+    return aa
 
 
 def _apply_memory_gates(actions: List[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
@@ -496,10 +568,11 @@ def _apply_memory_gates(actions: List[Dict[str, Any]]) -> Tuple[List[Dict[str, A
         if not isinstance(a, dict):
             continue
 
-        setup_ctx = _extract_setup_from_action(a)
+        aa0 = _normalize_setup_context_in_action(a)
+        setup_ctx = _extract_setup_from_action(aa0)
         if not setup_ctx:
             meta["no_setup_context"] += 1
-            aa = dict(a)
+            aa = dict(aa0)
             aa.setdefault("meta", {})
             if isinstance(aa["meta"], dict):
                 aa["meta"]["memory_gate"] = {"decision": "SKIP", "reason": "no_setup_context"}
@@ -509,7 +582,7 @@ def _apply_memory_gates(actions: List[Dict[str, Any]]) -> Tuple[List[Dict[str, A
         decision = pilot_decide(setup_ctx)
         dec = str(decision.get("decision") or "BLOCKED_BY_GATES")
 
-        aa = dict(a)
+        aa = dict(aa0)
         aa.setdefault("meta", {})
         if isinstance(aa["meta"], dict):
             aa["meta"]["memory_gate"] = decision
@@ -552,7 +625,7 @@ def _run_sample_policy(ai_state: Dict[str, Any]) -> List[Dict[str, Any]]:
             if not symbol or not side:
                 continue
 
-            sym = str(symbol).strip().upper()
+            sym = _canon_symbol(symbol)
             side_s = str(side).strip().lower()
 
             ai_action = build_trade_action_from_sample(
@@ -587,7 +660,7 @@ def _run_sample_policy(ai_state: Dict[str, Any]) -> List[Dict[str, Any]]:
             }
 
             ai_action["setup_context"] = setup_ctx
-            ai_actions.append(ai_action)
+            ai_actions.append(_normalize_setup_context_in_action(ai_action))
 
         return ai_actions
     except Exception as e:
@@ -602,7 +675,11 @@ def _run_core_policy(ai_state: Dict[str, Any]) -> List[Dict[str, Any]]:
         actions = core_evaluate_state(ai_state)  # type: ignore[misc]
         if not isinstance(actions, list):
             return []
-        return [a for a in actions if isinstance(a, dict)]
+        out: List[Dict[str, Any]] = []
+        for a in actions:
+            if isinstance(a, dict):
+                out.append(_normalize_setup_context_in_action(a))
+        return out
     except Exception as e:
         alert_bot_error("ai_pilot", f"core_policy error: {e}", "ERROR")
         return []
@@ -620,7 +697,6 @@ def _dispatch_actions(actions: List[Dict[str, Any]], *, label: str) -> int:
     _require_action_bus()
 
     try:
-        # Keep call signature stable with defensive fallback for older bus variants
         try:
             written = bus_append_actions(  # type: ignore[misc]
                 actions,
@@ -629,7 +705,6 @@ def _dispatch_actions(actions: List[Dict[str, Any]], *, label: str) -> int:
                 dry_run=DRY_RUN,
             )
         except TypeError:
-            # If older signature exists, try minimal call
             written = bus_append_actions(actions)  # type: ignore[misc]
         return int(written or 0)
     except Exception as e:
@@ -687,7 +762,7 @@ def loop() -> None:
             alert_bot_error("ai_pilot", f"loop error: {e}", "ERROR")
 
         elapsed = time.time() - t0
-        time.sleep(max(0.5, POLL_SECONDS - elapsed))
+        time.sleep(max(0.5, float(POLL_SECONDS) - elapsed))
 
 
 def main() -> int:

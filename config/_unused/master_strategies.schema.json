@@ -1,0 +1,121 @@
+{
+  "$schema": "http://json-schema.org/draft/2020-12/schema#",
+  "title": "Master Strategies Config Schema",
+  "type": "object",
+  "required": ["version", "subaccounts", "strategies"],
+  "properties": {
+    "version": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "notes": {
+      "type": "string"
+    },
+    "subaccounts": {
+      "type": "object",
+      "patternProperties": {
+        "^[a-z0-9_]+$": {
+          "type": "object",
+          "required": ["sub_uid", "telegram", "api_env"],
+          "properties": {
+            "sub_uid": { "type": ["integer", "string", "null"] },
+            "telegram": {
+              "type": "object",
+              "required": ["bot_token_env", "chat_id_env"],
+              "properties": {
+                "bot_token_env": { "type": "string" },
+                "chat_id_env": { "type": "string" }
+              }
+            },
+            "api_env": {
+              "type": "object",
+              "required": ["key", "secret"],
+              "properties": {
+                "key": { "type": "string" },
+                "secret": { "type": "string" }
+              }
+            }
+          },
+          "additionalProperties": false
+        }
+      }
+    },
+    "strategies": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": [
+          "id",
+          "account_label",
+          "enabled",
+          "symbols",
+          "timeframes",
+          "automation_mode",
+          "ai_profile",
+          "risk_profile",
+          "exit_profile",
+          "regime",
+          "tags"
+        ],
+        "properties": {
+          "id": { "type": "string" },
+          "account_label": { "type": "string" },
+          "enabled": { "type": "boolean" },
+          "symbols": {
+            "type": "array",
+            "items": { "type": "string" }
+          },
+          "timeframes": {
+            "type": "array",
+            "items": { "type": "string" }
+          },
+          "setup_types": {
+            "type": "array",
+            "items": { "type": "string" }
+          },
+          "automation_mode": {
+            "type": "string",
+            "enum": ["OFF", "LEARN_DRY", "PAPER", "LIVE_CANARY", "LIVE_FULL"]
+          },
+          "ai_profile": { "type": "string" },
+          "risk_profile": { "type": "string" },
+          "exit_profile": { "type": "string" },
+          "promotion_rules": {
+            "type": "object",
+            "properties": {
+              "enabled": { "type": "boolean" },
+              "min_trades": { "type": "number" },
+              "min_winrate": { "type": "number" },
+              "min_avg_r": { "type": "number" },
+              "min_expectancy_r": { "type": "number" },
+              "max_drawdown_pct": { "type": "number" }
+            },
+            "additionalProperties": false
+          },
+          "regime": {
+            "type": "object",
+            "properties": {
+              "min_adx": { "type": "number" },
+              "max_atr_pct": { "type": "number" },
+              "min_vol_z": { "type": "number" },
+              "max_vol_z": { "type": "number" }
+            },
+            "required": [
+              "min_adx",
+              "max_atr_pct",
+              "min_vol_z",
+              "max_vol_z"
+            ],
+            "additionalProperties": false
+          },
+          "tags": {
+            "type": "array",
+            "items": { "type": "string" }
+          }
+        },
+        "additionalProperties": false
+      }
+    }
+  },
+  "additionalProperties": false
+}

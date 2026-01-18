@@ -1,0 +1,380 @@
+from __future__ import annotations
+
+import sys
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[2]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+# === FLASHBACK_ROOT_INJECT ===
+
+import json
+import os
+import subprocess
+import time
+import socket
+import hashlib
+import platform
+from typing import Any, Dict, List, Optional
+
+from app.ops.writer_lock import acquire_lock, release_lock
+
+# =========================
+# CANONICAL EXECUTION ENTRYPOINT
+# =========================
+# This is the ONLY allowed entrypoint for LIVE trading.
+# All LIVE / LIVE_CANARY executions MUST pass through here.
+# Bypassing this file is a policy violation.
+
+STATE = ROOT / "state"
+LOGDIR = STATE / "orchestrator_logs"
+MANIFEST = ROOT / "config" / "fleet_manifest.yaml"
+OUT = STATE / "orchestrator_state.json"
+BOOT = STATE / "boot_record.json"
+
+ALLOWED_MODES = {"DRY", "LIVE_CANARY", "LIVE"}
+DEFAULT_MODE = "DRY"
+
+# =========================
+# UTILITIES
+# =========================
+
+def _now_ms() -> int:
+    return int(time.time() * 1000)
+
+
+def _fatal(msg: str) -> None:
+    print(f"FATAL: {msg}", file=sys.stderr)
+    raise SystemExit(1)
+
+
+def _pid_alive(pid: int) -> bool:
+    if pid is None:
+        return False
+    try:
+        pid_i = int(pid)
+    except Exception:
+        return False
+    if pid_i <= 0:
+        return False
+    try:
+        r = subprocess.run(
+            ["tasklist", "/FI", f"PID eq {pid_i}"],
+            capture_output=True,
+            text=True,
+        )
+        return str(pid_i) in (r.stdout or "")
+    except Exception:
+        return False
+
+
+def _cmd_to_str(cmd: Any) -> str:
+    try:
+        if isinstance(cmd, list):
+            return " ".join(str(x) for x in cmd)
+        return str(cmd)
+    except Exception:
+        return "<cmd_unprintable>"
+
+
+# =========================
+# VPN / NETWORK GATE (WINDOWS)
+# =========================
+
+def _vpn_active_avast() -> bool:
+    """
+    Avast Secure VPN creates a TAP / Wintun-style adapter.
+    We detect it via 'ipconfig' presence.
+    """
+    try:
+        r = subprocess.run(
+            ["ipconfig"],
+            capture_output=True,
+            text=True,
+        )
+        out = (r.stdout or "").lower()
+        return "avast" in out or "secure vpn" in out
+    except Exception:
+        return False
+
+
+def _enforce_vpn(mode: str) -> None:
+    if mode in {"LIVE", "LIVE_CANARY"}:
+        if not _vpn_active_avast():
+            _fatal(f"{mode} blocked: Avast Secure VPN not detected")
+
+
+# =========================
+# MACHINE FINGERPRINT
+# =========================
+
+def _machine_fingerprint() -> Dict[str, Any]:
+    h = hashlib.sha256()
+    h.update(platform.node().encode())
+    h.update(platform.platform().encode())
+    h.update(sys.executable.encode())
+    return {
+        "hostname": socket.gethostname(),
+        "platform": platform.platform(),
+        "python": sys.executable,
+        "fingerprint": h.hexdigest(),
+    }
+
+
+# =========================
+# MANIFEST LOADING
+# =========================
+
+def _load_manifest_rows() -> tuple[list[dict[str, Any]], Optional[str]]:
+    """
+    Returns (rows, error_string).
+    Never raises. Errors are returned for diagnostics.
+    """
+    if not MANIFEST.exists():
+        return [], f"manifest_missing:{MANIFEST}"
+    try:
+        import yaml  # type: ignore
+        d = yaml.safe_load(MANIFEST.read_text(encoding="utf-8", errors="ignore")) or {}
+        fleet = d.get("fleet") or []
+        rows = [r for r in fleet if isinstance(r, dict)]
+        return rows, None
+    except Exception as e:
+        return [], f"manifest_parse_error:{repr(e)}"
+
+
+def _should_run(row: dict[str, Any]) -> bool:
+    enabled = bool(row.get("enabled", True))
+    enable_ai_stack = bool(row.get("enable_ai_stack", True))
+    mode = str(row.get("automation_mode") or "").strip().upper()
+    mode_ok = mode not in ("", "OFF", "DISABLED", "NONE")
+    return bool(enabled and enable_ai_stack and mode_ok)
+
+
+def _label_from_row(row: dict[str, Any]) -> str:
+    return str(row.get("account_label") or "").strip()
+
+
+# =========================
+# MAIN
+# =========================
+
+def main() -> int:
+    STATE.mkdir(parents=True, exist_ok=True)
+    LOGDIR.mkdir(parents=True, exist_ok=True)
+
+    # cfg may exist from older patterns; keep safe fallback
+    cfg: Dict[str, Any] = {}
+
+    mode = (os.environ.get("FLASHBACK_MODE") or cfg.get("mode", DEFAULT_MODE)).strip().upper()
+    if mode not in ALLOWED_MODES:
+        _fatal(f"Invalid FLASHBACK_MODE={mode}")
+
+    _enforce_vpn(mode)
+
+    boot = {
+        "ts_ms": _now_ms(),
+        "mode": mode,
+        "root": str(ROOT),
+        "machine": _machine_fingerprint(),
+    }
+    BOOT.write_text(json.dumps(boot, indent=2), encoding="utf-8")
+
+    rows, manifest_err = _load_manifest_rows()
+
+    only = (os.getenv("ORCH_ONLY_LABELS") or "").strip()
+    only_set = {x.strip() for x in only.split(",") if x.strip()}
+
+    procs: Dict[str, Any] = {}
+    started: List[str] = []
+    skipped: List[str] = []
+
+    # Canonical per-sub truth map (dashboard + integrity rules)
+    subaccounts: Dict[str, Dict[str, Any]] = {}
+
+    # Diagnostics counters
+    dead_started: List[str] = []
+    spawn_errors: List[str] = []
+
+    # Build desired for every manifest row (even if skipped)
+    for r in rows:
+        label = _label_from_row(r)
+        if not label:
+            continue
+
+        desired = True
+        reason: Optional[str] = None
+
+        if only_set and label not in only_set:
+            desired = False
+            reason = "filtered_by_only_labels"
+        elif not _should_run(r):
+            desired = False
+            reason = "manifest_should_run_false"
+
+        # effective will be refined after spawn attempt
+        subaccounts[label] = {
+            "desired": bool(desired),
+            "effective_should_run": False,  # will set below
+            "alive": False,
+            "pid": None,
+            "cmd": None,
+            "cmd_str": None,
+            "started_ts_ms": None,
+            "stdout_log": None,
+            "stderr_log": None,
+            "restart_count": 0,
+            "blocked": False,
+            "backoff_sec": 0.0,
+            "reason": reason,
+        }
+
+        if not desired:
+            # desired=false => effective=false, reason already set
+            subaccounts[label]["effective_should_run"] = False
+            if reason == "filtered_by_only_labels":
+                skipped.append(f"{label}: not in ORCH_ONLY_LABELS")
+            else:
+                skipped.append(f"{label}: should_run=false by manifest")
+            continue
+
+        env = os.environ.copy()
+        env["ACCOUNT_LABEL"] = label
+        env["FLASHBACK_MODE"] = mode
+        env["PYTHONUTF8"] = "1"
+        env["PYTHONIOENCODING"] = "utf-8"
+
+        cmd = [sys.executable, "-m", "app.bots.supervisor_ai_stack"]
+        cmd_str = _cmd_to_str(cmd)
+
+        ts = _now_ms()
+        out_log = LOGDIR / f"{label}.stdout.log"
+        err_log = LOGDIR / f"{label}.stderr.log"
+
+        # Pre-fill command/log fields (even if spawn fails)
+        subaccounts[label]["cmd"] = cmd
+        subaccounts[label]["cmd_str"] = cmd_str
+        subaccounts[label]["started_ts_ms"] = ts
+        subaccounts[label]["stdout_log"] = str(out_log)
+        subaccounts[label]["stderr_log"] = str(err_log)
+
+        try:
+            with out_log.open("ab") as fo, err_log.open("ab") as fe:
+                header = f"\n\n=== START {label} ts_ms={ts} mode={mode} cmd={cmd_str} ===\n"
+                fo.write(header.encode("utf-8", errors="ignore"))
+                fe.write(header.encode("utf-8", errors="ignore"))
+
+                p = subprocess.Popen(
+                    cmd,
+                    cwd=str(ROOT),
+                    env=env,
+                    stdout=fo,
+                    stderr=fe,
+                    creationflags=subprocess.CREATE_NEW_PROCESS_GROUP if os.name == "nt" else 0,
+                )
+
+            time.sleep(0.35)
+            alive = _pid_alive(int(p.pid))
+
+            procs[label] = {
+                "pid": int(p.pid),
+                "cmd": cmd,
+                "cmd_str": cmd_str,
+                "started_ts_ms": ts,
+                "alive": bool(alive),
+                "stdout_log": str(out_log),
+                "stderr_log": str(err_log),
+            }
+            started.append(label)
+
+            subaccounts[label]["pid"] = int(p.pid)
+            subaccounts[label]["alive"] = bool(alive)
+
+            # effective should_run is the orchestrator's *truthful* view:
+            # desired AND process alive.
+            if alive:
+                subaccounts[label]["effective_should_run"] = True
+                subaccounts[label]["reason"] = None
+            else:
+                subaccounts[label]["effective_should_run"] = False
+                subaccounts[label]["reason"] = "spawned_but_dead"
+                dead_started.append(label)
+
+        except Exception as e:
+            err = repr(e)
+            procs[label] = {
+                "pid": None,
+                "cmd": cmd,
+                "cmd_str": cmd_str,
+                "error": err,
+                "started_ts_ms": ts,
+                "alive": False,
+                "stdout_log": str(out_log),
+                "stderr_log": str(err_log),
+            }
+
+            subaccounts[label]["pid"] = None
+            subaccounts[label]["alive"] = False
+            subaccounts[label]["effective_should_run"] = False
+            subaccounts[label]["reason"] = f"spawn_error:{err}"
+            spawn_errors.append(label)
+
+    # If manifest exists but rows empty, scream loudly
+    if manifest_err:
+        print(f"WARN: manifest_error={manifest_err}")
+    if MANIFEST.exists() and len(rows) == 0:
+        print("WARN: fleet_manifest.yaml loaded 0 rows. Dashboard will show no subs.")
+        print("WARN: manifest_path=", str(MANIFEST))
+
+    # Guard: never silently emit empty subaccounts if manifest exists
+    if MANIFEST.exists() and len(rows) > 0 and len(subaccounts) == 0:
+        print("WARN: manifest had rows but produced 0 subaccounts; dashboard will be degraded.")
+        print("WARN: manifest_path=", str(MANIFEST))
+        print("WARN: rows=", len(rows))
+        print("WARN: ORCH_ONLY_LABELS=", sorted(list(only_set)))
+
+    # Compact diagnostics for the real world
+    if dead_started:
+        print(f"WARN: started_but_dead_count={len(dead_started)} labels={dead_started[:10]}")
+    if spawn_errors:
+        print(f"WARN: spawn_error_count={len(spawn_errors)} labels={spawn_errors[:10]}")
+
+    out = {
+        "ts_ms": _now_ms(),
+        "mode": mode,
+        "boot_record": str(BOOT),
+        "manifest": str(MANIFEST),
+        "only_labels": sorted(list(only_set)),
+        "started": started,
+        "skipped": skipped,
+        "procs": procs,
+        # Canonical truth for active/degraded logic
+        "subaccounts": subaccounts,
+        # extra diagnostics (safe additive fields)
+        "manifest_rows": len(rows),
+        "manifest_error": manifest_err,
+        "dead_started_count": len(dead_started),
+        "spawn_error_count": len(spawn_errors),
+    }
+
+    # preserve writer lock behavior
+    lock_fp = str(OUT) + ".lock"
+    got = False
+    try:
+        got = acquire_lock(lock_fp, stale_after_sec=30.0)
+        OUT.write_text(json.dumps(out, indent=2), encoding="utf-8")
+    finally:
+        try:
+            if got:
+                release_lock(lock_fp)
+        except Exception:
+            # never crash on lock cleanup
+            pass
+
+    print(f"WROTE: {OUT}")
+    print(f"mode={mode} started={len(started)} skipped={len(skipped)} subaccounts={len(subaccounts)}")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
+

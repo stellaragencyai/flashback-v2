@@ -13,27 +13,18 @@ fleet:
   sub_uid: 524630315
   enabled: true
   enable_ai_stack: true
-  strategy_name: Sub1_Trend
-  role: trend_follow
+  strategy_name: HTF01_Trend_BTC
+  role: htf_trend
   automation_mode: LEARN_DRY
   ai_profile: trend_v1
   risk_pct: 0.1
-  max_concurrent_positions: 2
+  max_concurrent_positions: 1
   exit_profile: standard_5
   timeframes:
-  - '15'
   - '60'
+  - '240'
   symbols:
   - BTCUSDT
-  - ETHUSDT
-  - SOLUSDT
-  - XRPUSDT
-  - ADAUSDT
-  - LINKUSDT
-  - INJUSDT
-  - OPUSDT
-  - AVAXUSDT
-  - DOGEUSDT
   setup_types:
   - trend_pullback
   - trend_breakout_retest
@@ -48,75 +39,54 @@ fleet:
   sub_uid: 524633243
   enabled: true
   enable_ai_stack: true
-  strategy_name: Sub2_Breakout
-  role: breakout_momentum
+  strategy_name: HTF02_Trend_ETH
+  role: htf_trend
   automation_mode: LEARN_DRY
-  ai_profile: breakout_v1
+  ai_profile: trend_v1
   risk_pct: 0.1
-  max_concurrent_positions: 2
+  max_concurrent_positions: 1
   exit_profile: standard_5
   timeframes:
-  - '5'
-  - '15'
+  - '60'
+  - '240'
   symbols:
-  - BTCUSDT
   - ETHUSDT
-  - SOLUSDT
-  - XRPUSDT
-  - ADAUSDT
-  - LINKUSDT
-  - INJUSDT
-  - OPUSDT
-  - AVAXUSDT
-  - DOGEUSDT
-  - NEARUSDT
-  - ARBUSDT
-  - HBARUSDT
-  - FARTCOINUSDT
-  - PUMPFUNUSDT
   setup_types:
-  - breakout_high
-  - breakout_range
-  - squeeze_release
+  - trend_pullback
+  - trend_breakout_retest
+  - ema_trend_follow
   promotion_rules: null
-  min_trades: 200
-  min_winrate: 0.5
-  min_avg_r: 0.35
-  min_expectancy_r: 0.2
-  max_drawdown_pct: 20.0
+  min_trades: 150
+  min_winrate: 0.52
+  min_avg_r: 0.3
+  min_expectancy_r: 0.15
+  max_drawdown_pct: 18.0
 - account_label: flashback03
   sub_uid: 524634622
   enabled: true
   enable_ai_stack: true
-  strategy_name: Sub3_ScalpMajors
-  role: scalp_intraday
+  strategy_name: HTF03_Trend_SOL
+  role: htf_trend
   automation_mode: LEARN_DRY
-  ai_profile: scalp_v1
+  ai_profile: trend_v1
   risk_pct: 0.1
-  max_concurrent_positions: 2
+  max_concurrent_positions: 1
   exit_profile: standard_5
   timeframes:
-  - '1'
-  - '3'
-  - '5'
+  - '60'
+  - '240'
   symbols:
-  - BTCUSDT
-  - ETHUSDT
   - SOLUSDT
-  - XRPUSDT
-  - ADAUSDT
-  - LINKUSDT
-  - DOGEUSDT
   setup_types:
-  - scalp_liquidity_sweep
-  - scalp_trend_continuation
-  - scalp_reversal_snapback
+  - trend_pullback
+  - trend_breakout_retest
+  - ema_trend_follow
   promotion_rules: null
-  min_trades: 250
-  min_winrate: 0.5
-  min_avg_r: 0.2
-  min_expectancy_r: 0.1
-  max_drawdown_pct: 22.0
+  min_trades: 150
+  min_winrate: 0.52
+  min_avg_r: 0.3
+  min_expectancy_r: 0.15
+  max_drawdown_pct: 18.0
 - account_label: flashback04
   sub_uid: 524636309
   enabled: true
@@ -132,20 +102,10 @@ fleet:
   - '5'
   - '15'
   symbols:
-  - ARBUSDT
-  - OPUSDT
-  - INJUSDT
-  - NEARUSDT
-  - HBARUSDT
-  - AVAXUSDT
   - SOLUSDT
-  - LINKUSDT
-  - ADAUSDT
-  - XRPUSDT
-  - DOGEUSDT
+  - HBARUSDT
   setup_types:
   - breakout_high
-  - breakout_range
   - squeeze_release
   promotion_rules: null
   min_trades: 200
@@ -157,27 +117,26 @@ fleet:
   sub_uid: 524637467
   enabled: true
   enable_ai_stack: true
-  strategy_name: Sub5_HFT_MM
-  role: hft_market_maker
+  strategy_name: Alt05_RangeBreak_Alts25x
+  role: alt_breakout_25x
   automation_mode: LEARN_DRY
-  ai_profile: hft_mm_v1
-  risk_pct: 0.05
-  max_concurrent_positions: 3
+  ai_profile: breakout_v1
+  risk_pct: 0.1
+  max_concurrent_positions: 1
   exit_profile: standard_5
   timeframes:
-  - '1'
+  - '15'
   symbols:
-  - BTCUSDT
-  - ETHUSDT
+  - SOLUSDT
+  - HBARUSDT
   setup_types:
-  - mm_spread_capture
-  - mm_reversion_micro
+  - breakout_range
   promotion_rules: null
-  min_trades: 400
-  min_winrate: 0.49
-  min_avg_r: 0.12
-  min_expectancy_r: 0.05
-  max_drawdown_pct: 15.0
+  min_trades: 200
+  min_winrate: 0.5
+  min_avg_r: 0.25
+  min_expectancy_r: 0.12
+  max_drawdown_pct: 20.0
 - account_label: flashback06
   sub_uid: 524638768
   enabled: true
@@ -194,16 +153,7 @@ fleet:
   - '5'
   symbols:
   - SOLUSDT
-  - AVAXUSDT
-  - INJUSDT
-  - LINKUSDT
-  - OPUSDT
-  - ARBUSDT
-  - NEARUSDT
   - HBARUSDT
-  - ADAUSDT
-  - XRPUSDT
-  - DOGEUSDT
   setup_types:
   - scalp_liquidity_sweep
   - scalp_reversal_snapback
@@ -218,107 +168,78 @@ fleet:
   sub_uid: 524649709
   enabled: true
   enable_ai_stack: true
-  strategy_name: Sub7_Canary
-  role: canary_experimental
+  strategy_name: Sniper07_ETH
+  role: sniper_eth
   automation_mode: LEARN_DRY
-  ai_profile: canary_v1
-  risk_pct: 0.1
+  ai_profile: sniper_v1
+  risk_pct: 0.25
   max_concurrent_positions: 1
   exit_profile: standard_5
   timeframes:
   - '5'
-  - '15'
   symbols:
-  - BTCUSDT
   - ETHUSDT
-  - SOLUSDT
-  - LINKUSDT
-  - INJUSDT
-  - AVAXUSDT
-  - OPUSDT
   setup_types:
-  - trend_pullback
-  - breakout_high
-  - swing_trend_continuation
+  - sniper_liquidity_sweep
+  - sniper_breakout_impulse
   promotion_rules: null
   min_trades: 150
   min_winrate: 0.52
-  min_avg_r: 0.3
-  min_expectancy_r: 0.18
-  max_drawdown_pct: 18.0
+  min_avg_r: 0.35
+  min_expectancy_r: 0.2
+  max_drawdown_pct: 25.0
 - account_label: flashback08
   sub_uid: 524650929
   enabled: true
   enable_ai_stack: true
-  strategy_name: Alt08_SwingTrend_Alts25x
-  role: alt_swing_trend_25x
+  strategy_name: Sniper08_SOL
+  role: sniper_sol
   automation_mode: LEARN_DRY
-  ai_profile: swing_v1
-  risk_pct: 0.1
-  max_concurrent_positions: 1
-  exit_profile: standard_5
-  timeframes:
-  - '30'
-  - '240'
-  symbols:
-  - SOLUSDT
-  - AVAXUSDT
-  - INJUSDT
-  - LINKUSDT
-  - OPUSDT
-  - ARBUSDT
-  - NEARUSDT
-  - HBARUSDT
-  - ADAUSDT
-  - XRPUSDT
-  - DOGEUSDT
-  setup_types:
-  - swing_trend_follow
-  - swing_reversion_extreme
-  promotion_rules: null
-  min_trades: 150
-  min_winrate: 0.5
-  min_avg_r: 0.3
-  min_expectancy_r: 0.15
-  max_drawdown_pct: 20.0
-- account_label: flashback09
-  sub_uid: 524693375
-  enabled: true
-  enable_ai_stack: true
-  strategy_name: Alt09_RangeFade_Alts25x
-  role: alt_range_fade_25x
-  automation_mode: LEARN_DRY
-  ai_profile: range_v1
-  risk_pct: 0.1
+  ai_profile: sniper_v1
+  risk_pct: 0.25
   max_concurrent_positions: 1
   exit_profile: standard_5
   timeframes:
   - '5'
-  - '15'
   symbols:
-  - ARBUSDT
-  - OPUSDT
-  - NEARUSDT
-  - HBARUSDT
   - SOLUSDT
-  - AVAXUSDT
-  - LINKUSDT
-  - ADAUSDT
-  - XRPUSDT
-  - DOGEUSDT
   setup_types:
-  - intraday_range_fade
-  - failed_breakout_fade
+  - sniper_liquidity_sweep
+  - sniper_breakout_impulse
   promotion_rules: null
-  min_trades: 180
-  min_winrate: 0.5
-  min_avg_r: 0.25
-  min_expectancy_r: 0.12
-  max_drawdown_pct: 20.0
+  min_trades: 150
+  min_winrate: 0.52
+  min_avg_r: 0.35
+  min_expectancy_r: 0.2
+  max_drawdown_pct: 25.0
+- account_label: flashback09
+  sub_uid: 524693375
+  enabled: true
+  enable_ai_stack: true
+  strategy_name: Sniper09_FARTCOIN
+  role: sniper_fartcoin
+  automation_mode: LEARN_DRY
+  ai_profile: sniper_v1
+  risk_pct: 0.25
+  max_concurrent_positions: 1
+  exit_profile: standard_5
+  timeframes:
+  - '5'
+  symbols:
+  - FARTCOINUSDT
+  setup_types:
+  - sniper_liquidity_sweep
+  - sniper_breakout_impulse
+  promotion_rules: null
+  min_trades: 150
+  min_winrate: 0.52
+  min_avg_r: 0.35
+  min_expectancy_r: 0.2
+  max_drawdown_pct: 25.0
 - account_label: flashback10
   sub_uid: 524700541
   enabled: false
-  enable_ai_stack: false
+  enable_ai_stack: true
   strategy_name: Sub10_ManualOnly
   role: manual_discretionary
   automation_mode: 'OFF'
@@ -326,25 +247,8 @@ fleet:
   risk_pct: 0.01
   max_concurrent_positions: 0
   exit_profile: standard_5
-  timeframes:
-  - '5'
-  - '15'
-  symbols:
-  - BTCUSDT
-  - ETHUSDT
-  - SOLUSDT
-  - XRPUSDT
-  - ADAUSDT
-  - LINKUSDT
-  - INJUSDT
-  - OPUSDT
-  - AVAXUSDT
-  - DOGEUSDT
-  - NEARUSDT
-  - ARBUSDT
-  - HBARUSDT
-  - FARTCOINUSDT
-  - PUMPFUNUSDT
+  timeframes: []
+  symbols: []
   setup_types: []
   promotion_rules: null
 - account_label: main
@@ -356,18 +260,9 @@ fleet:
   automation_mode: 'OFF'
   ai_profile: manual_v1
   risk_pct: 0.01
-  max_concurrent_positions: 1
+  max_concurrent_positions: 0
   exit_profile: standard_10
-  timeframes:
-  - '5'
-  - '15'
-  symbols:
-  - BTCUSDT
-  - ETHUSDT
-  - SOLUSDT
-  - XRPUSDT
-  - ADAUSDT
-  - LINKUSDT
-  - AVAXUSDT
+  timeframes: []
+  symbols: []
   setup_types: []
   promotion_rules: null

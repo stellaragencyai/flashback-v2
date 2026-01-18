@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Flashback — AI Action Router v3.1 (Confidence-Gated + Perf-Store Gated)
+Flashback — AI Action Router v3.1.1 (Confidence-Gated + Perf-Store Gated + VENV-ONLY HARD GATE)
 
 Role
 ----
@@ -10,28 +10,63 @@ Tails AI Action Bus (state/ai_actions.jsonl) and processes validated actions for
   • Telegram notify (confidence-gated)
   • Future execution eligibility (just labeled for now)
 
-Phase 3 covered
----------------
-✅ Step 9: Wire Confidence → Action Router
-✅ Step 12: Enforce Setup Performance Gate (UNPROVEN/PROBATION/APPROVED)
-
 Compatibility
 -------------
 Accepts BOTH:
   A) envelope shape: {"label":..., "ts_ms":..., "action":{...}}
   B) flat shape     : {"account_label":..., "ts_ms":..., ...action_fields...}
+
+Hard safety
+-----------
+- Refuses to run unless launched under repo venv python:
+    <ROOT>\\.venv\\Scripts\\python.exe
+This prevents accidental Python312 system-interpreter launches.
 """
 
 from __future__ import annotations
 
 import os
+import sys
 import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 import orjson
 
+# ---------------------------------------------------------------------------
+# HARD GATE: venv-only
+# ---------------------------------------------------------------------------
+
+def _repo_root() -> Path:
+    # .../app/bots/ai_action_router.py -> repo root is 2 parents up
+    return Path(__file__).resolve().parents[2]
+
+
+def _expected_venv_python(root: Path) -> Path:
+    # Windows venv layout for this repo
+    return (root / ".venv" / "Scripts" / "python.exe").resolve()
+
+
+def _hard_gate_venv_only() -> None:
+    root = _repo_root()
+    expected = _expected_venv_python(root)
+    actual = Path(sys.executable).resolve()
+
+    if not expected.exists():
+        raise SystemExit(f"STOP Missing expected venv python: {expected}")
+
+    if actual != expected:
+        raise SystemExit(
+            "STOP ai_action_router must run under repo venv python.\n"
+            f"  expected: {expected}\n"
+            f"  actual  : {actual}"
+        )
+
+
+# ---------------------------------------------------------------------------
 # Core helpers
+# ---------------------------------------------------------------------------
+
 from app.core.flashback_common import (
     send_tg,
     record_heartbeat,
@@ -45,7 +80,6 @@ try:
     from app.core.log import get_logger
 except Exception:  # pragma: no cover
     import logging
-    import sys
 
     def get_logger(name: str) -> "logging.Logger":  # type: ignore
         logger_ = logging.getLogger(name)
@@ -442,6 +476,8 @@ def _tg_throttle() -> bool:
 # ---------------------------------------------------------------------------
 
 def loop() -> None:
+    _hard_gate_venv_only()
+
     if not AI_ROUTER_ENABLED:
         logger.warning("AI Action Router disabled. Exiting.")
         return

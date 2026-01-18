@@ -1,0 +1,268 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+Flashback Orchestrator v2 (Minimal + Reliable)
+
+Goal:
+- Launch multiple subaccounts at once by spawning supervisor_ai_stack.py per lane.
+- Enforce venv python.
+- Enforce per-account file isolation via env vars.
+- Write per-account stdout/stderr logs.
+- Optionally restart crashed lanes.
+
+Default lanes: flashback01..flashback09
+Optional: --include-main, --include-10
+"""
+
+from __future__ import annotations
+
+import argparse
+import os
+import signal
+import subprocess
+import sys
+import time
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Dict, List, Optional
+
+
+@dataclass
+class LaneProc:
+    label: str
+    popen: subprocess.Popen
+    stdout_path: Path
+    stderr_path: Path
+    started_ts: float
+
+
+def _root_from_here() -> Path:
+    # C:\Flashback\app\ops\orchestrator_v2.py -> ROOT is 3 parents up
+    return Path(__file__).resolve().parents[2]
+
+
+def _venv_python(root: Path) -> Path:
+    py = root / ".venv" / "Scripts" / "python.exe"
+    if not py.exists():
+        raise FileNotFoundError(f"Missing venv python: {py}")
+    return py
+
+
+def _ensure_dir(p: Path) -> None:
+    p.mkdir(parents=True, exist_ok=True)
+
+
+def _lane_env(root: Path, label: str) -> Dict[str, str]:
+    """
+    The entire point: isolate each lane's state paths.
+    These env vars are chosen to match what your logs already show and what we discussed:
+    - ACCOUNT_LABEL
+    - POSITIONS_BUS_PATH
+    - EXEC_BUS_PATH
+    - AI_EVENTS_DIR
+    - TRADE_OUTCOME_CURSOR_PATH
+    - ORDERBOOK_BUS_PATH / TRADES_BUS_PATH (optional but helpful)
+    """
+    state = root / "state"
+    _ensure_dir(state)
+
+    # Per-lane directories (especially helpful if you later split ai_events groups)
+    ai_events_dir = state / "ai_events"
+    _ensure_dir(ai_events_dir)
+
+    # If you want deeper split later, change this to state / f"ai_events_{label}"
+    # but keep dashboard aligned with whatever it reads.
+    env = dict(os.environ)
+
+    env["ROOT"] = str(root)
+    env["ACCOUNT_LABEL"] = label
+
+    # Bus paths
+    env["POSITIONS_BUS_PATH"] = str(state / f"positions_bus_{label}.json")
+    env["ORDERBOOK_BUS_PATH"] = str(state / f"orderbook_bus_{label}.json")
+    env["TRADES_BUS_PATH"] = str(state / f"trades_bus_{label}.json")
+    env["PUBLIC_TRADES_PATH"] = str(state / f"public_trades_{label}.jsonl")
+
+    # Execution stream (critical isolation)
+    env["EXEC_BUS_PATH"] = str(state / f"ws_executions_{label}.jsonl")
+
+    # Outcome recorder isolation
+    env["TRADE_OUTCOME_CURSOR_PATH"] = str(state / f"trade_outcome_recorder_{label}.cursor")
+    env["AI_EVENTS_DIR"] = str(ai_events_dir)
+
+    # Optional: make the heartbeat path deterministic (ws_switchboard already uses label, but belt+suspenders)
+    env["WS_HEARTBEAT_PATH"] = str(state / f"ws_switchboard_heartbeat_{label}.txt")
+
+    return env
+
+
+def _spawn_lane(root: Path, py: Path, label: str, logs_dir: Path) -> LaneProc:
+    _ensure_dir(logs_dir)
+
+    stdout_path = logs_dir / f"{label}.stdout.log"
+    stderr_path = logs_dir / f"{label}.stderr.log"
+
+    env = _lane_env(root, label)
+
+    # We run supervisor per lane (it already spawns ws_switchboard/tp_sl/pilot/router/outcomes/etc.)
+    # This is simpler than duplicating that worker logic in orchestrator.
+    cmd = [
+        str(py),
+        str(root / "app" / "bots" / "supervisor_ai_stack.py"),
+    ]
+
+    # Open log files in append mode so restarts keep history.
+    stdout_f = open(stdout_path, "a", encoding="utf-8")
+    stderr_f = open(stderr_path, "a", encoding="utf-8")
+
+    # Creation flags to keep Windows sane:
+    # - CREATE_NEW_PROCESS_GROUP helps CTRL+C handling.
+    creationflags = 0
+    if os.name == "nt":
+        creationflags = subprocess.CREATE_NEW_PROCESS_GROUP  # type: ignore[attr-defined]
+
+    p = subprocess.Popen(
+        cmd,
+        cwd=str(root),
+        env=env,
+        stdout=stdout_f,
+        stderr=stderr_f,
+        creationflags=creationflags,
+    )
+
+    return LaneProc(label=label, popen=p, stdout_path=stdout_path, stderr_path=stderr_path, started_ts=time.time())
+
+
+def _parse_labels(s: Optional[str]) -> List[str]:
+    if not s:
+        return [f"flashback{n:02d}" for n in range(1, 10)]
+    parts = [x.strip() for x in s.split(",") if x.strip()]
+    out: List[str] = []
+    for x in parts:
+        if x.lower() in ("main", "flashback10"):
+            out.append(x.lower() if x.lower() == "main" else "flashback10")
+        else:
+            # allow "01" -> "flashback01"
+            if x.isdigit() and len(x) in (1, 2):
+                out.append(f"flashback{int(x):02d}")
+            else:
+                out.append(x)
+    return out
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--labels", default="", help="Comma list: flashback01,flashback02,... or '01,02,03'. Default = 01..09")
+    ap.add_argument("--include-main", action="store_true", help="Also spawn ACCOUNT_LABEL=main")
+    ap.add_argument("--include-10", action="store_true", help="Also spawn ACCOUNT_LABEL=flashback10")
+    ap.add_argument("--restart", action="store_true", help="Restart crashed lanes")
+    ap.add_argument("--status-every", type=float, default=5.0, help="Seconds between status lines")
+    args = ap.parse_args()
+
+    root = _root_from_here()
+    py = _venv_python(root)
+    logs_dir = root / "state" / "orchestrator_logs"
+    _ensure_dir(logs_dir)
+
+    labels = _parse_labels(args.labels)
+    if args.include_main and "main" not in labels:
+        labels.append("main")
+    if args.include_10 and "flashback10" not in labels:
+        labels.append("flashback10")
+
+    # De-dupe while preserving order
+    seen = set()
+    labels = [x for x in labels if not (x in seen or seen.add(x))]
+
+    print(f"[orchestrator_v2] ROOT={root}")
+    print(f"[orchestrator_v2] PY={py}")
+    print(f"[orchestrator_v2] LOGS={logs_dir}")
+    print(f"[orchestrator_v2] LABELS={labels}")
+    print(f"[orchestrator_v2] RESTART={bool(args.restart)}")
+    sys.stdout.flush()
+
+    procs: Dict[str, LaneProc] = {}
+
+    # Spawn all lanes
+    for lab in labels:
+        lp = _spawn_lane(root, py, lab, logs_dir)
+        procs[lab] = lp
+        print(f"[orchestrator_v2] STARTED {lab} pid={lp.popen.pid} stdout={lp.stdout_path.name} stderr={lp.stderr_path.name}")
+        sys.stdout.flush()
+
+    # Graceful shutdown
+    stop = False
+
+    def _handle_sigint(signum, frame):
+        nonlocal stop
+        stop = True
+
+    signal.signal(signal.SIGINT, _handle_sigint)
+    if hasattr(signal, "SIGTERM"):
+        signal.signal(signal.SIGTERM, _handle_sigint)
+
+    last_status = 0.0
+    while not stop:
+        now = time.time()
+
+        # Periodic status
+        if now - last_status >= float(args.status_every):
+            last_status = now
+            alive = 0
+            dead = 0
+            for lab, lp in procs.items():
+                rc = lp.popen.poll()
+                if rc is None:
+                    alive += 1
+                else:
+                    dead += 1
+            print(f"[orchestrator_v2] STATUS alive={alive} dead={dead} (ctrl+c to stop)")
+            sys.stdout.flush()
+
+        # Restart crashed lanes if enabled
+        if args.restart:
+            for lab, lp in list(procs.items()):
+                rc = lp.popen.poll()
+                if rc is not None:
+                    print(f"[orchestrator_v2] CRASH {lab} rc={rc} -> restarting")
+                    sys.stdout.flush()
+                    try:
+                        procs[lab] = _spawn_lane(root, py, lab, logs_dir)
+                        print(f"[orchestrator_v2] RESTARTED {lab} pid={procs[lab].popen.pid}")
+                        sys.stdout.flush()
+                    except Exception as e:
+                        print(f"[orchestrator_v2] RESTART FAIL {lab}: {e}")
+                        sys.stdout.flush()
+
+        time.sleep(0.25)
+
+    # Shutdown: terminate children
+    print("[orchestrator_v2] SHUTDOWN requested, terminating lanes...")
+    sys.stdout.flush()
+
+    for lab, lp in procs.items():
+        try:
+            if lp.popen.poll() is None:
+                if os.name == "nt":
+                    # Send CTRL+BREAK equivalent to process group if possible
+                    lp.popen.send_signal(signal.CTRL_BREAK_EVENT)  # type: ignore[attr-defined]
+                else:
+                    lp.popen.terminate()
+        except Exception:
+            pass
+
+    # Give them a moment, then hard kill
+    time.sleep(2.0)
+    for lab, lp in procs.items():
+        try:
+            if lp.popen.poll() is None:
+                lp.popen.kill()
+        except Exception:
+            pass
+
+    print("[orchestrator_v2] DONE")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

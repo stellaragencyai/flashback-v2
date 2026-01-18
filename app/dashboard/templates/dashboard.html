@@ -3,564 +3,569 @@
 <head>
   <meta charset="utf-8" />
   <title>Flashback Trading Cockpit</title>
-  <style>
-    :root{
-      --bg: #ffffff;
-      --text: #0f172a;
-      --muted: #64748b;
-      --card: #ffffff;
-      --border: #e2e8f0;
-      --shadow: 0 1px 2px rgba(15, 23, 42, 0.06), 0 10px 30px rgba(15, 23, 42, 0.06);
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
 
-      --green: #16a34a;
-      --red: #dc2626;
-      --yellow: #f59e0b;
-      --gray: #64748b;
-
-      --chip: #f1f5f9;
-      --chipText: #334155;
-
-      --blue: #2563eb;
-      --blueSoft: rgba(37,99,235,.12);
-      --greenSoft: rgba(22,163,74,.12);
-      --redSoft: rgba(220,38,38,.12);
-      --yellowSoft: rgba(245,158,11,.14);
-      --graySoft: rgba(100,116,139,.12);
-    }
-
-    *{box-sizing:border-box}
-    body{
-      font-family: "Segoe UI", system-ui, -apple-system, Arial, sans-serif;
-      background: var(--bg);
-      color: var(--text);
-      margin: 0;
-      padding: 22px;
-    }
-
-    .topbar{
-      display:flex;
-      align-items:flex-start;
-      justify-content:space-between;
-      gap: 16px;
-      margin-bottom: 14px;
-    }
-
-    h1{
-      margin: 0;
-      font-size: 18px;
-      font-weight: 750;
-      letter-spacing: .2px;
-    }
-
-    .subhead{
-      margin: 6px 0 0 0;
-      color: var(--muted);
-      font-size: 13px;
-      display:flex;
-      gap: 10px;
-      flex-wrap: wrap;
-      align-items:center;
-    }
-
-    .btn{
-      display:inline-flex;
-      align-items:center;
-      gap: 8px;
-      padding: 8px 12px;
-      border: 1px solid var(--border);
-      background: #fff;
-      border-radius: 10px;
-      font-size: 12px;
-      color: var(--chipText);
-      font-weight: 650;
-      cursor: default;
-      box-shadow: 0 1px 0 rgba(15, 23, 42, 0.04);
-      white-space: nowrap;
-    }
-
-    .summary{
-      display:grid;
-      grid-template-columns: repeat(4, minmax(210px, 1fr));
-      gap: 12px;
-      margin-bottom: 16px;
-    }
-
-    .sCard{
-      background: var(--card);
-      border: 1px solid var(--border);
-      border-radius: 14px;
-      padding: 12px 14px;
-      box-shadow: var(--shadow);
-      min-height: 72px;
-      display:flex;
-      justify-content:space-between;
-      align-items:flex-start;
-      gap: 10px;
-    }
-
-    .sK{ color: var(--muted); font-size: 12px; font-weight: 650; }
-    .sV{ margin-top: 6px; font-size: 20px; font-weight: 800; letter-spacing:.2px; }
-
-    .grid{
-      display:grid;
-      grid-template-columns:repeat(3, minmax(360px, 1fr));
-      gap: 14px;
-    }
-
-    @media (max-width: 1180px){
-      .summary{ grid-template-columns: repeat(2, minmax(220px, 1fr)); }
-      .grid{ grid-template-columns:repeat(2, minmax(340px, 1fr)); }
-    }
-    @media (max-width: 820px){
-      .summary{ grid-template-columns: 1fr; }
-      .grid{ grid-template-columns: 1fr; }
-    }
-
-    .card{
-      background: var(--card);
-      border: 1px solid var(--border);
-      border-radius: 16px;
-      padding: 14px;
-      box-shadow: var(--shadow);
-      position: relative;
-      overflow:hidden;
-    }
-
-    /* left accent strip driven by state_color */
-    .card::before{
-      content:"";
-      position:absolute;
-      left:0; top:0; bottom:0;
-      width: 6px;
-      background: var(--graySoft);
-    }
-    .card.green::before{ background: rgba(22,163,74,.85); }
-    .card.yellow::before{ background: rgba(245,158,11,.90); }
-    .card.red::before{ background: rgba(220,38,38,.85); }
-    .card.gray::before{ background: rgba(100,116,139,.55); }
-
-    .header{
-      display:flex;
-      justify-content:space-between;
-      align-items:flex-start;
-      gap: 10px;
-      margin-bottom: 10px;
-      padding-left: 6px;
-    }
-
-    .acctWrap{ display:flex; gap: 10px; align-items:center; }
-
-    .avatar{
-      width: 34px; height: 34px;
-      border-radius: 10px;
-      background: #0f172a;
-      color: #fff;
-      display:flex;
-      align-items:center;
-      justify-content:center;
-      font-weight: 900;
-      font-size: 12px;
-      letter-spacing:.4px;
-      flex: 0 0 auto;
-    }
-
-    .acctName{
-      font-size: 14px;
-      font-weight: 900;
-      line-height: 1.15;
-    }
-
-    .acctMeta{
-      margin-top: 3px;
-      font-size: 12px;
-      color: var(--muted);
-      display:flex;
-      gap: 8px;
-      align-items:center;
-      flex-wrap: wrap;
-    }
-
-    .badge{
-      font-size: 11px;
-      font-weight: 900;
-      border-radius: 999px;
-      padding: 3px 10px;
-      border: 1px solid var(--border);
-      background: var(--chip);
-      color: var(--chipText);
-      text-transform: uppercase;
-      letter-spacing: .35px;
-      white-space: nowrap;
-    }
-
-    .badge.green{ background: var(--greenSoft); border-color: rgba(22,163,74,.25); color: var(--green); }
-    .badge.red{ background: var(--redSoft); border-color: rgba(220,38,38,.25); color: var(--red); }
-    .badge.yellow{ background: var(--yellowSoft); border-color: rgba(245,158,11,.35); color: #92400e; }
-    .badge.gray{ background: var(--graySoft); border-color: rgba(100,116,139,.25); color: var(--gray); }
-
-    /* The "green ONLINE button" you asked for */
-    .onlineBtn{
-      font-size: 11px;
-      font-weight: 950;
-      border-radius: 999px;
-      padding: 3px 10px;
-      border: 1px solid var(--border);
-      text-transform: uppercase;
-      letter-spacing: .35px;
-      white-space: nowrap;
-      user-select: none;
-      background: #f8fafc;
-      color: #64748b;
-    }
-    .onlineBtn.on{
-      background: var(--greenSoft);
-      border-color: rgba(22,163,74,.25);
-      color: var(--green);
-    }
-    .onlineBtn.off{
-      background: var(--graySoft);
-      border-color: rgba(100,116,139,.25);
-      color: var(--gray);
-    }
-
-    .rightPills{
-      display:flex;
-      gap: 8px;
-      align-items:center;
-      flex-wrap: wrap;
-      justify-content:flex-end;
-    }
-
-    .twoCols{
-      display:grid;
-      grid-template-columns: 1fr 1fr;
-      gap: 10px;
-      margin: 10px 0 10px 0;
-      padding-left: 6px;
-    }
-
-    .mini{
-      border: 1px solid var(--border);
-      border-radius: 12px;
-      padding: 10px 12px;
-      background: #fff;
-    }
-
-    .miniK{ font-size: 12px; color: var(--muted); font-weight: 650; }
-    .miniV{ margin-top: 6px; font-size: 18px; font-weight: 900; }
-
-    .tabs{
-      display:grid;
-      grid-template-columns: repeat(3, 1fr);
-      gap: 8px;
-      margin: 10px 0;
-      padding-left: 6px;
-    }
-    .tab{
-      text-align:center;
-      border: 1px solid var(--border);
-      border-radius: 10px;
-      padding: 7px 8px;
-      font-size: 12px;
-      color: var(--chipText);
-      background: #f8fafc;
-      font-weight: 800;
-      user-select:none;
-    }
-    .tab.active{
-      background: #fff;
-      box-shadow: 0 1px 0 rgba(15, 23, 42, 0.04);
-    }
-
-    .triple{
-      display:grid;
-      grid-template-columns: repeat(3, 1fr);
-      gap: 10px;
-      margin: 10px 0;
-      padding-left: 6px;
-    }
-    .stat{
-      border: 1px solid var(--border);
-      border-radius: 12px;
-      padding: 10px 12px;
-      background: #fff;
-    }
-    .statK{ font-size: 12px; color: var(--muted); font-weight: 650; }
-    .statV{ margin-top: 6px; font-size: 14px; font-weight: 900; }
-    .pos{ color: var(--green); }
-    .neg{ color: var(--red); }
-
-    .bar{
-      height: 8px;
-      border-radius: 999px;
-      background: #eef2f7;
-      overflow:hidden;
-      margin-top: 8px;
-      border: 1px solid var(--border);
-    }
-    .fill{
-      height: 100%;
-      width: 0%;
-      background: var(--blue);
-    }
-    .barLabel{
-      display:flex;
-      justify-content:space-between;
-      margin-top: 8px;
-      font-size: 12px;
-      color: var(--muted);
-      font-weight: 650;
-      padding-left: 6px;
-    }
-
-    .chips{
-      display:flex;
-      flex-wrap: wrap;
-      gap: 6px;
-      margin-top: 10px;
-      padding-left: 6px;
-    }
-
-    .chip{
-      display:inline-flex;
-      align-items:center;
-      gap: 6px;
-      padding: 5px 10px;
-      border-radius: 999px;
-      border: 1px solid var(--border);
-      background: var(--chip);
-      font-size: 12px;
-      color: var(--chipText);
-      font-weight: 800;
-      white-space: nowrap;
-      max-width: 100%;
-    }
-
-    .footer{
-      margin-top: 10px;
-      font-size: 12px;
-      color: var(--muted);
-      display:flex;
-      justify-content:space-between;
-      gap: 10px;
-      flex-wrap: wrap;
-      padding-left: 6px;
-    }
-
-    .mono{ font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace; }
-  </style>
+  <!-- CSS extracted for sanity -->
+  <link rel="stylesheet" href="{{ url_for('static', filename='css/dashboard.css') }}">
 </head>
 
 <body>
   <div class="topbar">
     <div>
       <h1>Flashback Trading Cockpit</h1>
+
       <div class="subhead">
         <span>Auto-refresh every 4s.</span>
-        <span>Yes, it is aggressive.</span>
-        <span>No, you don’t get a “pause” button.</span>
-        <span class="chip">Cards: {{ rows|length }}</span>
+        <span class="truthPill keep">Cards: {{ rows|length }}</span>
+        <span class="truthPill keep">Mode: {{ (meta.orch_mode if meta else "?")|upper }}</span>
+        <span class="truthPill keep">Subset: {{ (meta.orch_only_labels|join(", ")) if (meta and meta.orch_only_labels) else "ALL" }}</span>
+        <span class="truthPill keep">Last refresh: <span id="lastRefresh">—</span></span>
+      </div>
+
+      <div class="controls">
+        <input id="searchBox" class="input" placeholder="Search account / strategy / role…" />
+        <select id="sortBy" class="select">
+          <option value="acct">Sort: Account</option>
+          <option value="status">Sort: Status</option>
+          <option value="freshness">Sort: Freshness (worst first)</option>
+          <option value="pnl">Sort: PnL (best first)</option>
+          <option value="trades">Sort: Trades (most first)</option>
+        </select>
       </div>
     </div>
-    <div class="btn">Global Dashboard</div>
+
+    <div class="btns">
+      <button class="btn" id="themeToggle" type="button">Dark</button>
+      <a class="btn {% if window=='7d' %}active{% endif %}" href="/?window=7d">7D</a>
+      <a class="btn {% if window=='30d' %}active{% endif %}" href="/?window=30d">30D</a>
+      <a class="btn {% if window=='1y' %}active{% endif %}" href="/?window=1y">1Y</a>
+      <a class="btn {% if window=='all' %}active{% endif %}" href="/?window=all">ALL</a>
+    </div>
   </div>
 
-  {# ------------------------------------------------------------ #}
-  {# Summary tiles computed from rows (truth-first, fail-soft).     #}
-  {# ------------------------------------------------------------ #}
-  {% set ns = namespace(total_equity=0.0, avail=0.0, unreal=0.0, acct_count=0, online_count=0) %}
-  {% for r in rows %}
-    {% if r.account_label and r.account_label not in ["components","version","updatedms","updated_ms","meta","schema_version"] %}
-      {% set ns.acct_count = ns.acct_count + 1 %}
-      {% if (r.online is not none and r.online) or ((r.status or "")|upper in ["RUNNING","ONLINE"]) %}
-        {% set ns.online_count = ns.online_count + 1 %}
+  {% set m = (meta if meta is defined and meta is not none else {}) %}
+  {% set orch_mode = (m.get('orch_mode') if m else None) %}
+  {% set orch_only = (m.get('orch_only_labels') if m else None) %}
+  {% set expected = (m.get('expected_accounts') if m else None) %}
+  {% set missing = (m.get('missing_accounts') if m else None) %}
+  {% set present = (m.get('present_accounts') if m else None) %}
+
+  {% set expected_n = (expected|length if expected is iterable else 0) %}
+  {% set present_n = (present|length if present is iterable else 0) %}
+  {% set missing_n = (missing|length if missing is iterable else 0) %}
+
+  {% set only_n = (orch_only|length if orch_only is iterable else 0) %}
+  {% set running_subset = (true if only_n > 0 and only_n < expected_n else false) %}
+
+  <details class="sysPanel">
+    <summary class="sysSummary">
+      <span class="sysTitle">System Status</span>
+      <span class="sysMini">
+        <span class="sysItem">Orchestrator: <span class="mono">{{ (meta.orch_mode if meta else "?") }}</span></span>
+        <span class="sysItem">Subset: <span class="mono">{{ (meta.orch_only_labels|join(",")) if (meta and meta.orch_only_labels) else "ALL" }}</span></span>
+        <span class="sysItem">Fleet: <span class="mono">{{ present_n }}</span>/<span class="mono">{{ expected_n }}</span></span>
+        {% if running_subset %}
+          <span class="sysWarn">RUNNING SUBSET</span>
+        {% endif %}
+      </span>
+    </summary>
+
+    <div class="sysBody">
+      <div class="sysPills">
+        <span class="sysPill">Window: <span class="mono">{{ window|default("all") }}</span></span>
+        <span class="sysPill">Expected: <span class="mono">{{ expected_n }}</span></span>
+        <span class="sysPill">Present: <span class="mono">{{ present_n }}</span></span>
+        <span class="sysPill">Missing: <span class="mono">{{ missing_n }}</span></span>
+
+        {% if orch_mode %}
+          {% set om = (orch_mode|string)|upper %}
+          <span class="sysPill">Mode: <span class="mono">{{ om }}</span></span>
+        {% else %}
+          <span class="sysPill">Mode: <span class="mono">UNKNOWN</span></span>
+        {% endif %}
+
+        {% if orch_only is iterable and only_n > 0 %}
+          <span class="sysPill">only_labels: <span class="mono">{{ orch_only|join(", ") }}</span></span>
+        {% else %}
+          <span class="sysPill">only_labels: <span class="mono">ALL</span></span>
+        {% endif %}
+      </div>
+
+      {% if running_subset %}
+        <div class="sysNote">
+          ⚠ Dashboard has rows for all accounts, but orchestrator is only running a subset.
+        </div>
       {% endif %}
-    {% endif %}
-    {% if r.total_balance is not none %}
-      {% set ns.total_equity = ns.total_equity + (r.total_balance or 0.0) %}
-    {% endif %}
-    {% if r.available_balance is not none %}
-      {% set ns.avail = ns.avail + (r.available_balance or 0.0) %}
-    {% endif %}
-    {# We don’t have true unrealized PnL yet. Use 24h truth pnl as a proxy. #}
-    {% if r.ltm_pnl_24h is not none %}
-      {% set ns.unreal = ns.unreal + (r.ltm_pnl_24h or 0.0) %}
+    </div>
+  </details>
+
+  {% set ns = namespace(acct_count=0, online_count=0, total_trades=0, pnl_sum=0.0, stale_count=0, dead_count=0, sim_count=0) %}
+  {% for r in rows %}
+    {% if r.account_label %}
+      {% set ns.acct_count = ns.acct_count + 1 %}
+      {% if r.is_online %}{% set ns.online_count = ns.online_count + 1 %}{% endif %}
+      {% set ns.total_trades = ns.total_trades + (r.total_trades or 0) %}
+      {% set ns.pnl_sum = ns.pnl_sum + (r.pnl_usd_total or 0.0) %}
+      {% set f = (r.outcomes_freshness_sec if r.outcomes_freshness_sec is not none else none) %}
+      {% if f is not none and f|float > 3600 %}{% set ns.stale_count = ns.stale_count + 1 %}{% endif %}
+      {% if f is not none and f|float > 86400 %}{% set ns.dead_count = ns.dead_count + 1 %}{% endif %}
+      {% set m2 = (r.automation_mode or "")|upper %}
+      {% if "LIVE" not in m2 %}{% set ns.sim_count = ns.sim_count + 1 %}{% endif %}
     {% endif %}
   {% endfor %}
 
   <div class="summary">
     <div class="sCard">
       <div>
-        <div class="sK">Total Equity</div>
-        <div class="sV">${{ "%.2f"|format(ns.total_equity) }}</div>
+        <div class="sK">Total Trades ({{ window|default("all") }})</div>
+        <div class="sV" id="sumTotalTrades">{{ ns.total_trades }}</div>
       </div>
     </div>
+
     <div class="sCard">
       <div>
-        <div class="sK">Available Balance</div>
-        <div class="sV">${{ "%.2f"|format(ns.avail) }}</div>
-      </div>
-    </div>
-    <div class="sCard">
-      <div>
-        <div class="sK">“Unrealized” PnL (proxy: 24h)</div>
-        <div class="sV {% if ns.unreal >= 0 %}pos{% else %}neg{% endif %}">
-          ${{ "%.2f"|format(ns.unreal) }}
+        <div class="sK">PnL Total USD ({{ window|default("all") }})</div>
+        <div class="sV {% if ns.pnl_sum >= 0 %}pos{% else %}neg{% endif %}" id="sumPnlTotal">
+          ${{ "%.2f"|format(ns.pnl_sum) }}
         </div>
       </div>
     </div>
+
     <div class="sCard">
       <div>
         <div class="sK">Online / Total</div>
-        <div class="sV">{{ ns.online_count }} / {{ ns.acct_count }}</div>
+        <div class="sV" id="sumOnlineTotal">{{ ns.online_count }} / {{ ns.acct_count }}</div>
+      </div>
+    </div>
+
+    <div class="sCard">
+      <div>
+        <div class="sK">Stale / Dead Outcomes</div>
+        <div class="sV" id="sumStaleDead">{{ ns.stale_count }} / {{ ns.dead_count }}</div>
+      </div>
+    </div>
+
+    <div class="sCard">
+      <div>
+        <div class="sK">SIMULATED Cards</div>
+        <div class="sV" id="sumSimCards">{{ ns.sim_count }}</div>
       </div>
     </div>
   </div>
 
-  <div class="grid">
-    {% for r in rows %}
-      {# ------------------------------------------------------------ #}
-      {# Per-card deterministic display values (fail-soft).            #}
-      {# ------------------------------------------------------------ #}
+  {% set fb_rows = rows|rejectattr('account_label','equalto','main')|list %}
+  {% set main_rows = rows|selectattr('account_label','equalto','main')|list %}
+  {% set ordered = fb_rows + main_rows %}
+
+  <div class="grid" id="cardsGrid">
+    {% for r in ordered %}
       {% set acct = (r.account_label or "unknown") %}
-      {% set status = (r.status or "UNKNOWN")|upper %}
-      {% set color = (r.state_color or "gray") %}
-      {% set strat = (r.strategy_name or "unknown") %}
+      {% set strat = (r.strategy or "unknown") %}
       {% set mode = (r.automation_mode or "unknown") %}
       {% set role = (r.role or "") %}
-      {% set ai = (r.ai_profile or "") %}
+      {% set enabled = (true if (r.enabled is not none and r.enabled) else false) %}
+      {% set is_online = (true if r.is_online else false) %}
+      {% set sup_ok = (true if (r.get('supervisor_ok')) else false) %}
+      {% set sup_age = (r.get('supervisor_age_sec')) %}
+      {% set dead = (r.workers_dead if r.workers_dead is not none else []) %}
+      {% set dead_count = (dead|length if dead is not none else 0) %}
 
-      {# Online truth: prefer r.online boolean; else infer from status string #}
-      {% set is_online = false %}
-      {% if r.online is not none %}
-        {% set is_online = (true if r.online else false) %}
-      {% else %}
-        {% if status in ["RUNNING","ONLINE"] %}
-          {% set is_online = true %}
-        {% endif %}
+      {% set fresh = (r.outcomes_freshness_sec if r.outcomes_freshness_sec is not none else none) %}
+      {% set trades = (r.total_trades if r.total_trades is not none else 0) %}
+
+      {% set stale = (true if (trades|int > 0 and fresh is not none and fresh|float > 3600) else false) %}
+      {% set dead_outcomes = (true if (trades|int > 0 and fresh is not none and fresh|float > 86400) else false) %}
+
+      {% set status_norm = "UNKNOWN" %}
+      {% if not enabled %}
+        {% set status_norm = "STOPPED" %}
+      {% elif is_online and sup_ok and dead_count == 0 %}
+        {% set status_norm = "ONLINE" %}
+      {% elif is_online and (not sup_ok or dead_count > 0) %}
+        {% set status_norm = "DEGRADED" %}
+      {% elif enabled and not is_online %}
+        {% set status_norm = "OFFLINE" %}
       {% endif %}
 
-      {# Avatar: MA for main, else FB01..FB10 #}
       {% if acct == "main" %}
         {% set avatar = "MA" %}
         {% set acct_name = "Main Trading Account" %}
       {% else %}
         {% set digits = acct|replace("flashback","") %}
         {% set digits = digits|replace("_","") %}
-        {% if digits|length == 1 %}
-          {% set digits = "0" ~ digits %}
-        {% endif %}
+        {% if digits|length == 1 %}{% set digits = "0" ~ digits %}{% endif %}
         {% set avatar = "FB" ~ digits %}
         {% set acct_name = acct %}
       {% endif %}
 
-      <div class="card {{ color }}">
+      {% if r.win_rate_pct is not none %}
+        {% set win_pct = r.win_rate_pct|float %}
+      {% else %}
+        {% set wr = (r.win_rate if r.win_rate is not none else 0.0) %}
+        {% set win_pct = (wr|float * 100.0) %}
+      {% endif %}
+
+      {% set pnl = (r.pnl_usd_total if r.pnl_usd_total is not none else 0.0) %}
+      {% set pnl_avg = (r.pnl_usd_avg if r.pnl_usd_avg is not none else 0.0) %}
+      {% set trades = (r.total_trades if r.total_trades is not none else 0) %}
+      {% set last_iso = (r.outcomes_last_ts_iso if r.outcomes_last_ts_iso else "—") %}
+
+      {% set mU = (mode|upper) %}
+      {% set is_live = (true if "LIVE" in mU else false) %}
+      {% set funds_source = ("REAL" if is_live else "SIM") %}
+      {% set is_sim = (not is_live) %}
+
+      {% set cardFlags = "" %}
+      {% if is_sim %}{% set cardFlags = cardFlags ~ " sim" %}{% endif %}
+
+      <div class="card{{ cardFlags }}"
+           data-acct="{{ acct|e }}"
+           data-strat="{{ strat|e }}"
+           data-role="{{ role|e }}"
+           data-status="{{ status_norm|e }}"
+           data-fresh="{{ fresh if fresh is not none else 0 }}"
+           data-pnl="{{ pnl }}"
+           data-trades="{{ trades }}">
+        <div class="watermark">SIMULATED</div>
+
         <div class="header">
           <div class="acctWrap">
             <div class="avatar">{{ avatar|upper }}</div>
             <div>
               <div class="acctName">{{ acct_name }}</div>
               <div class="acctMeta">
-                <span class="chip">{{ mode }}</span>
-                <span class="chip">Strategy: {{ strat }}</span>
-                {% if role %}<span class="chip">Role: {{ role }}</span>{% endif %}
-                {% if ai %}<span class="chip">AI: {{ ai }}</span>{% endif %}
+                <span class="badge {% if is_live %}green{% else %}gray{% endif %} js-mode">{{ mU }}</span>
+                <span class="badge {% if r.funds_source == "REAL" %}green{% else %}gray{% endif %}">FUNDS: {{ r.funds_source if r.funds_source else funds_source }}</span>
+                <span class="chip truncate js-strategy" title="Strategy: {{ strat }}">Strategy: {{ strat }}</span>
+                {% if role %}<span class="chip truncate js-role" title="Role: {{ role }}">Role: {{ role }}</span>{% endif %}
+                {% if meta and meta.orch_only_labels and (acct not in meta.orch_only_labels) %}
+                  <span class="chip" style="opacity:.75;">Not scheduled (subset)</span>
+                {% endif %}
               </div>
             </div>
           </div>
 
           <div class="rightPills">
-            <div class="onlineBtn {% if is_online %}on{% else %}off{% endif %}">
-              {% if is_online %}ONLINE{% else %}OFFLINE{% endif %}
+            <div class="badge js-status">{{ status_norm }}</div>
+            {% if status_norm != "ONLINE" %}
+              {% set why = "" %}
+              {% if r.status_reason %}{% set why = r.status_reason %}
+              {% elif r.orch_reason %}{% set why = r.orch_reason %}
+              {% elif r.orch_status and (r.orch_status|string|upper) == "SKIPPED" %}{% set why = "SKIPPED: " ~ (r.orch_reason or "not scheduled") %}
+              {% elif status_norm == "STOPPED" %}{% set why = "Disabled" %}
+              {% elif status_norm == "OFFLINE" %}{% set why = "Supervisor not running" %}
+              {% elif status_norm == "DEGRADED" %}{% set why = "Degraded workers / supervisor" %}
+              {% else %}{% set why = "Unknown" %}
+              {% endif %}
+              {% if why %}
+                <div class="statusReason" title="{{ why }}">{{ why }}</div>
+              {% endif %}
+            {% endif %}
+          </div>
+        </div>
+
+        <div class="quad">
+          <div class="metric">
+            <div class="metricK">PnL ({{ window|default("all") }})</div>
+            <div class="metricV {% if pnl >= 0 %}pos{% else %}neg{% endif %} js-pnlTotal">${{ "%.2f"|format(pnl) }}</div>
+            <div class="metricSub js-pnlAvg">Avg/trade: ${{ "%.2f"|format(pnl_avg) }}</div>
+          </div>
+
+          <div class="metric">
+            <div class="metricK">Trades</div>
+            <div class="metricV js-trades">{{ trades }}</div>
+            <div class="metricSub">24h LTM: {{ r.ltm_trades_24h if r.ltm_trades_24h is not none else 0 }}</div>
+          </div>
+
+          <div class="metric">
+            <div class="metricK">Win %</div>
+            <div class="metricV js-winRate">{{ "%.2f"|format(win_pct) }}%</div>
+            <div class="metricSub">Mode: {{ mU }}</div>
+          </div>
+
+          <div class="metric">
+            <div class="metricK">Age</div>
+            <div class="metricV mono">
+              {% if trades|int > 0 and fresh is not none %}
+                <span class="freshHuman js-freshHuman" data-sec="{{ fresh|float }}">—</span>
+              {% else %}
+                —
+              {% endif %}
             </div>
-            <div class="badge {{ color }}">{{ status }}</div>
+            <div class="metricSub">Last: <span class="js-lastOutcome">{{ last_iso }}</span></div>
           </div>
         </div>
 
-        <div class="twoCols">
-          <div class="mini">
-            <div class="miniK">Total Equity</div>
-            <div class="miniV">${{ "%.2f"|format(r.total_balance or 0.0) }}</div>
+        <div class="alertSpacer"></div>
+
+        <details>
+          <summary>Details (debug + ops)</summary>
+          <div class="chips">
+            <span class="truthPill">Enabled: {{ "YES" if enabled else "NO" }}</span>
+            <span class="truthPill">AI Stack: {{ "ON" if (r.get("enable_ai_stack")) else "OFF" }}</span>
+            <span class="truthPill">Workers Running: {{ r.get('workers_running') if r.get('workers_running') is not none else 0 }}</span>
+
+            {% if r.funds_source == "REAL" %}
+              <span class="chip">Balance: ${{ "%.2f"|format(r.balance or 0.0) }}</span>
+            {% else %}
+              <span class="chip">Balance: — (SIM)</span>
+            {% endif %}
           </div>
-          <div class="mini">
-            <div class="miniK">Available Balance</div>
-            <div class="miniV">${{ "%.2f"|format(r.available_balance or 0.0) }}</div>
+
+          <div class="footer">
+            <div class="dim">Truth: <span class="mono">hydrate_dashboard_rows(window={{ window|default("all") }})</span></div>
+            <div class="dim">Last: <span class="mono">{{ last_iso }}</span></div>
           </div>
-        </div>
-
-        <div class="tabs">
-          <div class="tab active">7 Days</div>
-          <div class="tab">30 Days</div>
-          <div class="tab">1 Year</div>
-        </div>
-
-        <div class="triple">
-          <div class="stat">
-            <div class="statK">Trades</div>
-            <div class="statV">{{ r.total_trades or 0 }}</div>
-          </div>
-          <div class="stat">
-            <div class="statK">PnL (24h)</div>
-            <div class="statV {% if (r.ltm_pnl_24h or 0.0) >= 0 %}pos{% else %}neg{% endif %}">
-              ${{ "%.2f"|format(r.ltm_pnl_24h or 0.0) }}
-            </div>
-          </div>
-          <div class="stat">
-            <div class="statK">Win Rate</div>
-            <div class="statV">{{ "%.2f"|format(r.win_rate_pct or 0.0) }}%</div>
-          </div>
-        </div>
-
-        {# Risk bar: prefer manifest risk_pct; else integrity_score as stability proxy #}
-        {% set risk_pct = r.get(risk_pct, 0) %}
-        {% if risk_pct is none %}
-          {% set risk_pct = (r.integrity_score or 0) %}
-        {% endif %}
-        {% set w = risk_pct %}
-        {% if w < 0 %}{% set w = 0 %}{% endif %}
-        {% if w > 100 %}{% set w = 100 %}{% endif %}
-
-        <div class="barLabel">
-          <span>Risk Level</span>
-          <span>{{ "%.1f"|format(risk_pct or 0.0) }}%</span>
-        </div>
-        <div class="bar">
-          <div class="fill" style="width: {{ w }}%"></div>
-        </div>
-
-        <div class="chips">
-          <span class="chip">Integrity: {{ r.integrity_score or 0 }}/100</span>
-          <span class="chip">Join: {{ "%.2f"|format(r.join_pct or 0.0) }}%</span>
-          <span class="chip">Unknown: {{ "%.2f"|format(r.unknown_pct or 0.0) }}%</span>
-          <span class="chip">Buckets: {{ r.n_buckets if r.n_buckets is not none else "—" }}</span>
-          <span class="chip">LTM Trades: {{ r.ltm_trades_24h or 0 }}</span>
-          {% if r.ready_for_full_auto %}
-            <span class="chip">Ready: YES</span>
-          {% else %}
-            <span class="chip">Ready: NO</span>
-          {% endif %}
-          {% if r.cull_recommended %}
-            <span class="chip">Cull: YES</span>
-          {% else %}
-            <span class="chip">Cull: NO</span>
-          {% endif %}
-          {% if r.integrity_alerts and (r.integrity_alerts|length > 0) %}
-            <span class="chip">Alerts: {{ r.integrity_alerts|join(", ") }}</span>
-          {% else %}
-            <span class="chip">Alerts: none</span>
-          {% endif %}
-        </div>
-
-        <div class="footer">
-          <div>Truth: <span class="mono">{{ r.truth_source or "none" }}</span></div>
-          <div>Freshness: <span class="mono">{{ r.freshness_sec if r.freshness_sec is not none else "—" }}</span>s</div>
-        </div>
+        </details>
       </div>
     {% endfor %}
   </div>
 
   <script>
-    setTimeout(()=>location.reload(), 4000);
+    // GROUP A: tag status badges with semantic classes for color-only status
+    function tagStatusBadges(){
+      document.querySelectorAll(".badge.js-status").forEach(el=>{
+        const t = (el.textContent || "").trim().toUpperCase();
+        el.classList.remove("ONLINE","OFFLINE","DEGRADED","online","offline","degraded");
+        if(t === "ONLINE"){ el.classList.add("ONLINE","online"); }
+        else if(t === "OFFLINE"){ el.classList.add("OFFLINE","offline"); }
+        else if(t === "DEGRADED"){ el.classList.add("DEGRADED","degraded"); }
+      });
+    }
+
+    function humanSec(sec){
+      sec = Math.max(0, Math.floor(Number(sec||0)));
+      const d = Math.floor(sec / 86400); sec -= d*86400;
+      const h = Math.floor(sec / 3600); sec -= h*3600;
+      const m = Math.floor(sec / 60); sec -= m*60;
+      const parts = [];
+      if (d) parts.push(d+'d');
+      if (h) parts.push(h+'h');
+      if (m) parts.push(m+'m');
+      if (!parts.length) parts.push(sec+'s');
+      else if (sec && parts.length < 3) parts.push(sec+'s');
+      return parts.join(' ');
+    }
+
+    const pageLoadedAt = Date.now();
+    function tickUpdated(){
+      const agoSec = Math.floor((Date.now() - pageLoadedAt)/1000);
+      document.getElementById('lastRefresh').textContent = new Date(pageLoadedAt).toLocaleTimeString();
+      document.querySelectorAll('.updatedAgo').forEach(el=> el.textContent = humanSec(agoSec) + ' ago');
+    }
+
+    function renderFresh(){
+      document.querySelectorAll('.freshHuman').forEach(el=>{
+        const sec = Number(el.getAttribute('data-sec')||0);
+        el.textContent = humanSec(sec);
+      });
+    }
+
+    function applySearchSort(){
+      const q = (document.getElementById('searchBox').value||'').toLowerCase().trim();
+      const sortBy = document.getElementById('sortBy').value;
+      const grid = document.getElementById('cardsGrid');
+      const cards = Array.from(grid.querySelectorAll('.card'));
+
+      cards.forEach(c=>{
+        const hay = [
+          c.getAttribute('data-acct')||'',
+          c.getAttribute('data-strat')||'',
+          c.getAttribute('data-role')||'',
+          c.getAttribute('data-status')||''
+        ].join(' ').toLowerCase();
+        c.style.display = (q==='' || hay.includes(q)) ? '' : 'none';
+      });
+
+      const visible = cards.filter(c=>c.style.display !== 'none');
+
+      const statusRank = (s)=>{
+        s = (s||'').toUpperCase();
+        if (s==='OFFLINE') return 0;
+        if (s==='DEGRADED') return 1;
+        if (s==='ONLINE') return 2;
+        if (s==='STOPPED') return 3;
+        return 4;
+      };
+
+      visible.sort((a,b)=>{
+        if (sortBy==='acct'){
+          return String(a.getAttribute('data-acct')).localeCompare(String(b.getAttribute('data-acct')));
+        }
+        if (sortBy==='status'){
+          return statusRank(a.getAttribute('data-status')) - statusRank(b.getAttribute('data-status'));
+        }
+        if (sortBy==='freshness'){
+          return Number(b.getAttribute('data-fresh')||0) - Number(a.getAttribute('data-fresh')||0);
+        }
+        if (sortBy==='pnl'){
+          return Number(b.getAttribute('data-pnl')||0) - Number(a.getAttribute('data-pnl')||0);
+        }
+        if (sortBy==='trades'){
+          return Number(b.getAttribute('data-trades')||0) - Number(a.getAttribute('data-trades')||0);
+        }
+        return 0;
+      });
+
+      visible.forEach(c=>grid.appendChild(c));
+    }
+
+    document.getElementById('searchBox').addEventListener('input', applySearchSort);
+    document.getElementById('sortBy').addEventListener('change', applySearchSort);
+
+    renderFresh();
+    tickUpdated();
+    tagStatusBadges();
+    applySearchSort();
+    setInterval(tickUpdated, 1000);
+
+    // Theme toggle (persist in localStorage)
+    (function(){
+      const key = "fb_theme";
+      const root = document.documentElement;
+      const btn = document.getElementById("themeToggle");
+      if(!btn) return;
+
+      function applyTheme(t){
+        const theme = (t === "dark") ? "dark" : "light";
+        root.setAttribute("data-theme", theme);
+        btn.textContent = (theme === "dark") ? "Light" : "Dark";
+        try{ localStorage.setItem(key, theme); } catch(e){}
+      }
+
+      let saved = "light";
+      try{ saved = localStorage.getItem(key) || "light"; } catch(e){}
+      applyTheme(saved);
+
+      btn.addEventListener("click", function(){
+        const cur = root.getAttribute("data-theme") || "light";
+        applyTheme(cur === "dark" ? "light" : "dark");
+      });
+    })();
+
+    async function softRefresh(){
+      try{
+        const windowParam = "{{ window|default('all') }}";
+        const [subsResp, metaResp] = await Promise.all([
+          fetch(`/api/subaccounts?window=${encodeURIComponent(windowParam)}`, { cache: "no-store" }),
+          fetch(`/api/dashboard_meta?window=${encodeURIComponent(windowParam)}`, { cache: "no-store" })
+        ]);
+
+        if(!subsResp.ok) return;
+        const rows = await subsResp.json();
+
+        // Summary recompute from rows (mirror server logic)
+        let acctCount=0, onlineCount=0, totalTrades=0, pnlSum=0, staleCount=0, deadCount=0, simCount=0;
+
+        for(const r of rows){
+          if(!r || !r.account_label) continue;
+          acctCount++;
+          if(r.is_online) onlineCount++;
+          totalTrades += Number(r.total_trades||0);
+          pnlSum += Number(r.pnl_usd_total||0);
+
+          const f = (r.outcomes_freshness_sec===null || r.outcomes_freshness_sec===undefined) ? null : Number(r.outcomes_freshness_sec);
+          if(f!==null && f>3600) staleCount++;
+          if(f!==null && f>86400) deadCount++;
+
+          const m = String(r.automation_mode||"").toUpperCase();
+          if(!m.includes("LIVE")) simCount++;
+        }
+
+        const elTotalTrades = document.getElementById("sumTotalTrades");
+        if(elTotalTrades) elTotalTrades.textContent = String(totalTrades);
+
+        const elPnl = document.getElementById("sumPnlTotal");
+        if(elPnl){
+          elPnl.textContent = "$" + pnlSum.toFixed(2);
+          elPnl.classList.toggle("pos", pnlSum>=0);
+          elPnl.classList.toggle("neg", pnlSum<0);
+        }
+
+        const elOnline = document.getElementById("sumOnlineTotal");
+        if(elOnline) elOnline.textContent = `${onlineCount} / ${acctCount}`;
+
+        const elStaleDead = document.getElementById("sumStaleDead");
+        if(elStaleDead) elStaleDead.textContent = `${staleCount} / ${deadCount}`;
+
+        const elSim = document.getElementById("sumSimCards");
+        if(elSim) elSim.textContent = String(simCount);
+
+        // Update per-card fields
+        const byAcct = new Map(rows.map(r => [String(r.account_label), r]));
+
+        document.querySelectorAll(".card").forEach(card=>{
+          const acct = card.getAttribute("data-acct");
+          if(!acct || !byAcct.has(acct)) return;
+          const r = byAcct.get(acct);
+
+          // Update attributes used by sort
+          const pnl = Number(r.pnl_usd_total||0);
+          const trades = Number(r.total_trades||0);
+          const fresh = (r.outcomes_freshness_sec===null || r.outcomes_freshness_sec===undefined) ? 0 : Number(r.outcomes_freshness_sec);
+
+          card.setAttribute("data-pnl", String(pnl));
+          card.setAttribute("data-trades", String(trades));
+          card.setAttribute("data-fresh", String(fresh));
+
+          // Strategy/Role chips
+          const stratEl = card.querySelector(".js-strategy");
+          if(stratEl) stratEl.textContent = "Strategy: " + String(r.strategy||"unknown");
+
+          const roleEl = card.querySelector(".js-role");
+          if(roleEl){
+            const role = String(r.role||"").trim();
+            roleEl.textContent = "Role: " + role;
+          }
+
+          // Mode badge
+          const modeEl = card.querySelector(".js-mode");
+          if(modeEl) modeEl.textContent = String(r.automation_mode||"").toUpperCase();
+
+          // PnL fields
+          const pnlEl = card.querySelector(".js-pnlTotal");
+          if(pnlEl){
+            pnlEl.textContent = "$" + pnl.toFixed(2);
+            pnlEl.classList.toggle("pos", pnl>=0);
+            pnlEl.classList.toggle("neg", pnl<0);
+          }
+
+          const pnlAvg = Number(r.pnl_usd_avg||0);
+          const pnlAvgEl = card.querySelector(".js-pnlAvg");
+          if(pnlAvgEl) pnlAvgEl.textContent = "Avg/trade: $" + pnlAvg.toFixed(2);
+
+          // Last outcome
+          const lastEl = card.querySelector(".js-lastOutcome");
+          if(lastEl) lastEl.textContent = String(r.outcomes_last_ts_iso||"—");
+
+          // Trades / Win
+          const tradesEl = card.querySelector(".js-trades");
+          if(tradesEl) tradesEl.textContent = String(trades);
+
+          const winEl = card.querySelector(".js-winRate");
+          if(winEl){
+            const winPct = Number(r.win_rate_pct||0);
+            winEl.textContent = winPct.toFixed(2) + "%";
+          }
+
+          // Freshness
+          const freshEl = card.querySelector(".js-freshHuman");
+          if(freshEl){
+            freshEl.setAttribute("data-sec", String(fresh));
+            freshEl.textContent = humanSec(fresh);
+          }
+        });
+
+        applySearchSort();
+        tickUpdated();
+        tagStatusBadges();
+
+      } catch(e){
+        // fail-soft: do nothing
+      }
+    }
+
+    setInterval(softRefresh, 4000);
   </script>
 </body>
 </html>

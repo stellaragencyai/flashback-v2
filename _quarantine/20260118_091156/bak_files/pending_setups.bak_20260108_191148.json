@@ -1,0 +1,98 @@
+{
+  "TEST_JOINABLE_0df89729": {
+    "account_label": "flashback01",
+    "payload": {
+      "features": {
+        "risk_usd": 1.0,
+        "setup_fingerprint": "FORCED_FP_TEST_JOINABLE_0df89729"
+      },
+      "setup_type": "test_setup"
+    },
+    "strategy": "test_strategy",
+    "strategy_name": "test_strategy",
+    "symbol": "BTCUSDT",
+    "timeframe": "1m",
+    "trade_id": "TEST_JOINABLE_0df89729",
+    "ts": 1767922304063
+  },
+  "TEST_JOINABLE_FIXED_f385a8ce": {
+    "account_label": "flashback01",
+    "ai_state_snapshot": {
+      "account_label": "flashback01",
+      "features": {
+        "note": "fixed setup_type placement test"
+      },
+      "policy_hash": "16f7d129171be8f8d895031ee61aca20ee395141516e9c7aa1cb94ac4cd8d79b",
+      "setup_type": "test_setup",
+      "side": null,
+      "strategy": "test_strategy",
+      "symbol": "BTCUSDT",
+      "timeframe": "1m"
+    },
+    "capital_intent": {
+      "dry_run": false,
+      "notional_usd": null,
+      "risk_pct": null,
+      "risk_usd": 1,
+      "side": null
+    },
+    "component": "ai_events_spine",
+    "decision_context": {
+      "account_label": "flashback01",
+      "ai_profile": null,
+      "setup_type": "test_setup",
+      "state": {
+        "account_label": "flashback01",
+        "features": {
+          "note": "fixed setup_type placement test"
+        },
+        "policy_hash": "16f7d129171be8f8d895031ee61aca20ee395141516e9c7aa1cb94ac4cd8d79b",
+        "setup_type": "test_setup",
+        "side": null,
+        "strategy": "test_strategy",
+        "symbol": "BTCUSDT",
+        "timeframe": "1m"
+      },
+      "strategy": "test_strategy",
+      "symbol": "BTCUSDT",
+      "timeframe": "1m",
+      "trade_id": "TEST_JOINABLE_FIXED_f385a8ce"
+    },
+    "event_id": "53bf6e12-1c21-4c72-b0db-4b9713aecd67",
+    "event_seq": 1,
+    "event_ts_ms": 1767924069393,
+    "event_type": "setup_context",
+    "host": "Home",
+    "learning_valid": true,
+    "payload": {
+      "extra": {
+        "timeframe": "1m"
+      },
+      "features": {
+        "memory_fingerprint": "26657b714cbd35316ffbfa6862afb88faa468a4ee1ce5fea5ecf9fd0f1d9df64",
+        "note": "fixed setup_type placement test",
+        "risk_usd": 1,
+        "setup_fingerprint": "df3bbad75b930ac5ed270e996ac73220b8c7bfb8d3139c60f120d0ade93cc340"
+      }
+    },
+    "pid": 34400,
+    "policy": {
+      "exit_profiles_version": 3,
+      "paths": {
+        "exit_profiles": "C:\\Flashback\\config\\exit_profiles.yaml",
+        "risk_profiles": "C:\\Flashback\\config\\risk_profiles.yaml",
+        "strategies": "C:\\Flashback\\config\\strategies.yaml"
+      },
+      "policy_hash": "16f7d129171be8f8d895031ee61aca20ee395141516e9c7aa1cb94ac4cd8d79b",
+      "risk_profiles_version": 2,
+      "strategies_version": 8
+    },
+    "setup_type": "test_setup",
+    "strategy": "test_strategy",
+    "symbol": "BTCUSDT",
+    "thread_id": 21980,
+    "timeframe": "1m",
+    "trade_id": "TEST_JOINABLE_FIXED_f385a8ce",
+    "ts": 1767924069393
+  }
+}

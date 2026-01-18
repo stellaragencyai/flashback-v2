@@ -47,6 +47,7 @@ v2 Enhancements (backward compatible)
 
 from __future__ import annotations
 
+import os
 import threading
 import time
 from pathlib import Path
@@ -67,6 +68,11 @@ STATE_DIR.mkdir(parents=True, exist_ok=True)
 
 def _now_ms() -> int:
     return int(time.time() * 1000)
+
+
+def _env_bool(name: str, default: str = "false") -> bool:
+    raw = os.getenv(name, default)
+    return str(raw).strip().lower() in ("1", "true", "yes", "y", "on")
 
 
 class StateBus:
@@ -370,17 +376,23 @@ class StateBus:
 
     def log_ws_execution(self, label: str, ts_ms: int, row: Dict[str, Any]) -> None:
         """
-        Backward compatible: writes to state/ws_executions.jsonl with the
-        same shape trade_journal expects:
-            { "label": "<label>", "ts": <epoch_ms>, "row": { ...exec row... } }
+        Execution log routing:
+          - main/primary -> state/ws_executions.jsonl (back-compat)
+          - subs (flashbackXX, etc) -> state/ws_executions_<label>.jsonl
+
+        Set ALLOW_GLOBAL_EXEC_BUS=true to force subs onto the global file (not recommended).
         """
-        payload = {
-            "label": label,
-            "ts": ts_ms,
-            "row": row,
-        }
-        # Keep the historical file name so journal continues to work.
-        self.append_log("ws_executions", payload)
+        payload = {"label": label, "ts": ts_ms, "row": row}
+
+        lab = (label or "").strip().lower()
+        if not lab:
+            lab = "main"
+
+        is_main = lab in ("main", "primary")
+        allow_global = _env_bool("ALLOW_GLOBAL_EXEC_BUS", "false")
+
+        topic = "ws_executions" if (is_main or allow_global) else f"ws_executions_{lab}"
+        self.append_log(topic, payload)
 
     # ---------- group helpers (namespaced topics) ----------
 

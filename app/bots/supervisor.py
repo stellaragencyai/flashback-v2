@@ -1,45 +1,10 @@
-#!/usr/bin/env python3
-# Flashback — Supervisor v4.8 (Root-aware + Subaccount Status + Central + Optional Sub-bot Pings)
+﻿#!/usr/bin/env python3
+# Flashback — Supervisor v4.9 (VENV-PINNED SPAWNS + No sys.executable)
 #
-# What this does:
-# - Forces project root as working directory so imports and .env are consistent.
-# - Loads .env from project root explicitly.
-# - On startup:
-#     • Checks Bybit connectivity for MAIN + flashback01..flashback10
-#     • Sends a Telegram "boot report" with subaccount status + planned bots
-#     • Sends a per-subaccount "online" confirmation to your MAIN Telegram chat
-#     • Optionally sends "bot online" confirmation to subaccount Telegram bots
-#       (only if app.core.subs.load_subs / send_tg_to_sub exist)
-# - Keeps all core bots running; auto-restarts on crash.
-# - Logs each bot's stdout/stderr to app/logs/*.log
-# - Sends Telegram alerts on bot start/crash + periodic heartbeat.
-#
-# Expected .env keys (with some fallbacks):
-#
-#   BYBIT_BASE=https://api.bybit.com   (optional; defaults to mainnet)
-#
-#   # Preferred:
-#   BYBIT_MAIN_API_KEY=...
-#   BYBIT_MAIN_API_SECRET=...
-#
-#   # Fallbacks for MAIN (if above not set):
-#   BYBIT_MAIN_READ_KEY=...
-#   BYBIT_MAIN_READ_SECRET=...
-#   BYBIT_MAIN_TRADE_KEY=...
-#   BYBIT_MAIN_TRADE_SECRET=...
-#
-#   # Subaccounts (optional until you wire them):
-#   BYBIT_FLASHBACK01_API_KEY=...
-#   BYBIT_FLASHBACK01_API_SECRET=...
-#   ...
-#   BYBIT_FLASHBACK10_API_KEY=...
-#   BYBIT_FLASHBACK10_API_SECRET=...
-#
-#   TG_TOKEN_MAIN=...
-#   TG_CHAT_MAIN=...
-#
-#   # Optional:
-#   SUPERVISOR_HEARTBEAT_SEC=300
+# Permanent fix:
+# - NEVER spawn bots using sys.executable (prevents Python312 contamination).
+# - ALWAYS spawn bots using <ROOT>\.venv\Scripts\python.exe
+# - Still root-aware + .env load for legacy runs.
 
 import subprocess
 import time
@@ -54,20 +19,19 @@ import traceback
 from dotenv import load_dotenv
 
 from app.core.notifier_bot import get_notifier
-from app.core.flashback_common import bybit_get  # NEW: use shared Bybit client
+from app.core.flashback_common import bybit_get  # shared Bybit client
 
 # Optional: these may not exist yet, so we degrade gracefully
 try:
     from app.core.subs import load_subs, send_tg_to_sub  # type: ignore
-except Exception:  # noqa: BLE001
+except Exception:
     load_subs = None   # type: ignore[assignment]
     send_tg_to_sub = None  # type: ignore[assignment]
 
-SUPERVISOR_VERSION = "4.8"
+SUPERVISOR_VERSION = "4.9"
 
 # ---------- PATHS & ENV ----------
 
-# This file is expected at: project_root/app/bots/supervisor.py
 THIS_FILE = Path(__file__).resolve()
 BOTS_DIR = THIS_FILE.parent            # .../app/bots
 APP_DIR = BOTS_DIR.parent              # .../app
@@ -76,59 +40,39 @@ ROOT_DIR = APP_DIR.parent              # project_root
 # Ensure we always behave as if running from project_root
 os.chdir(ROOT_DIR)
 
-# Load .env from project root explicitly
+# Load .env from project root explicitly (legacy/manual runs)
 ENV_PATH = ROOT_DIR / ".env"
 load_dotenv(dotenv_path=ENV_PATH)
 
 BYBIT_BASE = os.getenv("BYBIT_BASE", "https://api.bybit.com").rstrip("/")
 
-# Supervisor heartbeat interval (seconds), overridable via env
 HEARTBEAT_INTERVAL = int(os.getenv("SUPERVISOR_HEARTBEAT_SEC", "300"))
 
-# Central notifier
 tg = get_notifier("main")
 
-# ---------- TELEGRAM HELPERS ----------
-
 def _tg_configured() -> bool:
-    """Return True if central notifier has a usable token + chat."""
     return bool(getattr(tg, "token", None) and getattr(tg, "chat_id", None))
 
-
 def send_tg(msg: str) -> None:
-    """
-    Send a Telegram message via the central notifier.
-    Safe: will not crash supervisor if Telegram fails or is misconfigured.
-    """
     if not _tg_configured():
-        # Still print locally so you see *something* in logs
         print(f"[SUPERVISOR][TG disabled] {msg}")
         return
     try:
         tg.info(msg)
     except Exception:
-        # Never let Telegram kill the supervisor
         print(f"[SUPERVISOR][TG error] {msg}")
 
-# ---------- BYBIT SUBACCOUNT CHECKS (using shared flashback_common client) ----------
+def _venv_python() -> Path:
+    py = (ROOT_DIR / ".venv" / "Scripts" / "python.exe").resolve()
+    if not py.exists():
+        raise FileNotFoundError(f"Missing venv python: {py}")
+    return py
 
 def _load_subaccount_creds(prefix: str) -> Tuple[Optional[str], Optional[str]]:
-    """
-    Load key/secret from env using the given prefix.
-
-    Example: prefix="BYBIT_FLASHBACK01" ->
-         BYBIT_FLASHBACK01_API_KEY
-         BYBIT_FLASHBACK01_API_SECRET
-
-    For MAIN, also supports your existing naming pattern:
-        BYBIT_MAIN_READ_KEY / BYBIT_MAIN_READ_SECRET
-        BYBIT_MAIN_TRADE_KEY / BYBIT_MAIN_TRADE_SECRET
-    """
     key = os.getenv(f"{prefix}_API_KEY")
     secret = os.getenv(f"{prefix}_API_SECRET")
 
     if prefix == "BYBIT_MAIN":
-        # Fallbacks if the *_API_* variant is not set
         if not key:
             key = os.getenv("BYBIT_MAIN_READ_KEY") or os.getenv("BYBIT_MAIN_TRADE_KEY")
         if not secret:
@@ -136,14 +80,7 @@ def _load_subaccount_creds(prefix: str) -> Tuple[Optional[str], Optional[str]]:
 
     return key, secret
 
-
 def check_subaccount(label: str, prefix: str) -> Dict[str, str]:
-    """
-    Check a single subaccount:
-      - If creds missing: status = MISSING_CREDS
-      - If Bybit wallet-balance call works: status = OK, equity string
-      - Else: status = ERROR, detail with exception string
-    """
     api_key, api_secret = _load_subaccount_creds(prefix)
     if not api_key or not api_secret:
         return {
@@ -155,7 +92,6 @@ def check_subaccount(label: str, prefix: str) -> Dict[str, str]:
         }
 
     try:
-        # Use shared, time-synced client from flashback_common
         data = bybit_get(
             "/v5/account/wallet-balance",
             {"accountType": "UNIFIED", "coin": "USDT"},
@@ -163,7 +99,6 @@ def check_subaccount(label: str, prefix: str) -> Dict[str, str]:
             secret=api_secret,
         )
     except Exception as e:
-        # bybit_get already handled 10002 resync / retries; anything here is "real"
         return {
             "label": label,
             "prefix": prefix,
@@ -172,7 +107,6 @@ def check_subaccount(label: str, prefix: str) -> Dict[str, str]:
             "detail": str(e),
         }
 
-    # Try to extract some equity info for the report
     equity_str = ""
     try:
         lst = data.get("result", {}).get("list", [])
@@ -190,11 +124,7 @@ def check_subaccount(label: str, prefix: str) -> Dict[str, str]:
         "detail": "",
     }
 
-
 def check_all_subaccounts() -> List[Dict[str, str]]:
-    """
-    Check MAIN + flashback01..flashback10 and return a list of status dicts.
-    """
     subconfigs = [
         {"label": "MAIN",         "prefix": "BYBIT_MAIN"},
         {"label": "flashback01",  "prefix": "BYBIT_FLASHBACK01"},
@@ -224,11 +154,7 @@ def check_all_subaccounts() -> List[Dict[str, str]]:
         results.append(res)
     return results
 
-
 def format_boot_report(subs: List[Dict[str, str]], bots: List[str]) -> str:
-    """
-    Build a human-readable boot report for Telegram.
-    """
     lines: List[str] = []
     lines.append(f"🚀 Flashback Supervisor v{SUPERVISOR_VERSION} Booted")
     lines.append("")
@@ -260,13 +186,7 @@ def format_boot_report(subs: List[Dict[str, str]], bots: List[str]) -> str:
 
     return "\n".join(lines)
 
-# ---------- Central per-subaccount "online" pings ----------
-
 def notify_subaccounts_online_central(subs: List[Dict[str, str]]) -> None:
-    """
-    For every subaccount in 'subs', send an explicit 'online' message
-    to the MAIN Telegram chat when supervisor starts.
-    """
     if not subs:
         return
 
@@ -286,17 +206,8 @@ def notify_subaccounts_online_central(subs: List[Dict[str, str]]) -> None:
 
         send_tg(msg)
 
-# ---------- Sub-bot "online" notifier (optional) ----------
-
 def notify_sub_bots_online() -> None:
-    """
-    Send a short 'online' ping to every configured subaccount Telegram bot.
-
-    Uses app.core.subs.load_subs() + send_tg_to_sub(), but only if those
-    functions are actually available. If not, this is a no-op.
-    """
     if load_subs is None or send_tg_to_sub is None:
-        # You haven't wired the subs infrastructure yet; just skip.
         return
 
     try:
@@ -319,49 +230,42 @@ def notify_sub_bots_online() -> None:
         except Exception as e:
             send_tg(f"⚠️ Sub-bot notify failed for {sub.get('label', '?')}: {type(e).__name__}")
 
-# ---------- BOT LIST ----------
-
-# app/bots/supervisor.py → BOTS list
-# Current core set: TP/SL, journal, executor_v2, equity drip, tier watcher, risk guardian
 BOTS: List[str] = [
-    # "app.bots.ws_switchboard",     # WS hub: multi-account private streams (TEMP DISABLED)
     "app.bots.tp_sl_manager",
     "app.bots.trade_journal",
     "app.bots.executor_v2",
     "app.bots.equity_drip_bot",
-   # "app.switchboard.server",#
     "app.bots.tier_watcher",
     "app.bots.ws_switchboard",
     "app.bots.risk_guardian",
-     "app.bots.sub_exec_notifier",   # TEMP DISABLED (depends on ws_switchboard)
+    "app.bots.sub_exec_notifier",
 ]
 
 procs: Dict[str, subprocess.Popen] = {}
 restart_counts: Dict[str, int] = {}
 
-# ---------- BOT PROCESS MANAGEMENT ----------
-
 def start(mod: str) -> subprocess.Popen:
-    """Start a bot and log its output."""
     log_dir = APP_DIR / "logs"
     log_dir.mkdir(exist_ok=True)
     log_path = log_dir / f"{mod.replace('.', '_')}.log"
 
     print(f"[START] {mod}")
-    # Comment this out if Telegram startup spam annoys you
     send_tg(f"✅ Bot started: {mod.split('.')[-1]} is now running.")
 
-    # Use ROOT_DIR as the working directory so imports and paths are stable
+    py = _venv_python()
+
+    env = os.environ.copy()
+    env["PYTHONNOUSERSITE"] = "1"
+
     return subprocess.Popen(
-        [sys.executable, "-m", mod],
+        [str(py), "-u", "-m", mod],
         cwd=str(ROOT_DIR),
+        env=env,
         stdout=open(log_path, "a", encoding="utf-8"),
         stderr=subprocess.STDOUT,
     )
 
-
 def stop_all() -> None:
-    """Stop all bots when exiting."""
     print("\n[STOP] Stopping all bots...")
     send_tg("🛑 All Flashback bots are stopping now.")
     for m, p in procs.items():
@@ -376,8 +280,6 @@ def stop_all() -> None:
     send_tg("✅ All bots stopped successfully.")
     print("[STOP] All bots stopped successfully.")
 
-# ---------- MAIN LOOP ----------
-
 def main() -> None:
     print(f"Flashback Supervisor v{SUPERVISOR_VERSION}")
     print(f"Project root: {ROOT_DIR}")
@@ -385,8 +287,8 @@ def main() -> None:
     print(f"TG configured: {'yes' if _tg_configured() else 'no'}")
     print(f"Bybit base:   {BYBIT_BASE}")
     print(f"Heartbeat:    {HEARTBEAT_INTERVAL} sec")
+    print(f"Spawn python: {_venv_python()}")
 
-    # 1) Subaccount status check + boot report
     try:
         subs = check_all_subaccounts()
     except Exception as e:
@@ -396,14 +298,10 @@ def main() -> None:
     if subs:
         boot_msg = format_boot_report(subs, BOTS)
         send_tg(boot_msg)
-
-        # 1a) Explicit per-subaccount "online" messages to MAIN Telegram
         notify_subaccounts_online_central(subs)
 
-    # 1b) Notify all sub-bots that they are "online" (if subs infra exists)
     notify_sub_bots_online()
 
-    # 2) Start all bots
     for m in BOTS:
         procs[m] = start(m)
         restart_counts[m] = 0
@@ -413,7 +311,6 @@ def main() -> None:
 
     try:
         while True:
-            # Check each bot
             for m, p in list(procs.items()):
                 if p.poll() is not None:
                     bot_name = m.split(".")[-1]
@@ -424,7 +321,6 @@ def main() -> None:
                     time.sleep(2)
                     procs[m] = start(m)
 
-            # Periodic heartbeat
             now = time.time()
             if now >= next_heartbeat:
                 alive = sum(1 for p in procs.values() if p.poll() is None)
@@ -445,15 +341,12 @@ def main() -> None:
         stop_all()
     except Exception:
         tb = traceback.format_exc()
-        msg = f"❌ Supervisor fatal error:\n{tb}"
+        msg = f"💥 Supervisor fatal error:\n{tb}"
         print(msg)
         if _tg_configured():
-            try:
+            with contextlib.suppress(Exception):
                 tg.error(msg)
-            except Exception:
-                pass
         stop_all()
-
 
 if __name__ == "__main__":
     main()

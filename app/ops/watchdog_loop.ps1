@@ -6,7 +6,7 @@
 $ErrorActionPreference = "Stop"
 
 if ($OnlyLabels -ne "") {
-  $Env:ORCH_ONLY_LABELS = $OnlyLabels
+if ($OnlyLabels -and $OnlyLabels.Trim().Length -gt 0) { $Env:ORCH_ONLY_LABELS = $OnlyLabels }
 } else {
   Remove-Item Env:ORCH_ONLY_LABELS -ErrorAction SilentlyContinue | Out-Null
 }
@@ -16,3 +16,4 @@ while ($true) {
   python -m app.ops.orchestrator_watchdog | Out-Host
   Start-Sleep -Seconds $IntervalSec
 }
+

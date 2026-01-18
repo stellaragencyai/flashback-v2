@@ -1,75 +1,59 @@
-#!/usr/bin/env python3
+﻿#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Flashback — Trade Classifier v2.2
+Flashback — Trade Classifier v2.3 (Regime-Aware + Score Fallback + Feature Alignment)
 
 Purpose
 -------
-Unified classifier used by the executor + setup memory.
+Unified classifier used by executor_v2 + setup memory.
 
-Two modes:
-
-1) NEW AI GATE MODE (used by executor_v2):
+NEW AI GATE MODE (executor_v2):
     classify(signal: dict, strat_id: str) -> dict
+Returns:
+  {
+    "allow": bool,
+    "score": float | None,
+    "reason": str,
+    "features": dict
+  }
 
-    Returns:
-      {
-        "allow": bool,         # model/policy-based yes/no
-        "score": float | None, # probability from model [0,1] if available
-        "reason": str,         # human-readable summary
-        "features": dict       # feature dict used for scoring & logging
-      }
-
-    - Uses trained model from models/setup_classifier.pkl if present.
-    - Uses per-strategy min_ai_score from setup_memory_policy if available.
-    - Falls back gracefully if model/meta/policy missing or broken.
-
-2) LEGACY LABEL MODE (backward compat):
+LEGACY LABEL MODE (backward compat):
     classify(signal: dict, features: dict) -> str
-
-    - Deterministic heuristic label:
-        "breakout_trend", "pullback_trend", "range_fade",
-        "vol_squeeze_break", "news_spike", "trend_momentum", "unknown"
-    - The old behavior is preserved via an internal helper.
-
-Executor usage (new):
-    from app.core.trade_classifier import classify as classify_trade
-    clf = classify_trade(signal, strat_id)
-
-Other legacy usage (if any) still works:
-    label = classify(signal, features_dict)
 """
 
 from __future__ import annotations
 
 import json
+import time
 from pathlib import Path
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, Optional, Tuple, List
 
+
+# ──────────────────────────────────────────────────────────────────────────
+# Logger
+# ──────────────────────────────────────────────────────────────────────────
 try:
     from app.core.logger import get_logger
 except Exception:
     import logging
 
     def get_logger(name: str) -> "logging.Logger":  # type: ignore
-        """
-        Minimal fallback logger used when app.core.logger is unavailable.
-        """
         logger_ = logging.getLogger(name)
         if not logger_.handlers:
             handler = logging.StreamHandler()
-            fmt = logging.Formatter(
-                "%(asctime)s [%(levelname)s] [%(name)s] %(message)s"
-            )
+            fmt = logging.Formatter("%(asctime)s [%(levelname)s] [%(name)s] %(message)s")
             handler.setFormatter(fmt)
-        logger_.addHandler(handler)
+            logger_.addHandler(handler)
         logger_.setLevel(logging.INFO)
         return logger_
 
 
 log = get_logger("trade_classifier")
 
+
+# ──────────────────────────────────────────────────────────────────────────
 # ROOT / models path
+# ──────────────────────────────────────────────────────────────────────────
 try:
     from app.core.config import settings
 except Exception:
@@ -79,8 +63,7 @@ except Exception:
 
 ROOT: Path = settings.ROOT
 MODELS_DIR: Path = ROOT / "models"
-MODEL_PATH: Path = MODELS_DIR / "setup_classifier.pkl"
-META_PATH: Path = MODELS_DIR / "setup_classifier_meta.json"
+
 
 # Optional policy integration (per-strategy min_ai_score)
 try:
@@ -97,15 +80,13 @@ try:
             return 1.0
         return v
 except Exception:
-    # Fallback: fixed 0.50 threshold if policy module not available
     def _policy_min_ai_score(strategy_id: str) -> float:  # type: ignore[override]
         return 0.5
 
 
-# ---------------------------------------------------------------------------
+# ──────────────────────────────────────────────────────────────────────────
 # Legacy heuristic labeler (kept as-is)
-# ---------------------------------------------------------------------------
-
+# ──────────────────────────────────────────────────────────────────────────
 def _get_lower(d: Dict[str, Any], key: str) -> str:
     v = d.get(key)
     if v is None:
@@ -114,11 +95,6 @@ def _get_lower(d: Dict[str, Any], key: str) -> str:
 
 
 def _legacy_label(signal: Dict[str, Any], features: Dict[str, Any]) -> str:
-    """
-    Legacy deterministic tagger:
-        (signal, features) -> short label string
-    """
-
     reason = _get_lower(signal, "reason")
     pattern = _get_lower(signal, "pattern")
     regime = _get_lower(features, "regime")
@@ -137,86 +113,33 @@ def _legacy_label(signal: Dict[str, Any], features: Dict[str, Any]) -> str:
     except Exception:
         vol_z = 0.0
 
-    # 1) Strong trend + breakout-ish reason
     if adx >= 20 and ("breakout" in reason or "breakout" in pattern):
         if "pullback" in reason or "retest" in reason:
             return "pullback_trend"
         return "breakout_trend"
 
-    # 2) Clear range structure
     if "range" in structure or "range" in reason:
         if any(k in reason for k in ("fade", "revert", "mean")):
             return "range_fade"
         return "range_play"
 
-    # 3) Volatility squeeze then pop
     if "squeeze" in reason or "squeeze" in pattern:
         if vol_z > 1.5 or atr_pct > 1.0:
             return "vol_squeeze_break"
         return "vol_squeeze"
 
-    # 4) News-ish spikes
     if any(k in reason for k in ("news", "event", "fomc", "earnings")):
         return "news_spike"
 
-    # 5) Default momentum in trend
     if adx >= 20:
         return "trend_momentum"
 
     return "unknown"
 
 
-# ---------------------------------------------------------------------------
-# Model loader / live feature extraction
-# ---------------------------------------------------------------------------
-
-_MODEL = None
-_MODEL_FEATURES: Optional[list[str]] = None
-_MODEL_META: Dict[str, Any] = {}
-
-
-def _load_model_once() -> None:
-    """
-    Lazy-load the classifier model and its metadata.
-
-    On any failure, we drop into "no_model_loaded" mode and keep
-    allowing trades by default while still returning features.
-    """
-    global _MODEL, _MODEL_FEATURES, _MODEL_META
-
-    if _MODEL is not None:
-        return
-
-    if not MODEL_PATH.exists() or not META_PATH.exists():
-        log.info("No trained model artifacts found; classifier will run in fallback mode.")
-        _MODEL = None
-        _MODEL_FEATURES = None
-        _MODEL_META = {}
-        return
-
-    try:
-        import joblib  # type: ignore
-    except Exception as e:
-        log.warning("joblib not available to load model: %r", e)
-        _MODEL = None
-        _MODEL_FEATURES = None
-        _MODEL_META = {}
-        return
-
-    try:
-        _MODEL = joblib.load(MODEL_PATH)
-        meta_raw = META_PATH.read_text()
-        _MODEL_META = json.loads(meta_raw)
-        feat_names = _MODEL_META.get("feature_names") or []
-        _MODEL_FEATURES = list(feat_names) if isinstance(feat_names, (list, tuple)) else []
-        log.info("Loaded setup classifier model from %s", MODEL_PATH)
-    except Exception as e:
-        log.exception("Failed to load model/meta: %r", e)
-        _MODEL = None
-        _MODEL_FEATURES = None
-        _MODEL_META = {}
-
-
+# ──────────────────────────────────────────────────────────────────────────
+# Session helpers
+# ──────────────────────────────────────────────────────────────────────────
 def _session_to_int(session: str) -> int:
     s = (session or "").upper()
     if s == "ASIA":
@@ -231,9 +154,6 @@ def _session_to_int(session: str) -> int:
 
 
 def _derive_session_from_ts(ts_ms: Optional[int]) -> str:
-    """
-    Rough session from timestamp (UTC). If ts is missing, use current time.
-    """
     import datetime as dt
 
     if ts_ms is None:
@@ -251,26 +171,54 @@ def _derive_session_from_ts(ts_ms: Optional[int]) -> str:
     return "POST"
 
 
-def _extract_live_features(signal: Dict[str, Any]) -> Tuple[Dict[str, Any], list[float]]:
-    """
-    Build a feature dict + vector for the live signal, aligned (as much as possible)
-    with the features used in training.
+# ──────────────────────────────────────────────────────────────────────────
+# Feature extraction (reads from signal["features"] first)
+# ──────────────────────────────────────────────────────────────────────────
+DEFAULT_FEATURE_ORDER: List[str] = [
+    "side_sign",
+    "atr_like",
+    "atr_pct",
+    "range_mean",
+    "range_std",
+    "volume_zscore",
+    "trend_dir",
+    "trend_strength",
+    "entry_hour",
+    "entry_dow",
+    "session_int",
+]
 
-    Training feature names (from train_models.py):
-        [
-          "side_sign",
-          "atr_like",
-          "atr_pct",
-          "range_mean",
-          "range_std",
-          "volume_zscore",
-          "trend_dir",
-          "trend_strength",
-          "entry_hour",
-          "entry_dow",
-          "session_int"
-        ]
+
+def _pick_feature_source(signal: Dict[str, Any]) -> Dict[str, Any]:
     """
+    Prefer computed feature payloads if present.
+    Supported:
+      - signal["features"] (dict)
+      - signal["setup_context"]["features"] (dict)
+    Fallback:
+      - signal itself
+    """
+    f = signal.get("features")
+    if isinstance(f, dict):
+        return f
+    sc = signal.get("setup_context")
+    if isinstance(sc, dict):
+        f2 = sc.get("features")
+        if isinstance(f2, dict):
+            return f2
+    return signal
+
+
+def _safe_float(v: Any, default: float = 0.0) -> float:
+    try:
+        if v is None:
+            return float(default)
+        return float(v)
+    except Exception:
+        return float(default)
+
+
+def _extract_live_features(signal: Dict[str, Any]) -> Dict[str, Any]:
     import datetime as dt
 
     side_raw = str(signal.get("side") or "").lower()
@@ -281,31 +229,26 @@ def _extract_live_features(signal: Dict[str, Any]) -> Tuple[Dict[str, Any], list
     else:
         side_sign = 0
 
-    # Numeric fields with graceful fallback
-    def _f(keys, default=0.0) -> float:
-        for k in keys:
-            if k in signal and signal[k] is not None:
-                try:
-                    return float(signal[k])
-                except Exception:
-                    continue
-        return float(default)
+    src = _pick_feature_source(signal)
 
-    atr_like = _f(["atr_like"], 0.0)
-    atr_pct = _f(["atr_pct", "atr_percent"], 0.0)
-    range_mean = _f(["range_mean"], 0.0)
-    range_std = _f(["range_std"], 0.0)
+    atr_like = _safe_float(src.get("atr_like"), 0.0)
+    atr_pct = _safe_float(src.get("atr_pct", src.get("atr_percent")), 0.0)
 
-    # Volume zscore might be named in different ways
-    volume_zscore = _f(["volume_zscore", "vol_z", "volume_z"], 0.0)
+    range_mean = _safe_float(src.get("range_mean"), 0.0)
+    range_std = _safe_float(src.get("range_std"), 0.0)
 
-    # Trend dir/strength could be precomputed; if not, we leave neutral
-    trend_dir = _f(["trend_dir"], 0.0)
-    trend_strength = _f(["trend_strength"], 0.0)
+    volume_zscore = _safe_float(
+        src.get("volume_zscore", src.get("vol_z", src.get("volume_z"))), 0.0
+    )
 
-    ts = signal.get("ts") or signal.get("timestamp")
+    trend_dir = _safe_float(src.get("trend_dir"), 0.0)
+    trend_strength = _safe_float(src.get("trend_strength"), 0.0)
+
+    # Timestamp: try common keys (ts_ms is best)
+    ts_any = signal.get("ts_ms", signal.get("ts", signal.get("timestamp")))
+    ts_ms: Optional[int]
     try:
-        ts_ms = int(ts)
+        ts_ms = int(ts_any) if ts_any is not None else None
     except Exception:
         ts_ms = None
 
@@ -314,13 +257,15 @@ def _extract_live_features(signal: Dict[str, Any]) -> Tuple[Dict[str, Any], list
     else:
         dt_obj = dt.datetime.utcnow()
 
-    entry_hour = dt_obj.hour
-    entry_dow = dt_obj.weekday()
+    entry_hour = int(dt_obj.hour)
+    entry_dow = int(dt_obj.weekday())
 
-    session = _derive_session_from_ts(ts_ms)
+    session = str(src.get("session") or _derive_session_from_ts(ts_ms))
     session_int = _session_to_int(session)
 
-    feature_dict: Dict[str, Any] = {
+    regime = str(src.get("regime", signal.get("regime", "other")))
+
+    return {
         "side_sign": side_sign,
         "atr_like": atr_like,
         "atr_pct": atr_pct,
@@ -333,182 +278,217 @@ def _extract_live_features(signal: Dict[str, Any]) -> Tuple[Dict[str, Any], list
         "entry_dow": entry_dow,
         "session": session,
         "session_int": session_int,
+        "regime": regime,
     }
 
-    # Default feature order used by training
-    default_names = [
-        "side_sign",
-        "atr_like",
-        "atr_pct",
-        "range_mean",
-        "range_std",
-        "volume_zscore",
-        "trend_dir",
-        "trend_strength",
-        "entry_hour",
-        "entry_dow",
-        "session_int",
-    ]
 
-    names = _MODEL_FEATURES if _MODEL_FEATURES else default_names
-    vec = [float(feature_dict.get(name, 0.0)) for name in names]
+def _vec_from_features(features: Dict[str, Any], names: List[str]) -> List[float]:
+    return [_safe_float(features.get(n), 0.0) for n in names]
 
-    return feature_dict, vec
+
+def _fallback_score(features: Dict[str, Any]) -> float:
+    """
+    Deterministic fallback score in [0,1] when no ML model artifacts exist.
+
+    This keeps ai_policy_log useful (score is never null) and lets you test gating
+    before training.
+    """
+    # Base
+    s = 0.50
+
+    # Trend strength helps
+    ts = _safe_float(features.get("trend_strength"), 0.0)
+    s += max(-0.15, min(0.15, ts * 0.05))
+
+    # Volume zscore helps (cap contribution)
+    vz = _safe_float(features.get("volume_zscore"), 0.0)
+    s += max(-0.15, min(0.15, vz * 0.05))
+
+    # ATR% mild penalty if too high (sloppy conditions), mild boost if moderate
+    ap = _safe_float(features.get("atr_pct"), 0.0)
+    if ap >= 2.0:
+        s -= 0.05
+    elif 0.2 <= ap <= 1.2:
+        s += 0.03
+
+    # Session bias (tiny)
+    sess = str(features.get("session") or "").upper()
+    if sess == "NEW_YORK":
+        s += 0.02
+    elif sess == "POST":
+        s -= 0.02
+
+    # Clamp
+    if s < 0.0:
+        return 0.0
+    if s > 1.0:
+        return 1.0
+    return float(s)
+
 
 # ──────────────────────────────────────────────────────────────────────────
-# Regime-Aware Model Loader & Classifier Enhancements
+# Regime-Aware Model Loader
 # ──────────────────────────────────────────────────────────────────────────
-
-# Internal storage for regime models
 _REGIME_MODELS: Dict[str, Any] = {}
-_REGIME_FEATURES: Dict[str, list[str]] = {}
-_MODEL_LOADED = False
+_REGIME_FEATURES: Dict[str, List[str]] = {}
+_GLOBAL_MODEL: Any = None
+_GLOBAL_FEATURES: List[str] = []
+_MODELS_LOADED: bool = False
 
-# Default global model (fallback)
-_GLOBAL_MODEL = None
-_GLOBAL_FEATURES: list[str] = []
+_LAST_DEBUG_TS: float = 0.0
+
 
 def _load_models_once() -> None:
-    """
-    Lazy load all regime expert models found in models/ directory.
-    Expected naming:
-      - setup_classifier_{regime}.pkl
-      - setup_classifier_{regime}_meta.json
-    """
-    global _REGIME_MODELS, _REGIME_FEATURES, _GLOBAL_MODEL, _GLOBAL_FEATURES, _MODEL_LOADED
+    global _MODELS_LOADED, _GLOBAL_MODEL, _GLOBAL_FEATURES
 
-    if _MODEL_LOADED:
+    if _MODELS_LOADED:
         return
-    _MODEL_LOADED = True
+    _MODELS_LOADED = True
 
-    import joblib
-    from pathlib import Path
-
-    models_root = Path(ROOT) / "models"
-    if not models_root.exists():
-        log.info("No models directory found; classifier will operate with no models.")
+    if not MODELS_DIR.exists():
+        log.info("No models directory found at %s; classifier will operate with fallback scoring.", MODELS_DIR)
         return
 
-    # Load all pickles ending with _classifier_*.pkl
-    for p in models_root.glob("setup_classifier_*.pkl"):
+    try:
+        import joblib  # type: ignore
+    except Exception as e:
+        log.warning("joblib not available; classifier will operate with fallback scoring. err=%r", e)
+        return
+
+    # Load regime models: setup_classifier_{regime}.pkl
+    for p in MODELS_DIR.glob("setup_classifier_*.pkl"):
+        # Avoid double-loading the global model if it exists as setup_classifier.pkl
+        if p.name == "setup_classifier.pkl":
+            continue
+
         try:
             regimen = p.stem.replace("setup_classifier_", "")
             model_obj = joblib.load(p)
             _REGIME_MODELS[regimen] = model_obj
 
-            # Try corresponding meta file
-            meta_path = models_root / f"{p.stem}_meta.json"
+            meta_path = MODELS_DIR / f"{p.stem}_meta.json"
+            feat_names: List[str] = []
             if meta_path.exists():
                 try:
-                    raw_meta = meta_path.read_text()
-                    meta = json.loads(raw_meta)
-                    feat_names = meta.get("feature_names") or []
-                    _REGIME_FEATURES[regimen] = list(feat_names)
+                    meta = json.loads(meta_path.read_text(encoding="utf-8"))
+                    raw = meta.get("feature_names") or []
+                    if isinstance(raw, (list, tuple)):
+                        feat_names = [str(x) for x in raw]
                 except Exception:
-                    _REGIME_FEATURES[regimen] = []
-            else:
-                _REGIME_FEATURES[regimen] = []
-
-            log.info(f"Loaded regime model '{regimen}'")
+                    feat_names = []
+            _REGIME_FEATURES[regimen] = feat_names
+            log.info("Loaded regime model '%s' (%s)", regimen, p.name)
         except Exception as e:
-            log.warning(f"Failed to load regime model from {p}: {e}")
+            log.warning("Failed to load regime model from %s: %r", p.name, e)
 
-    # Optionally also load a global fallback model
-    global_path = models_root / "setup_classifier.pkl"
-    global_meta = models_root / "setup_classifier_meta.json"
+    # Load global fallback model: setup_classifier.pkl
+    global_path = MODELS_DIR / "setup_classifier.pkl"
+    global_meta = MODELS_DIR / "setup_classifier_meta.json"
     if global_path.exists():
         try:
             _GLOBAL_MODEL = joblib.load(global_path)
-            log.info("Loaded global fallback classifier")
+            log.info("Loaded global fallback classifier (%s)", global_path.name)
             if global_meta.exists():
-                raw_meta = global_meta.read_text()
-                gm = json.loads(raw_meta)
-                _GLOBAL_FEATURES = gm.get("feature_names") or []
+                gm = json.loads(global_meta.read_text(encoding="utf-8"))
+                raw = gm.get("feature_names") or []
+                if isinstance(raw, (list, tuple)):
+                    _GLOBAL_FEATURES = [str(x) for x in raw]
         except Exception as e:
             log.warning("Failed to load global fallback classifier: %r", e)
+
 
 def _pick_model_for_regime(regime: str):
     """
     Return (model, feature_names, regime_key_used)
     """
-    # Exact regime match
     if regime in _REGIME_MODELS:
         return _REGIME_MODELS[regime], _REGIME_FEATURES.get(regime, []), regime
-    # Fallback: try lowercase keys
-    low = regime.lower()
+
+    low = (regime or "").lower()
     for rkey in _REGIME_MODELS:
         if rkey.lower() == low:
             return _REGIME_MODELS[rkey], _REGIME_FEATURES.get(rkey, []), rkey
-    # Fallback: global if available
+
     if _GLOBAL_MODEL is not None:
         return _GLOBAL_MODEL, _GLOBAL_FEATURES, "global"
-    # No model at all
+
     return None, [], None
 
+
+def _maybe_debug(features: Dict[str, Any], used_regime: Optional[str], vec: List[float], has_model: bool) -> None:
+    global _LAST_DEBUG_TS
+    now = time.time()
+    if now - _LAST_DEBUG_TS < 5.0:
+        return
+    _LAST_DEBUG_TS = now
+
+    nonzero = sum(1 for x in vec if abs(float(x)) > 1e-12)
+    log.info(
+        "🧠 CLASSIFIER debug regime=%s used_model=%s vec_len=%s nonzero=%s atr_pct=%.4f vol_z=%.4f trend=%.4f",
+        str(features.get("regime")),
+        str(used_regime),
+        int(len(vec)),
+        int(nonzero),
+        _safe_float(features.get("atr_pct"), 0.0),
+        _safe_float(features.get("volume_zscore"), 0.0),
+        _safe_float(features.get("trend_strength"), 0.0),
+    )
+
+
 def _classify_ai(signal: Dict[str, Any], strat_id: str) -> Dict[str, Any]:
-    """
-    Regime-aware AI classification:
-    """
     _load_models_once()
 
-    # Build features for this signal
-    features_dict, vec = _extract_live_features(signal)
-
-    # Determine regime (from normalized feature store)
-    # Expect it to be present in `signal["regime"]` or features_dict from builder
-    regime = str(signal.get("regime") or features_dict.get("regime") or "other")
+    features = _extract_live_features(signal)
+    regime = str(features.get("regime") or "other")
 
     model_obj, feature_names, used_regime = _pick_model_for_regime(regime)
 
-    # Attach regime tag
-    features_dict["regime"] = regime
-    features_dict["used_regime_model"] = used_regime
+    # Always annotate
+    features["used_regime_model"] = used_regime
 
-    # Check absence of model
+    # No model: produce deterministic fallback score
     if model_obj is None:
-        return {
-            "allow": True,
-            "score": None,
-            "reason": f"no_model_for_regime_{regime}",
-            "features": features_dict
-        }
+        score = _fallback_score(features)
+        min_score = _policy_min_ai_score(strat_id)
+        features["min_ai_score"] = float(min_score)
+        allow = bool(score >= min_score)
+        reason = "fallback_score_ok" if allow else f"fallback_below_min_ai_score_{min_score:.3f}"
+        vec = _vec_from_features(features, DEFAULT_FEATURE_ORDER)
+        _maybe_debug(features, used_regime, vec, has_model=False)
+        return {"allow": allow, "score": float(score), "reason": reason, "features": features}
 
-    # Attempt model inference
+    # Model exists: build vec in the exact expected feature order
+    names = feature_names if isinstance(feature_names, list) and feature_names else DEFAULT_FEATURE_ORDER
+    vec = _vec_from_features(features, names)
+
+    # Inference
     try:
-        # If needed, reorder vec to match regime model features
-        # We assume _extract_live_features makes vec in a default order.
         probs = model_obj.predict_proba([vec])[0]
         score = float(probs[1]) if len(probs) > 1 else float(probs[0])
     except Exception as e:
-        log.warning(f"Model inference failed for regime={regime}: {e}")
-        return {
-            "allow": True,
-            "score": None,
-            "reason": f"inference_error:{e}",
-            "features": features_dict
-        }
-
-    # Apply per-strategy policy
-    try:
+        # If inference fails, still provide deterministic score so logs stay useful
+        score = _fallback_score(features)
         min_score = _policy_min_ai_score(strat_id)
-    except Exception:
-        min_score = 0.5
-    features_dict["min_ai_score"] = float(min_score)
+        features["min_ai_score"] = float(min_score)
+        allow = bool(score >= min_score)
+        reason = f"inference_error_fallback:{e}"
+        _maybe_debug(features, used_regime, vec, has_model=True)
+        return {"allow": allow, "score": float(score), "reason": reason, "features": features}
+
+    # Policy threshold
+    min_score = _policy_min_ai_score(strat_id)
+    features["min_ai_score"] = float(min_score)
 
     allow = bool(score >= min_score)
     reason = "score_ok" if allow else f"below_min_ai_score_{min_score:.3f}"
 
-    return {
-        "allow": allow,
-        "score": score,
-        "reason": reason,
-        "features": features_dict,
-    }
+    _maybe_debug(features, used_regime, vec, has_model=True)
+    return {"allow": allow, "score": float(score), "reason": reason, "features": features}
 
-# ---------------------------------------------------------------------------
+
+# ──────────────────────────────────────────────────────────────────────────
 # Public entrypoint with dual behavior
-# ---------------------------------------------------------------------------
-
+# ──────────────────────────────────────────────────────────────────────────
 def classify(*args, **kwargs):
     """
     Public entry with dual behavior:
@@ -518,58 +498,23 @@ def classify(*args, **kwargs):
 
     2) LEGACY LABEL MODE:
         classify(signal: dict, features: dict) -> str
-
-    We branch based on types of the second arg.
     """
-    # Keyword-based dispatch (just in case)
     if "strat_id" in kwargs or "strategy_id" in kwargs:
         signal = kwargs.get("signal") or (args[0] if args else {})
         strat_id = kwargs.get("strat_id") or kwargs.get("strategy_id")
         return _classify_ai(signal, str(strat_id))
 
-    # Positional dispatch
     if len(args) == 2:
         a0, a1 = args
-        # New AI usage: (signal, strat_id) where strat_id is a string
         if isinstance(a1, str):
             return _classify_ai(a0, a1)
-        # Legacy usage: (signal, features_dict)
         if isinstance(a1, dict):
             return _legacy_label(a0, a1)
 
-    # Fallback: try to guess
     if len(args) == 1 and isinstance(args[0], dict):
-        # Just signal? not great; treat as "unknown"
         return "unknown"
 
     raise TypeError(
         "classify() expected (signal, strat_id:str) or (signal, features:dict); "
         f"got args={args}, kwargs={kwargs}"
     )
-# =========================
-# Optional GPU inference utilities
-# =========================
-try:
-    import torch
-    from app.ai.gpu_runtime import configure_gpu
-    from app.ai.torch_compile import maybe_compile
-
-    _RUNTIME, _DEVICE = configure_gpu()
-except Exception:
-    torch = None
-    _DEVICE = "cpu"
-# =========================
-# =========================
-# GPU-ready classification hook (ML slot)
-# =========================
-def gpu_inference_hook(features):
-    """
-    Placeholder for future ML inference.
-    Safe no-op today.
-    """
-    if torch and _DEVICE == "cuda":
-        with torch.inference_mode():
-            # ML model will live here later
-            pass
-    return None
-# =========================

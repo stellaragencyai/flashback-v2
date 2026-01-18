@@ -1,7 +1,7 @@
-#!/usr/bin/env python3
+﻿#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Base44 / Flashback — AI Hooks
+Base44 / Flashback â€” AI Hooks
 
 Thin convenience layer on top of:
 - app.core.ai_schema
@@ -9,9 +9,9 @@ Thin convenience layer on top of:
 
 Purpose:
 - Give bots a simple, stable API to log AI-relevant events:
-    • log_signal_from_engine(...)
-    • log_order_basic(...)
-    • log_trade_summary_basic(...)
+    â€¢ log_signal_from_engine(...)
+    â€¢ log_order_basic(...)
+    â€¢ log_trade_summary_basic(...)
 
 If ai_store is NOT available yet, this module will:
     - Not crash.
@@ -19,12 +19,14 @@ If ai_store is NOT available yet, this module will:
 
 ADDED:
 - Lightweight JSONL mirroring into state/ai_events:
-    • Signals -> "setup" events in setups.jsonl
-    • Trade summaries -> "outcome" events in outcomes.jsonl
+    â€¢ Signals -> "setup" events in setups.jsonl
+    â€¢ Trade summaries -> "outcome" events in outcomes.jsonl
 """
 
 from __future__ import annotations
 
+
+import os  # AI_HOOKS_LANE_SAFE_PATCH_v1
 import time
 import uuid
 from pathlib import Path
@@ -119,37 +121,36 @@ except Exception:
     ROOT = Path(__file__).resolve().parents[2]
 
 STATE_DIR: Path = ROOT / "state"
-AI_EVENTS_DIR: Path = STATE_DIR / "ai_events"
-SETUPS_PATH: Path = AI_EVENTS_DIR / "setups.jsonl"
-OUTCOMES_PATH: Path = AI_EVENTS_DIR / "outcomes.jsonl"
+
+# AI_HOOKS_LANE_SAFE_PATCH_v1
+# IMPORTANT:
+# - Never write to global state/ai_events by default.
+# - Only mirror if AI_EVENTS_DIR is explicitly provided (lane-safe).
+_AI_EVENTS_DIR_ENV = os.getenv("AI_EVENTS_DIR", "").strip()
+AI_EVENTS_DIR = Path(_AI_EVENTS_DIR_ENV) if _AI_EVENTS_DIR_ENV else None
+SETUPS_PATH = (AI_EVENTS_DIR / "setups.jsonl") if AI_EVENTS_DIR else None
+OUTCOMES_PATH = (AI_EVENTS_DIR / "outcomes.jsonl") if AI_EVENTS_DIR else None
 
 
 def _ensure_ai_events_dir() -> None:
-    """
-    Ensure state/ai_events exists. Never raises on failure in normal flow;
-    errors will be surfaced when writing.
-    """
+    """Create lane dir if mirroring is enabled (AI_EVENTS_DIR env set)."""
+    if AI_EVENTS_DIR is None:
+        return
     try:
         AI_EVENTS_DIR.mkdir(parents=True, exist_ok=True)
     except Exception as exc:
-        # Last resort: do not crash trading because of logging dir issues.
         print(f"[AI_EVENTS] WARNING: could not create dir {AI_EVENTS_DIR}: {exc}")
-
-
-def _append_jsonl(path: Path, payload: Dict[str, Any]) -> None:
-    """
-    Append one JSON object as a line to the given path. Fail-soft to avoid
-    breaking bots due to logging problems.
-    """
+def _append_jsonl(path, payload: Dict[str, Any]) -> None:
+    """Append one JSONL line. No-op if path is None. Fail-soft."""
+    if path is None:
+        return
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
         with path.open("ab") as f:
-            f.write(orjson.dumps(payload))
-            f.write(b"\n")
+            f.write(orjson.dumps(payload) + b"
+")
     except Exception as exc:
         print(f"[AI_EVENTS] WARNING: failed to append to {path}: {exc}")
-
-
 def _mirror_signal_to_ai_events(
     *,
     signal_payload: SignalLog,
@@ -399,3 +400,4 @@ def log_trade_summary_basic(
 
     # 2) Mirror into ai_events JSONL (outcome stream)
     _mirror_trade_to_ai_events(trade_payload=payload)
+

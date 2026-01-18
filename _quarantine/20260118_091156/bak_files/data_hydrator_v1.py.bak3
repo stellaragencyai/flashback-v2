@@ -1,0 +1,200 @@
+﻿import json
+import time
+from pathlib import Path
+from typing import Any, Dict, List, Optional
+
+SCHEMA_VERSION = 3
+ONLINE_MAX_AGE_SEC = 15.0
+
+
+def _find_repo_root(start: Path) -> Path:
+    """
+    Walk upward until we find a folder containing /state.
+    Fallback: return CWD.
+    """
+    p = start.resolve()
+    for cand in [p, *p.parents]:
+        if (cand / "state").exists():
+            return cand
+    return Path.cwd().resolve()
+
+
+REPO_ROOT = _find_repo_root(Path(__file__).resolve())
+STATE_DIR = REPO_ROOT / "state"
+
+SUBACCOUNTS_STATE = STATE_DIR / "subaccounts_state.json"
+GOV_STATE = STATE_DIR / "governance_state.json"
+OUTCOMES_V1 = STATE_DIR / "ai_events" / "outcomes.v1.jsonl"
+
+
+def _now_ms() -> int:
+    return int(time.time() * 1000)
+
+
+def _safe_read_json(path: Path) -> Dict[str, Any]:
+    if not path.exists():
+        return {}
+    try:
+        return json.loads(path.read_text(encoding="utf-8", errors="replace"))
+    except Exception:
+        return {}
+
+
+def _iter_jsonl(path: Path):
+    if not path.exists():
+        return
+    try:
+        with path.open("r", encoding="utf-8", errors="ignore") as f:
+            for line in f:
+                line = (line or "").strip()
+                if not line:
+                    continue
+                try:
+                    obj = json.loads(line)
+                except Exception:
+                    continue
+                if isinstance(obj, dict):
+                    yield obj
+    except Exception:
+        return
+
+
+def _window_to_cutoff_ms(window: str) -> Optional[int]:
+    w = (window or "all").strip().lower()
+    if w in ("all", "", "0"):
+        return None
+    if w in ("7d", "7", "week"):
+        days = 7
+    elif w in ("30d", "30", "month"):
+        days = 30
+    elif w in ("1y", "365", "year"):
+        days = 365
+    else:
+        return None
+    return _now_ms() - int(days * 86400 * 1000)
+
+
+def _load_outcomes_stats(window: str) -> Dict[str, Dict[str, Any]]:
+    cutoff = _window_to_cutoff_ms(window)
+    stats: Dict[str, Dict[str, Any]] = {}
+
+    for row in _iter_jsonl(OUTCOMES_V1):
+        if row.get("schema_version") != "outcome.v1":
+            continue
+
+        acct = row.get("account_label")
+        if not isinstance(acct, str) or not acct.strip():
+            continue
+        acct = acct.strip()
+
+        ts = row.get("ts_ms") or row.get("closed_ts_ms") or 0
+        try:
+            ts_i = int(ts)
+        except Exception:
+            ts_i = 0
+
+        if cutoff is not None and ts_i and ts_i < cutoff:
+            continue
+
+        try:
+            pnl_f = float(row.get("pnl_usd") or 0.0)
+        except Exception:
+            pnl_f = 0.0
+
+        s = stats.get(acct)
+        if s is None:
+            s = {"n": 0, "wins": 0, "losses": 0, "pnl_sum": 0.0, "last_ts_ms": 0}
+            stats[acct] = s
+
+        s["n"] += 1
+        if pnl_f > 0:
+            s["wins"] += 1
+        elif pnl_f < 0:
+            s["losses"] += 1
+
+        s["pnl_sum"] += pnl_f
+        if ts_i > int(s.get("last_ts_ms", 0) or 0):
+            s["last_ts_ms"] = ts_i
+
+    now_ms = _now_ms()
+    for _, s in stats.items():
+        n = int(s.get("n", 0) or 0)
+        wins = int(s.get("wins", 0) or 0)
+        pnl_sum = float(s.get("pnl_sum", 0.0) or 0.0)
+        last_ts_ms = int(s.get("last_ts_ms", 0) or 0)
+
+        s["winrate"] = (wins / n) if n > 0 else 0.0
+        s["avg_pnl"] = (pnl_sum / n) if n > 0 else 0.0
+        s["freshness_sec"] = ((now_ms - last_ts_ms) / 1000.0) if last_ts_ms > 0 else None
+        s["last_ts_iso"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(last_ts_ms / 1000.0)) if last_ts_ms > 0 else None
+
+    return stats
+
+
+def hydrate_dashboard_rows(window: str = "all") -> List[Dict[str, Any]]:
+    state = _safe_read_json(SUBACCOUNTS_STATE)
+    governance = _safe_read_json(GOV_STATE)
+    districts = (governance.get("districts") or {}) if isinstance(governance, dict) else {}
+
+    outcomes = _load_outcomes_stats(window)
+
+    subaccounts = state.get("subaccounts", []) or []
+    if not isinstance(subaccounts, list):
+        subaccounts = []
+
+    rows: List[Dict[str, Any]] = []
+
+    for sa in subaccounts:
+        uid = sa.get("subaccount_uid") or sa.get("subaccount_name") or sa.get("account_label")
+        if not isinstance(uid, str) or not uid.strip():
+            continue
+        uid = uid.strip()
+
+        age = sa.get("supervisor_age_sec")
+        try:
+            age_f = float(age) if age is not None else None
+        except Exception:
+            age_f = None
+
+        is_online = bool(age_f is not None and age_f <= ONLINE_MAX_AGE_SEC)
+
+        gov = districts.get(uid, {}) if isinstance(districts, dict) else {}
+        if isinstance(gov, dict):
+            sa = {**sa, **gov}
+
+        o = outcomes.get(uid, {}) if isinstance(outcomes.get(uid, {}), dict) else {}
+        n = int(o.get("n", 0) or 0)
+        winrate = float(o.get("winrate", 0.0) or 0.0)
+        pnl_sum = float(o.get("pnl_sum", 0.0) or 0.0)
+
+        rows.append({
+            "account": uid,
+            "account_label": uid,
+
+            "strategy": sa.get("current_strategy") or sa.get("strategy_name") or "—",
+            "automation_mode": sa.get("automation_mode") or "—",
+            "role": sa.get("role") or "—",
+
+            "is_online": is_online,
+            "status": "online" if is_online else "offline",
+            "supervisor_ok": bool(sa.get("supervisor_ok", False)),
+            "supervisor_age_sec": age_f,
+
+            "workers_running": int(sa.get("workers_running") or 0),
+            "workers_enabled": sa.get("workers_enabled") or [],
+            "workers_dead": sa.get("workers_dead") or [],
+            "workers": sa.get("workers") or {},
+
+            "total_trades": n,
+            "win_rate": round(winrate * 100.0, 2),
+            "pnl_usd_total": round(pnl_sum, 6),
+            "outcomes_last_ts_iso": o.get("last_ts_iso"),
+            "outcomes_freshness_sec": o.get("freshness_sec"),
+
+            "window": window,
+            "updated_ms": _now_ms(),
+            "schema_version": SCHEMA_VERSION,
+        })
+
+    rows.sort(key=lambda r: r.get("account_label", ""))
+    return rows

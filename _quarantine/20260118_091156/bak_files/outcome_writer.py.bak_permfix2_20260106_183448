@@ -1,0 +1,90 @@
+﻿from __future__ import annotations
+
+"""
+Flashback — Outcome Writer (v1)
+
+Writes ONLY canonical v1 outcomes.
+
+Routing (critical for per-account isolation):
+- If AI_EVENTS_DIR is set (env), write to: <AI_EVENTS_DIR>/outcomes.v1.jsonl
+- Else (default), write to: state/ai_events/outcomes.v1.jsonl
+
+Stable API contract (do NOT break):
+- append_outcome_v1(payload: dict) -> None
+- write_outcome_from_paper_close(*, payload: Optional[dict]=None, **fields) -> dict
+
+This is intentionally boring. Boring is reliable.
+"""
+
+import json
+import os
+from pathlib import Path
+from typing import Any, Dict, Optional
+
+from app.ai.outcome_contract import OUTCOME_SCHEMA_VERSION, validate_outcome_v1
+
+
+def _resolve_root() -> Path:
+    """
+    Resolve repo root WITHOUT importing app.core.* (which may not exist).
+    File: <ROOT>/app/ai/outcome_writer.py
+    parents[0]=<ROOT>/app/ai
+    parents[1]=<ROOT>/app
+    parents[2]=<ROOT>
+    """
+    return Path(__file__).resolve().parents[2]
+
+
+ROOT = _resolve_root()
+
+
+def _resolve_out_path() -> Path:
+    """
+    Outcome path resolution:
+      - Prefer AI_EVENTS_DIR env when present (per-account lane).
+      - Fallback to legacy global state/ai_events.
+    """
+    ai_events_dir = (os.environ.get("AI_EVENTS_DIR") or "").strip()
+    if ai_events_dir:
+        base = Path(ai_events_dir)
+        if not base.is_absolute():
+            base = (ROOT / base).resolve()
+        out_path = base / "outcomes.v1.jsonl"
+    else:
+        out_path = ROOT / "state" / "ai_events" / "outcomes.v1.jsonl"
+
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    return out_path
+
+
+def append_outcome_v1(outcome: Dict[str, Any]) -> None:
+    """
+    Append a validated outcome.v1 row to the canonical outcomes.v1 bus.
+    """
+    # Writer owns schema_version
+    outcome["schema_version"] = OUTCOME_SCHEMA_VERSION
+
+    # Hard schema validation (fail fast)
+    validate_outcome_v1(outcome)
+
+    out_path = _resolve_out_path()
+    line = json.dumps(outcome, ensure_ascii=False)
+    with out_path.open("a", encoding="utf-8", newline="\n") as f:
+        f.write(line + "\n")
+
+
+def write_outcome_from_paper_close(*, payload: Optional[Dict[str, Any]] = None, **fields: Any) -> Dict[str, Any]:
+    """
+    Stable interface used by PaperBroker.
+
+    - If payload is provided, it is used as the base dict.
+    - Any **fields override payload keys.
+    - The final dict is validated and appended.
+    - Returns the final payload dict for debugging/tests.
+    """
+    data: Dict[str, Any] = dict(payload or {})
+    if fields:
+        data.update(fields)
+
+    append_outcome_v1(data)
+    return data

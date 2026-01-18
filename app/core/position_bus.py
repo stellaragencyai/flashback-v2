@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+﻿#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
 Flashback — Position Bus (WS/REST-normalized mirror over positions)
@@ -14,46 +14,26 @@ whether the data comes from:
 
 Design
 ------
-- Snapshot file:   state/positions_bus.json
-- Structure (v2, normalized):
+Legacy global snapshot file:
+  - state/positions_bus.json
+
+Per-label snapshot file (preferred in multi-subaccount orchestrator mode):
+  - state/positions_bus_<label>.json
+
+Structure (v2, normalized):
     {
       "version": 2,
       "updated_ms": 1763752000123,
       "labels": {
-        "main": {
+        "<label>": {
           "category": "linear",
-          "positions": [
-            {
-              "symbol": "BTCUSDT",
-              "side": "Buy",
-              "size": 0.25,
-              "avgPrice": 43200.5,
-              "stopLoss": 0.0,
-              "sub_uid": "12345",
-              "account_label": "main",
-              "category": "linear"
-            },
-            ...
-          ]
-        },
-        "flashback03": {
-          "category": "linear",
-          "positions": [ ...normalized rows... ]
+          "positions": [ ... normalized rows ... ]
         }
       }
     }
 
 Older snapshots with version=1 and raw Bybit rows are still readable; we
 normalize rows when returning them to callers.
-
-Callers typically use:
-    from app.core.position_bus import (
-        get_positions_for_label,
-        get_position_map_for_label,
-        get_positions_snapshot,
-        get_positions_for_current_label,
-        get_snapshot,
-    )
 """
 
 from __future__ import annotations
@@ -78,6 +58,7 @@ ROOT: Path = getattr(settings, "ROOT", Path(__file__).resolve().parents[2])
 STATE_DIR: Path = ROOT / "state"
 STATE_DIR.mkdir(parents=True, exist_ok=True)
 
+# Legacy global snapshot path (back-compat)
 POS_SNAPSHOT_PATH: Path = STATE_DIR / "positions_bus.json"
 
 # Max age (seconds) before snapshot is considered stale
@@ -93,7 +74,14 @@ _POSITION_BUS_ALLOW_REST_WRITE: bool = (
 ACCOUNT_LABEL: str = os.getenv("ACCOUNT_LABEL", "main").strip() or "main"
 
 # Mirror of flashback_common.EXEC_DRY_RUN (avoid importing to keep this module stable)
-EXEC_DRY_RUN: bool = os.getenv("EXEC_DRY_RUN", "false").strip().lower() in ("1","true","yes","y","on")
+EXEC_DRY_RUN: bool = os.getenv("EXEC_DRY_RUN", "false").strip().lower() in ("1", "true", "yes", "y", "on")
+
+# Optional override. Supports either:
+#  - absolute path to a json file
+#  - template with "{label}" placeholder (recommended)
+# Special values treated as AUTO:
+#  - "auto", "(auto)"
+POSITIONS_BUS_PATH_ENV: str = os.getenv("POSITIONS_BUS_PATH", "").strip()
 
 _CANONICAL_VERSION: int = 2  # normalized schema version
 
@@ -108,6 +96,35 @@ def _safe_float(x: Any) -> float:
         return float(x)
     except Exception:
         return 0.0
+
+
+def _is_auto_bus_value(v: str) -> bool:
+    s = (v or "").strip().lower()
+    return s in ("auto", "(auto)")
+
+
+def _resolve_positions_bus_path(label: str) -> Path:
+    """
+    Resolve the positions bus file path for a given label.
+
+    Priority:
+      1) POSITIONS_BUS_PATH (supports "{label}" templating) unless it's AUTO
+      2) state/positions_bus_<label>.json (preferred default)
+      3) state/positions_bus.json (legacy fallback)
+    """
+    lab = (label or "").strip() or "main"
+
+    if POSITIONS_BUS_PATH_ENV and not _is_auto_bus_value(POSITIONS_BUS_PATH_ENV):
+        try:
+            candidate = POSITIONS_BUS_PATH_ENV.format(label=lab)
+        except Exception:
+            candidate = POSITIONS_BUS_PATH_ENV
+        return Path(candidate)
+
+    if lab:
+        return STATE_DIR / f"positions_bus_{lab}.json"
+
+    return POS_SNAPSHOT_PATH
 
 
 def _normalize_entry(
@@ -172,14 +189,14 @@ def _normalize_entry(
         return None
 
 
-def _load_snapshot_raw() -> Optional[Dict[str, Any]]:
+def _load_snapshot_raw_from_path(path: Path) -> Optional[Dict[str, Any]]:
     """
-    Load the entire snapshot dict from positions_bus.json, or None if missing/invalid.
+    Load snapshot dict from a given file path, or None if missing/invalid.
     """
     try:
-        if not POS_SNAPSHOT_PATH.exists():
+        if not path.exists():
             return None
-        data = orjson.loads(POS_SNAPSHOT_PATH.read_bytes())
+        data = orjson.loads(path.read_bytes())
         if not isinstance(data, dict):
             return None
         return data
@@ -201,34 +218,75 @@ def _snapshot_age_seconds(snap: Dict[str, Any]) -> Optional[float]:
     return (now_ms - updated_ms) / 1000.0
 
 
-def _save_snapshot(
+def _save_snapshot_to_path(path: Path, snap: Dict[str, Any]) -> None:
+    """
+    Save snapshot dict to a given file path.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(orjson.dumps(snap))
+
+
+def _save_snapshot_for_label(
+    label: str,
     labels_positions: Dict[str, Dict[str, Any]],
 ) -> None:
     """
-    Save a complete snapshot to disk, using canonical schema version.
+    Save a complete snapshot to disk using canonical schema version, writing to:
+      - per-label file (preferred)
+      - and also merging into legacy global file for compatibility
     """
+    lab = (label or "").strip() or "main"
+
     snap = {
         "version": _CANONICAL_VERSION,
         "updated_ms": _now_ms(),
         "labels": labels_positions,
     }
+
+    # Write per-label snapshot
+    per_path = _resolve_positions_bus_path(lab)
+    _save_snapshot_to_path(per_path, snap)
+
+    # Also merge into legacy global file (best-effort)
     try:
-        POS_SNAPSHOT_PATH.write_bytes(orjson.dumps(snap))
+        global_snap = _load_snapshot_raw_from_path(POS_SNAPSHOT_PATH)
+        global_labels: Dict[str, Dict[str, Any]] = {}
+        if isinstance(global_snap, dict):
+            global_labels = dict(global_snap.get("labels") or {})
+        # merge
+        for k, v in (labels_positions or {}).items():
+            global_labels[k] = v
+        merged = {
+            "version": _CANONICAL_VERSION,
+            "updated_ms": _now_ms(),
+            "labels": global_labels,
+        }
+        _save_snapshot_to_path(POS_SNAPSHOT_PATH, merged)
     except Exception:
         pass
 
 
-def get_snapshot() -> Tuple[Optional[Dict[str, Any]], Optional[float]]:
+def get_snapshot_for_label(
+    label: str,
+) -> Tuple[Optional[Dict[str, Any]], Optional[float], Path]:
     """
-    Return (snapshot_dict, age_seconds).
+    Return (snapshot_dict, age_seconds, path_used) for a label.
+    Preference order:
+      - per-label file
+      - legacy global file
+    """
+    lab = (label or "").strip() or "main"
 
-    If the file is missing or invalid, returns (None, None).
-    """
-    snap = _load_snapshot_raw()
-    if snap is None:
-        return None, None
-    age = _snapshot_age_seconds(snap)
-    return snap, age
+    per_path = _resolve_positions_bus_path(lab)
+    snap = _load_snapshot_raw_from_path(per_path)
+    if snap is not None:
+        return snap, _snapshot_age_seconds(snap), per_path
+
+    # fallback: global
+    gsnap = _load_snapshot_raw_from_path(POS_SNAPSHOT_PATH)
+    if gsnap is None:
+        return None, None, per_path
+    return gsnap, _snapshot_age_seconds(gsnap), POS_SNAPSHOT_PATH
 
 
 def _extract_label_positions_raw(
@@ -318,35 +376,34 @@ def get_positions_for_label(
     effective_label = label if isinstance(label, str) else None
     if not effective_label or not effective_label.strip():
         effective_label = "main"
-    label = effective_label.strip()
+    lab = effective_label.strip()
 
     if max_age_seconds is None:
         max_age_seconds = _POSITION_BUS_MAX_AGE_SECONDS
 
-    # Snapshot path
-    snap, age = get_snapshot()
+    # Snapshot (label-scoped preference)
+    snap, age, _path_used = get_snapshot_for_label(lab)
 
     # DRY_RUN: keep positions bus fresh even when empty (no WS/REST dependency)
     if EXEC_DRY_RUN:
-        # If missing or stale, write a fresh empty snapshot for this label
         if snap is None or age is None or age > float(max_age_seconds):
             labels_block = {}
             if isinstance(snap, dict):
                 labels_block = dict(snap.get("labels") or {})
-            labels_block[label] = {"category": category, "positions": []}
-            _save_snapshot(labels_block)
-            # return empty (paper mode should not invent positions)
+            labels_block[lab] = {"category": category, "positions": []}
+            _save_snapshot_for_label(lab, labels_block)
             return []
+
     if snap is not None and age is not None and age <= max_age_seconds:
         raw_positions = _extract_label_positions_raw(
             snap,
-            label=label,
+            label=lab,
             category=category,
         )
         if raw_positions:
             norm_positions: List[Dict[str, Any]] = []
             for row in raw_positions:
-                norm = _normalize_entry(row, label=label, category=category)
+                norm = _normalize_entry(row, label=lab, category=category)
                 if norm:
                     norm_positions.append(norm)
             if norm_positions:
@@ -357,7 +414,7 @@ def get_positions_for_label(
         return []
 
     # NOTE: REST fallback is only supported for MAIN right now.
-    if label.lower() != "main":
+    if lab.lower() != "main":
         return []
 
     norm_positions, new_snap = _rest_refresh_snapshot_for_label(
@@ -367,7 +424,7 @@ def get_positions_for_label(
     )
 
     if _POSITION_BUS_ALLOW_REST_WRITE:
-        _save_snapshot(new_snap.get("labels") or {})
+        _save_snapshot_for_label("main", new_snap.get("labels") or {})
 
     return norm_positions
 

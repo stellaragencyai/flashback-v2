@@ -33,3 +33,5 @@ pytz
 # ML stack for AI policies
 scikit-learn
 joblib
+
+PyYAML>=6.0

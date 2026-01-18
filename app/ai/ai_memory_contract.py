@@ -89,6 +89,7 @@ def get_ts_ms(obj: Dict[str, Any], default: Optional[int] = None) -> int:
     v = obj.get("ts_ms", obj.get("ts"))
     try:
         iv = int(v)
+        # If given seconds, promote to ms.
         if 0 < iv < 10_000_000_000:
             return iv * 1000
         return iv
@@ -123,16 +124,12 @@ def normalize_timeframe(tf: Any) -> Optional[str]:
 # ----------------------------- SHAPE TOLERANCE -----------------------------
 
 
-def _as_dict(x: Any) -> Dict[str, Any]:
-    return x if isinstance(x, dict) else {}
-
-
 def _get_setup_like(obj: Dict[str, Any]) -> Dict[str, Any]:
     """
     Accept either:
       - setup_context record itself
       - outcome_enriched envelope with {"setup": {...}}
-      - random wrappers that include a "setup" dict
+      - wrappers that include a "setup" dict
     """
     if not isinstance(obj, dict):
         return {}
@@ -147,6 +144,7 @@ def _get_payload_dict(setup_like: Dict[str, Any]) -> Dict[str, Any]:
     Tolerate payload nesting:
       payload
       payload.payload
+    Returns the innermost payload dict when possible.
     """
     p = setup_like.get("payload")
     if isinstance(p, dict):
@@ -164,39 +162,19 @@ def _get_features_dict(setup_like: Dict[str, Any]) -> Dict[str, Any]:
       payload.payload.features
     """
     payload = _get_payload_dict(setup_like)
-
     feats = payload.get("features")
-    if isinstance(feats, dict):
-        return feats
-
-    p2 = payload.get("payload")
-    if isinstance(p2, dict):
-        feats2 = p2.get("features")
-        if isinstance(feats2, dict):
-            return feats2
-
-    return {}
+    return feats if isinstance(feats, dict) else {}
 
 
 def _get_extra_dict(setup_like: Dict[str, Any]) -> Dict[str, Any]:
     """
-    Tolerate payload.extra nesting:
+    Tolerate extra path drift across modules:
       payload.extra
       payload.payload.extra
     """
     payload = _get_payload_dict(setup_like)
-
     extra = payload.get("extra")
-    if isinstance(extra, dict):
-        return extra
-
-    p2 = payload.get("payload")
-    if isinstance(p2, dict):
-        extra2 = p2.get("extra")
-        if isinstance(extra2, dict):
-            return extra2
-
-    return {}
+    return extra if isinstance(extra, dict) else {}
 
 
 def _infer_account_label(setup_like: Dict[str, Any]) -> Optional[str]:
@@ -246,6 +224,10 @@ def _trim_json_bytes(raw: bytes) -> bytes:
 
 
 def iter_jsonl(path: Path, *, max_lines: Optional[int] = None) -> Iterable[Dict[str, Any]]:
+    """
+    Fail-soft JSONL iterator.
+    If file doesn't exist or lines are corrupted, yields what it can.
+    """
     if not path.exists():
         return
     n = 0
@@ -315,7 +297,7 @@ def append_jsonl(path: Path, row: Dict[str, Any]) -> None:
         if _HAS_ORJSON:
             line = orjson.dumps(row) + b"\n"  # type: ignore[name-defined]
         else:  # pragma: no cover
-            line = (json.dumps(row) + "\n").encode("utf-8", errors="ignore")
+            line = (json.dumps(row, ensure_ascii=False) + "\n").encode("utf-8", errors="ignore")
 
         import os as _os
 
@@ -330,9 +312,6 @@ def append_jsonl(path: Path, row: Dict[str, Any]) -> None:
 
 # ----------------------------- CONTRACT PATHS -------------------------------
 
-# ----------------------------- CONTRACT PATHS -------------------------------
-
-from dataclasses import dataclass
 
 @dataclass(frozen=True)
 class ContractPaths:
@@ -353,10 +332,14 @@ class ContractPaths:
             memory_index_path=state / "ai_memory" / "memory_index.sqlite",
         )
 
+
 # ----------------------------- VALIDATORS ----------------------------------
 
 
 def validate_setup_record(ev: Dict[str, Any]) -> Tuple[bool, str]:
+    """
+    Validate setup_context with tolerance for payload nesting.
+    """
     if ev.get("event_type") != "setup_context":
         return False, "bad_event_type"
     if not str(ev.get("trade_id") or "").strip():
@@ -365,12 +348,18 @@ def validate_setup_record(ev: Dict[str, Any]) -> Tuple[bool, str]:
         return False, "missing_symbol"
     if not normalize_timeframe(ev.get("timeframe")):
         return False, "missing_timeframe"
+
     policy = ev.get("policy")
     if not isinstance(policy, dict) or not str(policy.get("policy_hash") or "").strip():
         return False, "missing_policy_hash"
-    payload = ev.get("payload")
-    if not isinstance(payload, dict) or not isinstance(payload.get("features"), dict):
+
+    # Tolerate payload nesting for features
+    setup_like = _get_setup_like(ev)
+    feats = _get_features_dict(setup_like)
+    if not isinstance(feats, dict) or not feats:
+        # If empty dict, treat as missing: this is Phase 5 contract.
         return False, "missing_payload_features"
+
     return True, "ok"
 
 
@@ -466,6 +455,7 @@ def _filter_features_for_fingerprint(features: Dict[str, Any]) -> Dict[str, Any]
 
     f = dict(features)
 
+    # Remove unstable / time-varying / microstructure noise keys
     for k in (
         "ts",
         "timestamp",
@@ -481,6 +471,7 @@ def _filter_features_for_fingerprint(features: Dict[str, Any]) -> Dict[str, Any]
     ):
         f.pop(k, None)
 
+    # Never include fingerprint fields inside the fingerprint
     f.pop("setup_fingerprint", None)
     f.pop("memory_fingerprint", None)
 
@@ -573,7 +564,9 @@ def is_canary_account(account_label: Optional[str]) -> bool:
 
 
 def _connect_readonly_sqlite(db_path: Path) -> sqlite3.Connection:
-    uri = f"file:{db_path.as_posix()}?mode=ro"
+    # Use a URI with mode=ro. Resolve to a normalized absolute path.
+    p = db_path.resolve()
+    uri = f"file:{p.as_posix()}?mode=ro"
     return sqlite3.connect(uri, uri=True)
 
 

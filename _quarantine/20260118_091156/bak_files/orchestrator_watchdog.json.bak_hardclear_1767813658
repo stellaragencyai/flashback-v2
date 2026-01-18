@@ -1,0 +1,54 @@
+{
+  "checked": [
+    "flashback01",
+    "flashback02",
+    "flashback03"
+  ],
+  "labels": {
+    "flashback01": {
+      "alive": true,
+      "backoff_sec": 0,
+      "blocked": true,
+      "blocked_reason": "too_many_restarts",
+      "last_checked_ts_ms": 1767813656863,
+      "last_restart_ts_ms": 1767812969364,
+      "next_restart_allowed_ts_ms": 0,
+      "pid": 35464,
+      "restart_count": 5,
+      "restart_history_ms": []
+    },
+    "flashback02": {
+      "alive": true,
+      "backoff_sec": 0,
+      "blocked": true,
+      "blocked_reason": "too_many_restarts",
+      "last_checked_ts_ms": 1767813656863,
+      "last_restart_ts_ms": 1767812969364,
+      "next_restart_allowed_ts_ms": 0,
+      "pid": 21272,
+      "restart_count": 5,
+      "restart_history_ms": []
+    },
+    "flashback03": {
+      "blocked": false,
+      "blocked_reason": null,
+      "last_checked_ts_ms": 1767813656863,
+      "last_restart_ts_ms": 1767812969364,
+      "restart_count": 1,
+      "restart_history_ms": []
+    },
+    "flashback07": {
+      "alive": true,
+      "backoff_sec": 0,
+      "blocked": false,
+      "blocked_reason": null,
+      "last_checked_ts_ms": 1766448848219,
+      "last_restart_ts_ms": null,
+      "next_restart_allowed_ts_ms": 0,
+      "pid": 12184,
+      "restart_count": 0,
+      "restart_history_ms": []
+    }
+  },
+  "ts_ms": 1767813656863
+}

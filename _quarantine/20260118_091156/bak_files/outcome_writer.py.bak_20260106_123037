@@ -1,0 +1,61 @@
+﻿from __future__ import annotations
+
+"""
+Flashback — Outcome Writer (v1)
+
+Writes ONLY canonical v1 outcomes.
+
+Routing (critical for per-account isolation):
+- If AI_EVENTS_DIR is set (env), write to: <AI_EVENTS_DIR>/outcomes.v1.jsonl
+- Else (default), write to: state/ai_events/outcomes.v1.jsonl
+
+This preserves backwards compatibility while enabling per-subaccount lanes.
+
+This is intentionally boring. Boring is reliable.
+"""
+
+import os
+from pathlib import Path
+from typing import Any, Dict
+
+from app.ai.outcome_contract import OUTCOME_SCHEMA_VERSION, validate_outcome_v1
+from app.core import settings
+
+
+def _resolve_out_path() -> Path:
+    """
+    Outcome path resolution:
+      - Prefer AI_EVENTS_DIR env when present (per-account lane).
+      - Fallback to legacy global state/ai_events.
+    """
+    ai_events_dir = (os.environ.get("AI_EVENTS_DIR") or "").strip()
+    if ai_events_dir:
+        base = Path(ai_events_dir)
+        if not base.is_absolute():
+            base = (settings.ROOT / base).resolve()
+        out_path = base / "outcomes.v1.jsonl"
+    else:
+        out_path = settings.ROOT / "state" / "ai_events" / "outcomes.v1.jsonl"
+
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    return out_path
+
+
+def append_outcome_v1(outcome: Dict[str, Any]) -> None:
+    """
+    Append a validated outcome.v1 row to the canonical outcomes.v1 bus.
+    """
+    # Hard schema validation (fail fast)
+    validate_outcome_v1(outcome)
+
+    # Enforce schema_version
+    outcome["schema_version"] = OUTCOME_SCHEMA_VERSION
+
+    out_path = _resolve_out_path()
+
+    # Append as JSONL (utf-8, one line)
+    import json
+
+    line = json.dumps(outcome, ensure_ascii=False)
+    with out_path.open("a", encoding="utf-8", newline="\n") as f:
+        f.write(line + "\n")

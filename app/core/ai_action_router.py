@@ -2,48 +2,69 @@
 # -*- coding: utf-8 -*-
 """
 Flashback — AI Action Router (Canonical)
-
-IMPORTANT
----------
-This module is the ONE canonical implementation for AI action routing.
-
-It provides:
-1) Execution router (WS-first): normalize_ai_action / apply_ai_action(s)
-2) DRY-RUN tailer router: tails action bus (state/ai_actions.jsonl) and logs/TG
-3) ExecSignal queue router: guarded router that maps validated AI actions into ExecSignal queue
-
-Other modules (app/bots/ai_action_router.py and app/tools/ai_action_router.py)
-MUST be thin adapters that call into this canonical implementation.
 """
 
 from __future__ import annotations
 
+# ---------------------------------------------------------------------------
+# STANDARD LIBRARY IMPORTS (TOP, ALWAYS)
+# ---------------------------------------------------------------------------
+
 import os
 import time
 import uuid
+import sys
 from dataclasses import dataclass
 from decimal import Decimal
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
-import orjson
+# ---------------------------------------------------------------------------
+# THIRD-PARTY / OPTIONAL JSON
+# ---------------------------------------------------------------------------
+
+try:
+    import orjson  # type: ignore
+    _HAS_ORJSON = True
+
+    def _json_loads(b: bytes) -> Any:
+        return orjson.loads(b)
+
+    def _json_dumps(obj: Any) -> bytes:
+        return orjson.dumps(obj)
+
+except Exception:
+    import json as _json_std
+    _HAS_ORJSON = False
+
+    def _json_loads(b: bytes) -> Any:
+        if isinstance(b, (bytes, bytearray)):
+            s = b.decode("utf-8", errors="ignore")
+        else:
+            s = str(b)
+        return _json_std.loads(s)
+
+    def _json_dumps(obj: Any) -> bytes:
+        return (_json_std.dumps(obj, separators=(",", ":"), ensure_ascii=False) + "\n").encode(
+            "utf-8", errors="ignore"
+        ).rstrip(b"\n")
 
 # ---------------------------------------------------------------------------
-# Logger (robust import)
+# LOGGER (ROBUST FALLBACK)
 # ---------------------------------------------------------------------------
 
 try:
     from app.core.log import get_logger  # type: ignore
-except Exception:  # pragma: no cover
+except Exception:
     import logging
-    import sys
 
     def get_logger(name: str) -> "logging.Logger":  # type: ignore
         logger_ = logging.getLogger(name)
         if not logger_.handlers:
             handler = logging.StreamHandler(sys.stdout)
-            fmt = logging.Formatter("%(asctime)s [%(levelname)s] [%(name)s] %(message)s")
-            handler.setFormatter(fmt)
+            handler.setFormatter(
+                logging.Formatter("%(asctime)s [%(levelname)s] [%(name)s] %(message)s")
+            )
             logger_.addHandler(handler)
         logger_.setLevel(logging.INFO)
         return logger_
@@ -51,7 +72,7 @@ except Exception:  # pragma: no cover
 logger = get_logger("ai_action_router")
 
 # ---------------------------------------------------------------------------
-# Core helpers
+# FLASHBACK CORE IMPORTS (ALL AT TOP)
 # ---------------------------------------------------------------------------
 
 from app.core.flashback_common import (
@@ -60,7 +81,6 @@ from app.core.flashback_common import (
     record_heartbeat,
 )
 
-# Execution WS-first functions (LIVE side)
 from app.core.execution_ws import (
     open_position_ws_first,
     flatten_symbol_ws_first,
@@ -68,11 +88,8 @@ from app.core.execution_ws import (
 )
 
 from app.core.ai_profile import get_current_ai_profile
-
-# Action bus path (DRY-RUN tailer)
 from app.core.ai_action_bus import ACTION_LOG_PATH
 
-# Guard + exec signal schema (QUEUE router)
 from app.core.ai_action_guard import (
     load_guard_config,
     guard_action,
@@ -84,19 +101,45 @@ from app.core.exec_signal_schema import (
 )
 
 # ---------------------------------------------------------------------------
-# Env helpers
+# ENV HELPERS
 # ---------------------------------------------------------------------------
 
 def _env_bool(name: str, default: str = "false") -> bool:
-    raw = os.getenv(name, default).strip().lower()
-    return raw in ("1", "true", "yes", "y", "on")
+    raw = os.getenv(name, default)
+    s = raw.strip().lower() if isinstance(raw, str) else str(raw).strip().lower()
+    return s in ("1", "true", "yes", "y", "on")
 
 
 def _env_int(name: str, default: str) -> int:
+    raw = os.getenv(name, default)
     try:
-        return int(os.getenv(name, default).strip())
+        return int(str(raw).strip())
     except Exception:
         return int(default)
+
+# ---------------------------------------------------------------------------
+# SMALL DEFENSIVE HELPERS
+# ---------------------------------------------------------------------------
+
+def _trim_json_bytes(raw: bytes) -> bytes:
+    if not raw:
+        return raw
+    raw = raw.strip()
+    if raw.startswith(b"\xef\xbb\xbf"):
+        raw = raw[3:].lstrip()
+    return raw.rstrip(b"\x00").rstrip()
+
+
+def _safe_decimal(x: Any) -> Optional[Decimal]:
+    try:
+        return Decimal(str(x))
+    except Exception:
+        return None
+
+# ---------------------------------------------------------------------------
+# (1) EXECUTION ROUTER — STRICT NORMALIZATION
+# ---------------------------------------------------------------------------
+# (rest of your file remains EXACTLY THE SAME)
 
 
 # ---------------------------------------------------------------------------
@@ -139,8 +182,11 @@ def _validate_symbol_whitelist(symbol: str, profile: Dict[str, Any]) -> None:
 def _validate_notional_pct(pct: Decimal, profile: Dict[str, Any]) -> None:
     if pct <= 0:
         raise ValueError("risk_pct_notional must be > 0")
-    max_pct = profile.get("max_notional_pct")
-    if isinstance(max_pct, Decimal) and max_pct > 0 and pct > max_pct:
+
+    max_pct_raw = profile.get("max_notional_pct")
+    max_pct = _safe_decimal(max_pct_raw)
+
+    if max_pct is not None and max_pct > 0 and pct > max_pct:
         raise ValueError(
             f"risk_pct_notional {pct}% exceeds AI profile max_notional_pct={max_pct}%"
         )
@@ -163,19 +209,11 @@ def _normalize_open_action(payload: Dict[str, Any], profile: Dict[str, Any]) -> 
     rpn_raw = payload.get("risk_pct_notional", "__MISSING__")
     if rpn_raw in ("__MISSING__", None):
         # Compute from size_fraction * profile.max_notional_pct if possible
-        max_pct = profile.get("max_notional_pct")
-        if not isinstance(max_pct, Decimal):
-            try:
-                max_pct = Decimal(str(max_pct))
-            except Exception:
-                max_pct = Decimal("40")  # safe fallback
+        max_pct = _safe_decimal(profile.get("max_notional_pct")) or Decimal("40")
 
         sf_raw = payload.get("size_fraction", None)
         if sf_raw is not None:
-            try:
-                sf = Decimal(str(sf_raw))
-            except Exception:
-                sf = Decimal("0")
+            sf = _safe_decimal(sf_raw) or Decimal("0")
             if sf <= 0:
                 raise ValueError("size_fraction must be > 0 when used")
             if sf > 1:
@@ -222,6 +260,7 @@ def _normalize_open_action(payload: Dict[str, Any], profile: Dict[str, Any]) -> 
         "leverage_override": lev,
     }
 
+
 def _normalize_flatten_action(payload: Dict[str, Any], profile: Dict[str, Any]) -> Dict[str, Any]:
     symbol = _normalize_symbol(payload.get("symbol"))
     _validate_symbol_whitelist(symbol, profile)
@@ -244,7 +283,6 @@ def normalize_ai_action(raw_action: Dict[str, Any]) -> Dict[str, Any]:
     if not isinstance(raw_action, dict):
         raise ValueError("AI action must be a dict")
 
-
     # Sanitize explicit nulls so fallback sizing logic can run
     if raw_action.get("risk_pct_notional", "__MISSING__") is None:
         raw_action = dict(raw_action)
@@ -257,6 +295,7 @@ def normalize_ai_action(raw_action: Dict[str, Any]) -> Dict[str, Any]:
     if raw_action.get("leverage_override", "__MISSING__") is None:
         raw_action = dict(raw_action)
         raw_action.pop("leverage_override", None)
+
     profile = get_current_ai_profile()
 
     action_type = str(raw_action.get("type") or "").strip().upper()
@@ -362,6 +401,7 @@ def apply_ai_actions(raw_actions: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
 
 _VALID_TYPES_DRY = {"open", "close", "reduce", "adjust_tp", "adjust_sl"}
 
+
 @dataclass
 class DryRunRouterConfig:
     account_label: str
@@ -441,11 +481,11 @@ def _iter_new_envelopes(path: Path, offset: int) -> Tuple[int, List[Dict[str, An
             f.seek(offset)
             for line in f:
                 offset += len(line)
-                line = line.strip()
+                line = _trim_json_bytes(line)
                 if not line:
                     continue
                 try:
-                    env = orjson.loads(line)
+                    env = _json_loads(line)
                     if isinstance(env, dict):
                         envs.append(env)
                 except Exception:
@@ -537,7 +577,9 @@ def dry_run_router_loop() -> None:
                 logger.info(text)
 
                 if cfg.send_tg:
-                    allowed, sent_count, last_minute = _tg_throttle_state(cfg.max_tg_per_minute, sent_count, last_minute)
+                    allowed, sent_count, last_minute = _tg_throttle_state(
+                        cfg.max_tg_per_minute, sent_count, last_minute
+                    )
                     if allowed:
                         try:
                             send_tg(text)
@@ -561,7 +603,7 @@ def _resolve_paths_for_queue_router() -> Tuple[Path, Path]:
       - fallback to settings if available
       - fallback to state/*.jsonl
     """
-    ACCOUNT_LABEL = os.getenv("ACCOUNT_LABEL", "main").strip() or "main"
+    account_label = os.getenv("ACCOUNT_LABEL", "main").strip() or "main"
 
     try:
         from app.core.config import settings  # type: ignore
@@ -582,48 +624,54 @@ def _resolve_paths_for_queue_router() -> Tuple[Path, Path]:
 
     logger.info(
         "Queue Router configured for ACCOUNT_LABEL=%s, ACTIONS_FILE=%s, EXEC_SIGNALS_PATH=%s",
-        ACCOUNT_LABEL, actions_path, exec_path
+        account_label, actions_path, exec_path
     )
 
     return actions_path, exec_path
 
 
-def _load_new_actions_bytes(actions_file: Path, last_size: int) -> Tuple[List[Dict[str, Any]], int]:
+def _tail_new_actions(actions_file: Path, offset: int) -> Tuple[int, List[Dict[str, Any]]]:
+    """
+    Tail-only reader: reads new lines since offset. Handles truncation.
+    """
     if not actions_file.exists():
-        return [], last_size
+        return offset, []
 
     try:
-        raw = actions_file.read_bytes()
+        size = actions_file.stat().st_size
+    except Exception:
+        return offset, []
+
+    if offset > size:
+        logger.warning("Queue Router: actions file truncated; resetting offset to 0")
+        offset = 0
+
+    out: List[Dict[str, Any]] = []
+    try:
+        with actions_file.open("rb") as f:
+            f.seek(offset)
+            for line in f:
+                offset += len(line)
+                line = _trim_json_bytes(line)
+                if not line:
+                    continue
+                try:
+                    obj = _json_loads(line)
+                except Exception:
+                    logger.debug("Skipping malformed action line.")
+                    continue
+                if isinstance(obj, dict):
+                    out.append(obj)
     except Exception as exc:
-        logger.error("Failed to read actions file %s: %s", actions_file, exc)
-        return [], last_size
+        logger.error("Failed tail-read actions file %s: %s", actions_file, exc)
+        return offset, []
 
-    new_size = len(raw)
-    if new_size <= last_size:
-        return [], new_size
-
-    chunk = raw[last_size:]
-    lines = chunk.splitlines()
-
-    actions: List[Dict[str, Any]] = []
-    for line in lines:
-        line = line.strip()
-        if not line:
-            continue
-        try:
-            obj = orjson.loads(line)
-        except Exception:
-            logger.debug("Skipping malformed action line.")
-            continue
-        if isinstance(obj, dict):
-            actions.append(obj)
-
-    return actions, new_size
+    return offset, out
 
 
 def _append_exec_signal(exec_signals_path: Path, exec_sig: ExecSignal) -> None:
     try:
-        payload = orjson.dumps(exec_sig)
+        payload = _json_dumps(exec_sig)
         with exec_signals_path.open("ab") as f:
             f.write(payload)
             f.write(b"\n")
@@ -735,11 +783,11 @@ def execsignal_queue_router_main() -> None:
         cfg.max_notional_pct,
     )
 
-    last_size = 0
+    offset = 0
 
     while True:
         try:
-            actions, last_size = _load_new_actions_bytes(actions_file, last_size)
+            offset, actions = _tail_new_actions(actions_file, offset)
             if actions:
                 logger.info("Queue Router saw %d new actions for %s", len(actions), account_label)
 
@@ -750,11 +798,17 @@ def execsignal_queue_router_main() -> None:
                         if res.ok:
                             logger.info("AI heartbeat accepted for %s: %s", account_label, res.action)
                         else:
-                            logger.warning("AI heartbeat REJECTED for %s reasons=%s action=%s", account_label, res.reasons, res.action)
+                            logger.warning(
+                                "AI heartbeat REJECTED for %s reasons=%s action=%s",
+                                account_label, res.reasons, res.action
+                            )
                         continue
 
                     if not res.ok:
-                        logger.warning("AI action REJECTED for %s reasons=%s action=%s", account_label, res.reasons, res.action)
+                        logger.warning(
+                            "AI action REJECTED for %s reasons=%s action=%s",
+                            account_label, res.reasons, res.action
+                        )
                         continue
 
                     a = res.action

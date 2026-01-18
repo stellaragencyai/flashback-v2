@@ -6,8 +6,38 @@
 #   - Provide portfolio-safe default envelopes by horizon/role.
 #   - Keep leverage/risk sane and consistent with Phase-5 strategy roles.
 #   - Manual profiles exist, but automation must still respect automation_mode=OFF.
+#
+# Canonical intent:
+#   - This file is the single source of truth for sizing + margin/leverage constraints.
+#   - Subaccounts reference one profile key via: risk_profile: <profile_name>
+#   - Executors must enforce:
+#       * require_stop == true  => stop must exist before/at entry
+#       * margin mode allowed + preferred
+#       * implied risk_pct close to target within tolerance
+#       * max_concurrent_positions
+#       * daily loss caps + trade caps + cooldowns
+#
+# Risk definition (must be consistent system-wide):
+#   implied_risk_usd = abs(entry_price - stop_price) * position_qty
+#   implied_risk_pct = implied_risk_usd / equity_usd
+#
+# Enforcement:
+#   abs(implied_risk_pct - risk_pct) <= (risk_tolerance_pct / 100)
 
 version: 2
+
+schema_version: risk_profiles.v2
+risk_definition: stop_distance_times_qty
+enforcement_contract:
+  require_stop: true
+  enforce_implied_risk: true
+  enforce_margin_mode: true
+  enforce_leverage_cap: true
+  enforce_concurrency: true
+  enforce_daily_caps: true
+  enforce_cooldowns: true
+  enforce_news_lockout: true
+
 notes: |
   v2:
     - Phase-5 aligned envelopes:
@@ -19,84 +49,208 @@ notes: |
         * spec_intraday: volatile microcap/spec profile
         * manual_only: explicit manual flag
         * main_manual_exits_only: executor must not trade main (OFF), but exits may use profile constraints
+    - Added enforcement fields (require_stop, tolerance, daily caps, cooldowns, entry restrictions).
+    - Added extractor_25x_v1 (10% risk) and sniper_v1 (25% risk) per your latest decisions.
 
 profiles:
+
   # --------------------------------------------------------
   # MAIN — Manual entries, system-managed exits only
   # --------------------------------------------------------
   main_manual_exits_only:
+    description: "Main account: manual entries only; system may manage exits under constraints."
     risk_pct: 0.01
+    risk_tolerance_pct: 0.50
     max_concurrent_positions: 1
     max_leverage: 75
+    margin_mode_preference: cross
     allow_cross: true
     allow_isolated: true
+    require_stop: true
+    allow_market_entries: true          # manual entries may be market; exits can be market
+    max_trades_per_day: 20              # informational (main is manual)
+    daily_loss_cap_pct: 0.20            # informational for warnings/alerts (not auto-blocking manual)
+    cooldown_after_loss_min: 0
+    cooldown_after_2_losses_min: 0
+    news_lockout_required: false        # main is manual; system can still warn
     manual_only: true
 
   # --------------------------------------------------------
   # Intraday (1m–5m signals, flat/short holds)
   # --------------------------------------------------------
   intraday_fast:
+    description: "Fast intraday: higher leverage allowed, but still stop-defined risk."
     risk_pct: 0.10
+    risk_tolerance_pct: 0.50
     max_concurrent_positions: 2
     max_leverage: 50
+    margin_mode_preference: isolated
     allow_cross: true
     allow_isolated: true
+    require_stop: true
+    allow_market_entries: false
+    max_trades_per_day: 10
+    daily_loss_cap_pct: 0.25
+    cooldown_after_loss_min: 10
+    cooldown_after_2_losses_min: 30
+    news_lockout_required: true
 
   # Spec intraday (volatile names, single position)
   spec_intraday:
+    description: "Spec intraday: volatile names; single position; strict discipline."
     risk_pct: 0.10
+    risk_tolerance_pct: 0.50
     max_concurrent_positions: 1
     max_leverage: 75
+    margin_mode_preference: isolated
     allow_cross: true
     allow_isolated: true
+    require_stop: true
+    allow_market_entries: false
+    max_trades_per_day: 6
+    daily_loss_cap_pct: 0.30
+    cooldown_after_loss_min: 10
+    cooldown_after_2_losses_min: 45
+    news_lockout_required: true
 
   # --------------------------------------------------------
   # Mid-term (15m–1h signals, hours to ~2 days)
   # --------------------------------------------------------
   midterm_core:
+    description: "Midterm core: moderate leverage, moderate pacing."
     risk_pct: 0.10
+    risk_tolerance_pct: 0.50
     max_concurrent_positions: 2
     max_leverage: 25
+    margin_mode_preference: isolated
     allow_cross: true
     allow_isolated: true
+    require_stop: true
+    allow_market_entries: false
+    max_trades_per_day: 8
+    daily_loss_cap_pct: 0.20
+    cooldown_after_loss_min: 15
+    cooldown_after_2_losses_min: 45
+    news_lockout_required: true
 
   # --------------------------------------------------------
   # Swing / Position (4h–1D signals, days+ holds)
   # --------------------------------------------------------
   swing_position:
+    description: "Swing/position: lower leverage, wider horizons; 1 position."
     risk_pct: 0.10
+    risk_tolerance_pct: 0.50
     max_concurrent_positions: 1
     max_leverage: 10
+    margin_mode_preference: isolated
     allow_cross: true
     allow_isolated: true
+    require_stop: true
+    allow_market_entries: false
+    max_trades_per_day: 4
+    daily_loss_cap_pct: 0.15
+    cooldown_after_loss_min: 30
+    cooldown_after_2_losses_min: 90
+    news_lockout_required: true
 
   # --------------------------------------------------------
   # Canary (smallest risk, safest envelope)
   # --------------------------------------------------------
   canary_low_risk:
+    description: "Canary: smallest risk, safest envelope."
     risk_pct: 0.05
+    risk_tolerance_pct: 0.25
     max_concurrent_positions: 1
     max_leverage: 20
+    margin_mode_preference: isolated
     allow_cross: true
     allow_isolated: true
+    require_stop: true
+    allow_market_entries: false
+    max_trades_per_day: 6
+    daily_loss_cap_pct: 0.08
+    cooldown_after_loss_min: 20
+    cooldown_after_2_losses_min: 60
+    news_lockout_required: true
 
   # --------------------------------------------------------
   # HFT / Market Making (microstructure)
   # --------------------------------------------------------
   hft_mm:
+    description: "HFT/MM: microstructure profile. Multiple small positions; tight controls."
     risk_pct: 0.05
+    risk_tolerance_pct: 0.25
     max_concurrent_positions: 3
     max_leverage: 25
-    allow_cross: true
+    margin_mode_preference: isolated
+    allow_cross: false
     allow_isolated: true
+    require_stop: true
+    allow_market_entries: false
+    max_trades_per_day: 200
+    daily_loss_cap_pct: 0.10
+    cooldown_after_loss_min: 5
+    cooldown_after_2_losses_min: 15
+    news_lockout_required: true
+
+  # --------------------------------------------------------
+  # Group 2: 25x “Money Extractors” (Altcoins)
+  # --------------------------------------------------------
+  extractor_25x_v1:
+    description: "25x altcoin extractors: aggressive but controlled, one position at a time."
+    risk_pct: 0.10
+    risk_tolerance_pct: 0.50
+    max_concurrent_positions: 1
+    max_leverage: 25
+    margin_mode_preference: isolated
+    allow_cross: false
+    allow_isolated: true
+    require_stop: true
+    allow_market_entries: false
+    max_trades_per_day: 6
+    daily_loss_cap_pct: 0.30
+    cooldown_after_loss_min: 10
+    cooldown_after_2_losses_min: 30
+    news_lockout_required: true
+
+  # --------------------------------------------------------
+  # Group 3: Snipers (07/08/09)
+  # One symbol each, ultra-high risk
+  # --------------------------------------------------------
+  sniper_v1:
+    description: "Sniper accounts: one symbol only, ultra-selective, extreme risk."
+    risk_pct: 0.25
+    risk_tolerance_pct: 1.00
+    max_concurrent_positions: 1
+    max_leverage: 25
+    margin_mode_preference: isolated
+    allow_cross: false
+    allow_isolated: true
+    require_stop: true
+    allow_market_entries: false
+    max_trades_per_day: 3
+    daily_loss_cap_pct: 0.50
+    cooldown_after_loss_min: 20
+    cooldown_after_2_losses_min: 60
+    news_lockout_required: true
 
   # --------------------------------------------------------
   # Manual-only subaccount (hard block for executor)
   # --------------------------------------------------------
   manual_only:
+    description: "Explicit manual-only: executor must never open positions."
     risk_pct: 0.01
+    risk_tolerance_pct: 0.50
     max_concurrent_positions: 0
     max_leverage: 75
+    margin_mode_preference: cross
     allow_cross: true
     allow_isolated: true
+    require_stop: false                 # executor should never enter anyway
+    allow_market_entries: true
+    max_trades_per_day: 0
+    daily_loss_cap_pct: 1.00
+    cooldown_after_loss_min: 0
+    cooldown_after_2_losses_min: 0
+    news_lockout_required: false
     manual_only: true

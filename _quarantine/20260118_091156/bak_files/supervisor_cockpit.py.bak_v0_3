@@ -1,0 +1,89 @@
+﻿from pathlib import Path
+import time, json, os
+from collections import defaultdict
+
+ROOT = Path(r"C:\flashback")
+STATE = ROOT / "state"
+OPS = STATE / "ops_snapshot.json"
+ORCH = STATE / "orchestrator_state.json"
+
+def clear():
+    os.system("cls" if os.name == "nt" else "clear")
+
+def load(p):
+    try:
+        return json.loads(p.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+def trunc(s, n):
+    return s if len(s) <= n else s[:n-1] + "…"
+
+def count(v):
+    if isinstance(v, list):
+        return len(v)
+    if isinstance(v, bool):
+        return int(v)
+    if isinstance(v, int):
+        return v
+    return 0
+
+while True:
+    clear()
+    ops = load(OPS)
+    orch = load(ORCH)
+
+    components = ops.get("components", {})
+    accounts = defaultdict(lambda: {
+        "enabled": 0,
+        "running": 0,
+        "dead": 0,
+        "mode": "?",
+        "trades": 0,
+        "bucket_n": 0,
+        "last": 0,
+        "sup": "OFF",
+    })
+
+    now = time.time()
+
+    for comp, data in components.items():
+        label = comp.split(":")[-1]
+        d = data.get("details", {})
+        a = accounts[label]
+
+        a["enabled"] += count(d.get("enabled_workers"))
+        a["running"] += count(d.get("running_workers"))
+        a["dead"] += count(d.get("dead_workers"))
+
+        a["mode"] = d.get("mode", a["mode"])
+        a["trades"] = max(a["trades"], d.get("trade_count", 0))
+        a["bucket_n"] = max(a["bucket_n"], d.get("bucket_n", 0))
+        a["last"] = max(a["last"], data.get("ts_ms", 0))
+
+    for acc in orch.get("procs", {}):
+        accounts[acc]["sup"] = "ON"
+
+    print("FLASHBACK — SUPERVISOR COCKPIT v0.3")
+    print("=" * 96)
+    print(f"{'ACCOUNT':14} {'MODE':6} {'SUP':5} {'WORKERS':15} {'TRADES':8} {'BUCKET':8} {'LAST(s)':8}")
+    print("-" * 96)
+
+    for label in sorted(accounts):
+        a = accounts[label]
+        last = int((now * 1000 - a["last"]) / 1000) if a["last"] else "?"
+        workers = f"{a['running']}/{a['enabled']}/{a['dead']}"
+
+        print(
+            f"{trunc(label,14):14} "
+            f"{a['mode']:<6} "
+            f"{a['sup']:<5} "
+            f"{workers:<15} "
+            f"{a['trades']:<8} "
+            f"{a['bucket_n']:<8} "
+            f"{last:<8}"
+        )
+
+    time.sleep(2)
+
+# COCKPIT_V0_4

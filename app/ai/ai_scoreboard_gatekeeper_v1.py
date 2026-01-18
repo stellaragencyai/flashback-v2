@@ -1,4 +1,4 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 import json
 import math
@@ -35,10 +35,9 @@ def _load_scoreboard(path: str) -> Optional[Dict[str, Any]]:
 
 
 def _bucket_key(setup_type: str, timeframe: str, symbol: str) -> Tuple[str, str, str]:
-    return (
-        str(setup_type or "unknown"),
-        str(timeframe or "unknown"),
-        str(symbol or "unknown"),
+    return (str((setup_type or "unknown")).lower(),
+        str((timeframe or "unknown")).lower(),
+        str((symbol or "unknown")).upper(),
     )
 
 
@@ -134,3 +133,4 @@ def scoreboard_gate_decide(
         "bucket_stats": match,
         "scoreboard_path": path,
     }
+
