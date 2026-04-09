@@ -5,7 +5,7 @@ Feature Builder — trades + outcomes → unified feature_store.jsonl
 
 Reads:
 - state/features_trades.jsonl
-- state/ai_events/outcomes.enriched.backfill.jsonl
+- lane-aware outcome files under state/ai_events*/...
 
 Writes:
 - state/feature_store.jsonl (append-only; progress tracked via app.data.append_store)
@@ -20,9 +20,9 @@ from __future__ import annotations
 import math
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Iterator, List, Optional, Tuple
 
-from app.data.append_store import append_rows, load_progress
+from app.data.append_store import append_rows, load_progress, save_progress
 from app.data.feature_registry import enforce_schema
 
 # ---------------- JSON ----------------
@@ -50,15 +50,11 @@ except Exception:
 # ---------------- PATHS ----------------
 ROOT = Path(__file__).resolve().parents[2]
 STATE = ROOT / "state"
-AI_EVENTS_DIR = STATE / "ai_events"
-
 FEATURES_TRADES = STATE / "features_trades.jsonl"
-OUTCOMES = AI_EVENTS_DIR / "outcomes.enriched.backfill.jsonl"
 OUT = STATE / "feature_store.jsonl"
 
 # Ensure dirs exist (avoids weird partial failures)
 STATE.mkdir(parents=True, exist_ok=True)
-AI_EVENTS_DIR.mkdir(parents=True, exist_ok=True)
 
 
 # ---------------- HELPERS ----------------
@@ -105,25 +101,106 @@ def regime(row: Dict[str, Any]) -> str:
     return "other"
 
 
-def load_jsonl(path: Path) -> List[Dict[str, Any]]:
+def iter_jsonl(path: Path, start_offset: int = 0) -> Tuple[Iterator[Dict[str, Any]], Dict[str, int]]:
     if not path.exists():
-        return []
-    out: List[Dict[str, Any]] = []
+        return iter(()), {"offset": 0}
+
     try:
-        with path.open("rb") as f:
-            for line in f:
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    obj = loads(line)
-                    if isinstance(obj, dict):
-                        out.append(obj)
-                except Exception:
-                    continue
+        file_size = int(path.stat().st_size)
     except Exception:
-        return []
-    return out
+        file_size = 0
+
+    offset = max(0, int(start_offset or 0))
+    if offset > file_size:
+        offset = 0
+
+    state = {"offset": offset}
+
+    def _iter() -> Iterator[Dict[str, Any]]:
+        try:
+            with path.open("rb") as f:
+                if state["offset"] > 0:
+                    f.seek(state["offset"])
+                for line in f:
+                    state["offset"] = int(f.tell())
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        obj = loads(line)
+                    except Exception:
+                        continue
+                    if isinstance(obj, dict):
+                        yield obj
+        except Exception:
+            return
+
+    return _iter(), state
+
+
+def _candidate_outcome_paths() -> List[Path]:
+    out: List[Path] = []
+    seen: set[str] = set()
+    patterns = [
+        "ai_events/outcomes.enriched.backfill.jsonl",
+        "ai_events/outcomes.v1.jsonl",
+        "ai_events/*/outcomes.v1.jsonl",
+        "ai_events_*/outcomes.v1.jsonl",
+        "ai_decision_outcomes.v1.jsonl",
+    ]
+    for pattern in patterns:
+        try:
+            matches = STATE.glob(pattern)
+        except Exception:
+            matches = []
+        for path in matches:
+            try:
+                if not path.is_file():
+                    continue
+            except Exception:
+                continue
+            key = str(path).lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append(path)
+    return sorted(out, key=lambda p: str(p).lower())
+
+
+def _source_offsets(progress: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
+    raw = progress.get("source_offsets")
+    return dict(raw) if isinstance(raw, dict) else {}
+
+
+def _offset_for_path(progress: Dict[str, Any], path: Path) -> int:
+    key = str(path.resolve())
+    slot = _source_offsets(progress).get(key)
+    if not isinstance(slot, dict):
+        return 0
+    try:
+        return int(slot.get("offset") or 0)
+    except Exception:
+        return 0
+
+
+def _remember_offset(progress: Dict[str, Any], path: Path, offset: int) -> None:
+    key = str(path.resolve())
+    bucket = _source_offsets(progress)
+    bucket[key] = {
+        "offset": int(max(0, offset)),
+        "updated_ms": int(datetime.now(tz=timezone.utc).timestamp() * 1000),
+    }
+    progress["source_offsets"] = bucket
+
+
+def _outcome_identity(evt: Dict[str, Any]) -> str:
+    outcome_id = str(evt.get("outcome_id") or "").strip()
+    if outcome_id:
+        return f"oid:{outcome_id}"
+    trade_id = str(evt.get("trade_id") or "").strip()
+    ts = evt.get("closed_ts_ms") or evt.get("ts_ms") or evt.get("ts") or ""
+    reason = evt.get("close_reason") or evt.get("exit_reason") or ""
+    return f"tid:{trade_id}|ts:{ts}|reason:{reason}"
 
 
 def _coerce_bool(x: Any) -> Optional[bool]:
@@ -181,6 +258,36 @@ def normalize_feature_trade(r: Dict[str, Any]) -> Optional[Dict[str, Any]]:
 
 def normalize_outcome(evt: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     try:
+        if str(evt.get("schema_version") or "").strip() == "outcome.v1" or str(evt.get("event_type") or "").strip() == "trade_outcome":
+            ts = fint(evt.get("opened_ts_ms"))
+            dt = datetime.fromtimestamp(ts / 1000, tz=timezone.utc) if ts else None
+            pnl = ffloat(evt.get("pnl_usd"))
+            win = _coerce_bool(evt.get("win"))
+            if win is None and pnl is not None:
+                win = pnl > 0
+            row: Dict[str, Any] = {
+                "trade_id": evt.get("trade_id"),
+                "symbol": evt.get("symbol"),
+                "strategy_name": evt.get("strategy_name") or evt.get("strategy"),
+                "account_label": evt.get("account_label"),
+                "mode": evt.get("mode"),
+                "ts_open_ms": ts,
+                "ts_open_iso": dt.isoformat() if dt else None,
+                "dow": dt.weekday() if dt else None,
+                "hour_utc": dt.hour if dt else None,
+                "session": session(dt.hour if dt else None),
+                "entry_price": ffloat(evt.get("entry_px")),
+                "exit_price": ffloat(evt.get("exit_px")),
+                "pnl_usd": pnl,
+                "r_multiple": ffloat(evt.get("r_multiple")),
+                "win": win,
+                "atr_pct": ffloat(evt.get("atr_pct")),
+                "vol_zscore": ffloat(evt.get("vol_zscore") or evt.get("volume_zscore")),
+                "adx": ffloat(evt.get("adx")),
+            }
+            row["regime"] = regime(row)
+            return row
+
         if evt.get("event_type") != "outcome_enriched":
             return None
 
@@ -235,7 +342,8 @@ def main() -> None:
     max_ts = last_ts_i
 
     # Feature trades
-    for r in load_jsonl(FEATURES_TRADES):
+    trade_iter, trade_state = iter_jsonl(FEATURES_TRADES, _offset_for_path(progress, FEATURES_TRADES))
+    for r in trade_iter:
         o = normalize_feature_trade(r)
         if not o:
             continue
@@ -247,27 +355,40 @@ def main() -> None:
             rows.append(o)
             if ts_i > max_ts:
                 max_ts = ts_i
+    _remember_offset(progress, FEATURES_TRADES, int(trade_state.get("offset", 0)))
 
     # Outcomes
-    for e in load_jsonl(OUTCOMES):
-        o = normalize_outcome(e)
-        if not o:
-            continue
-        ts = o.get("ts_open_ms")
-        ts_i = fint(ts)
-        if ts_i is None:
-            continue
-        if ts_i > last_ts_i:
-            rows.append(o)
-            if ts_i > max_ts:
-                max_ts = ts_i
+    seen_outcomes: set[str] = set()
+    for outcome_path in _candidate_outcome_paths():
+        outcome_iter, outcome_state = iter_jsonl(outcome_path, _offset_for_path(progress, outcome_path))
+        for e in outcome_iter:
+            ident = _outcome_identity(e)
+            if ident in seen_outcomes:
+                continue
+            seen_outcomes.add(ident)
+            o = normalize_outcome(e)
+            if not o:
+                continue
+            ts = o.get("ts_open_ms")
+            ts_i = fint(ts)
+            if ts_i is None:
+                continue
+            if ts_i > last_ts_i:
+                rows.append(o)
+                if ts_i > max_ts:
+                    max_ts = ts_i
+        _remember_offset(progress, outcome_path, int(outcome_state.get("offset", 0)))
 
     if not rows:
+        progress["last_ts"] = max_ts
+        save_progress(progress)
         print(f"[feature_builder] appended=0 last_ts={max_ts} (no new rows)")
         return
 
     enforce_schema(rows)
     append_rows(OUT, rows, max_ts)
+    progress["last_ts"] = max_ts
+    save_progress(progress)
     print(f"[feature_builder] appended={len(rows)} last_ts={max_ts}")
 
 

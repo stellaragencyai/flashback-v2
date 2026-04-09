@@ -16,16 +16,25 @@
 
       <div class="subhead">
         <span>Auto-refresh every 4s.</span>
-        <span class="truthPill keep">Cards: {{ rows|length }}</span>
-        <span class="truthPill keep">Mode: {{ (meta.orch_mode if meta else "?")|upper }}</span>
-        <span class="truthPill keep">Subset: {{ (meta.orch_only_labels|join(", ")) if (meta and meta.orch_only_labels) else "ALL" }}</span>
+        <span class="truthPill keep">Cards: <span id="metaCardsCount">{{ rows|length }}</span></span>
+        <span class="truthPill keep">Mode: <span id="metaMode">{{ (meta.orch_mode if meta else "?")|upper }}</span></span>
+        <span class="truthPill keep">Subset: <span id="metaSubset">{{ (meta.orch_only_labels|join(", ")) if (meta and meta.orch_only_labels) else "ALL" }}</span></span>
         <span class="truthPill keep">Last refresh: <span id="lastRefresh">—</span></span>
       </div>
-
       <div class="controls">
-        <input id="searchBox" class="input" placeholder="Search account / strategy / role…" />
+        <input id="searchBox" class="input" placeholder="Search account / strategy / role / group…" />
+        <select id="viewFilter" class="select">
+          <option value="all">View: All</option>
+          <option value="live">View: Live</option>
+          <option value="paper">View: Paper</option>
+          <option value="ai">View: AI Lanes</option>
+          <option value="manual">View: Manual</option>
+          <option value="ready">View: Ready By N</option>
+          <option value="offline">View: Offline / Degraded</option>
+        </select>
         <select id="sortBy" class="select">
           <option value="acct">Sort: Account</option>
+          <option value="group">Sort: Group</option>
           <option value="status">Sort: Status</option>
           <option value="freshness">Sort: Freshness (worst first)</option>
           <option value="pnl">Sort: PnL (best first)</option>
@@ -35,6 +44,7 @@
     </div>
 
     <div class="btns">
+      <button class="btn" id="cardSizeToggle" type="button">Expanded Cards</button>
       <button class="btn" id="themeToggle" type="button">Dark</button>
       <a class="btn {% if window=='7d' %}active{% endif %}" href="/?window=7d">7D</a>
       <a class="btn {% if window=='30d' %}active{% endif %}" href="/?window=30d">30D</a>
@@ -44,6 +54,7 @@
   </div>
 
   {% set m = (meta if meta is defined and meta is not none else {}) %}
+  {% set ps0 = (m.get('portfolio_summary') if m else {}) %}
   {% set orch_mode = (m.get('orch_mode') if m else None) %}
   {% set orch_only = (m.get('orch_only_labels') if m else None) %}
   {% set expected = (m.get('expected_accounts') if m else None) %}
@@ -53,81 +64,264 @@
   {% set expected_n = (expected|length if expected is iterable else 0) %}
   {% set present_n = (present|length if present is iterable else 0) %}
   {% set missing_n = (missing|length if missing is iterable else 0) %}
+  {% set live_cfg = (m.get('live_accounts') if m else []) %}
+  {% set paper_cfg = (m.get('paper_accounts') if m else []) %}
+  {% set ai_cfg = (m.get('ai_stack_accounts') if m else []) %}
+  {% set live_cfg_n = (live_cfg|length if live_cfg is iterable else (live_cfg or 0)) %}
+  {% set paper_cfg_n = (paper_cfg|length if paper_cfg is iterable else (paper_cfg or 0)) %}
+  {% set ai_cfg_n = (ai_cfg|length if ai_cfg is iterable else (ai_cfg or 0)) %}
 
   {% set only_n = (orch_only|length if orch_only is iterable else 0) %}
   {% set running_subset = (true if only_n > 0 and only_n < expected_n else false) %}
+
+  <div class="commandCenter">
+    <div class="commandHero">
+      <div class="commandEyebrow">Operator Command Center</div>
+      <div class="commandTitle">Fleet heat, approvals, and lane intent in one place.</div>
+      <div class="commandCopy">Built for faster live decisions and cleaner paper-to-live promotion control.</div>
+    </div>
+    <div class="commandStats">
+      <div class="commandStat">
+        <div class="commandLabel">Portfolio Heat</div>
+        <div class="commandValue" id="ccPortfolioHeat">{{ "%.1f"|format((((ps0.get('portfolio_heat') if ps0 else 0.0) or 0.0) * 100.0)) }}%</div>
+      </div>
+      <div class="commandStat">
+        <div class="commandLabel">Pending Approvals</div>
+        <div class="commandValue" id="ccApprovals">{{ (meta.approval_queue_count if meta else 0) or 0 }}</div>
+      </div>
+      <div class="commandStat">
+        <div class="commandLabel">Rebuild Targets</div>
+        <div class="commandValue" id="ccRebuilds">{{ (meta.rebuild_count if meta else 0) or 0 }}</div>
+      </div>
+      <div class="commandStat">
+        <div class="commandLabel">Scale-Ready</div>
+        <div class="commandValue" id="ccScaleReady">{{ (ps0.get('shadow_live_ready_count') if ps0 else 0) or 0 }}</div>
+      </div>
+    </div>
+  </div>
+
+  {% set super_label = (meta.super_ai_label if meta and meta.super_ai_label else 'flashback06') %}
+  {% set super_rows = rows|selectattr('account_label','equalto',super_label)|list %}
+  {% set super = (super_rows[0] if super_rows else none) %}
+
+  <section class="superPanel" id="superPanel">
+    <div class="superPanelHead">
+      <div>
+        <div class="superEyebrow">Super AI Lane</div>
+        <div class="superTitle" id="superTitle">{{ (super.strategy_name if super else "Super lane not found") }}</div>
+        <div class="superCopy" id="superCopy">
+          {% if super %}
+            {{ super.account_label }} on {{ (super.symbols|join(", ")) if super.symbols else (super.pinned_symbol or "—") }}.
+          {% else %}
+            Waiting for lane telemetry.
+          {% endif %}
+        </div>
+      </div>
+      <div class="superBadges">
+        <span class="truthPill" id="superRisk">Risk {{ "%.2f"|format(((super.risk_pct if super else 0.0) or 0.0) * 100.0) }}%</span>
+        <span class="truthPill" id="superFresh">{% if super and super.outcomes_freshness_sec is not none %}Fresh {{ (super.outcomes_freshness_sec|round(0, 'common')|int) }}s{% else %}Fresh n/a{% endif %}</span>
+      </div>
+    </div>
+
+    <div class="superGrid">
+      <div class="superMetric">
+        <div class="superMetricK">Fills / Day</div>
+        <div class="superMetricV" id="superFillsDay">{{ "%.2f"|format((super.fills_per_day if super else 0.0) or 0.0) }}</div>
+        <div class="superMetricSub" id="superFillDays">Active fill days: {{ (super.active_fill_days if super else 0) or 0 }}</div>
+      </div>
+      <div class="superMetric">
+        <div class="superMetricK">Outcomes / Day</div>
+        <div class="superMetricV" id="superOutcomesDay">{{ "%.2f"|format((super.outcomes_per_day if super else 0.0) or 0.0) }}</div>
+        <div class="superMetricSub" id="superOutcomeDays">Active outcome days: {{ (super.active_outcome_days if super else 0) or 0 }}</div>
+      </div>
+      <div class="superMetric">
+        <div class="superMetricK">Avg Time To Outcome</div>
+        <div class="superMetricV" id="superAvgOutcome">
+          {% if super and super.avg_time_to_outcome_sec is not none %}
+            {{ "%.1f"|format((super.avg_time_to_outcome_sec or 0.0) / 60.0) }}m
+          {% else %}
+            —
+          {% endif %}
+        </div>
+        <div class="superMetricSub" id="superOutcomes24h">24h outcomes: {{ (super.ltm_trades_24h if super else 0) or 0 }}</div>
+      </div>
+      <div class="superMetric">
+        <div class="superMetricK">Win / PnL</div>
+        <div class="superMetricV" id="superPerf">
+          {% if super %}
+            {{ "%.2f"|format((super.win_rate_pct or 0.0)) }}% / ${{ "%.2f"|format((super.pnl_usd_total or 0.0)) }}
+          {% else %}
+            —
+          {% endif %}
+        </div>
+        <div class="superMetricSub" id="superPairs">
+          Pairs: {{ (super.symbols|join(", ")) if super and super.symbols else (super.pinned_symbol if super else "—") }}
+        </div>
+      </div>
+    </div>
+
+    <div class="superMixGrid">
+      <div class="superMixCard">
+        <div class="superMetricK">Setup Mix</div>
+        <div class="superMixText" id="superSetupMix">
+          {% if super and super.setup_mix %}
+            {% for item in super.setup_mix[:4] %}
+              {{ item[0] }} {{ item[1] }}{% if not loop.last %} · {% endif %}
+            {% endfor %}
+          {% else %}
+            No outcome mix yet
+          {% endif %}
+        </div>
+      </div>
+      <div class="superMixCard">
+        <div class="superMetricK">Symbol Split</div>
+        <div class="superMixText" id="superSymbolMix">
+          {% if super and super.symbol_mix %}
+            {% for item in super.symbol_mix[:4] %}
+              {{ item[0] }} {{ item[1] }}{% if not loop.last %} · {% endif %}
+            {% endfor %}
+          {% else %}
+            No outcome split yet
+          {% endif %}
+        </div>
+      </div>
+    </div>
+  </section>
 
   <details class="sysPanel">
     <summary class="sysSummary">
       <span class="sysTitle">System Status</span>
       <span class="sysMini">
-        <span class="sysItem">Orchestrator: <span class="mono">{{ (meta.orch_mode if meta else "?") }}</span></span>
-        <span class="sysItem">Subset: <span class="mono">{{ (meta.orch_only_labels|join(",")) if (meta and meta.orch_only_labels) else "ALL" }}</span></span>
-        <span class="sysItem">Fleet: <span class="mono">{{ present_n }}</span>/<span class="mono">{{ expected_n }}</span></span>
+        <span class="sysItem">Orchestrator: <span class="mono" id="sysMode">{{ (meta.orch_mode if meta else "?") }}</span></span>
+        <span class="sysItem">Subset: <span class="mono" id="sysSubset">{{ (meta.orch_only_labels|join(",")) if (meta and meta.orch_only_labels) else "ALL" }}</span></span>
+        <span class="sysItem">Fleet: <span class="mono" id="sysFleetPresent">{{ present_n }}</span>/<span class="mono" id="sysFleetExpected">{{ expected_n }}</span></span>
         {% if running_subset %}
-          <span class="sysWarn">RUNNING SUBSET</span>
+          <span class="sysWarn" id="sysSubsetWarn">RUNNING SUBSET</span>
+        {% else %}
+          <span class="sysWarn" id="sysSubsetWarn" style="display:none;">RUNNING SUBSET</span>
         {% endif %}
       </span>
     </summary>
 
     <div class="sysBody">
       <div class="sysPills">
-        <span class="sysPill">Window: <span class="mono">{{ window|default("all") }}</span></span>
-        <span class="sysPill">Expected: <span class="mono">{{ expected_n }}</span></span>
-        <span class="sysPill">Present: <span class="mono">{{ present_n }}</span></span>
-        <span class="sysPill">Missing: <span class="mono">{{ missing_n }}</span></span>
+        <span class="sysPill">Window: <span class="mono" id="sysWindow">{{ window|default("all") }}</span></span>
+        <span class="sysPill">Expected: <span class="mono" id="sysExpected">{{ expected_n }}</span></span>
+        <span class="sysPill">Present: <span class="mono" id="sysPresent">{{ present_n }}</span></span>
+        <span class="sysPill">Missing: <span class="mono" id="sysMissing">{{ missing_n }}</span></span>
+        <span class="sysPill">Configured Live: <span class="mono" id="sysLiveAccounts">{{ live_cfg_n }}</span></span>
+        <span class="sysPill">Configured Paper: <span class="mono" id="sysPaperAccounts">{{ paper_cfg_n }}</span></span>
+        <span class="sysPill">AI Stack: <span class="mono" id="sysAiAccounts">{{ ai_cfg_n }}</span></span>
+        <span class="sysPill">Config Loader: <span class="mono" id="sysConfigLoader">{{ "OK" if (m.get('config_loader_ok', true) if m else true) else "DEGRADED" }}</span></span>
 
         {% if orch_mode %}
           {% set om = (orch_mode|string)|upper %}
-          <span class="sysPill">Mode: <span class="mono">{{ om }}</span></span>
+          <span class="sysPill">Mode: <span class="mono" id="sysModePill">{{ om }}</span></span>
         {% else %}
-          <span class="sysPill">Mode: <span class="mono">UNKNOWN</span></span>
+          <span class="sysPill">Mode: <span class="mono" id="sysModePill">UNKNOWN</span></span>
         {% endif %}
 
         {% if orch_only is iterable and only_n > 0 %}
-          <span class="sysPill">only_labels: <span class="mono">{{ orch_only|join(", ") }}</span></span>
+          <span class="sysPill">only_labels: <span class="mono" id="sysOnlyLabels">{{ orch_only|join(", ") }}</span></span>
         {% else %}
-          <span class="sysPill">only_labels: <span class="mono">ALL</span></span>
+          <span class="sysPill">only_labels: <span class="mono" id="sysOnlyLabels">ALL</span></span>
         {% endif %}
       </div>
 
       {% if running_subset %}
-        <div class="sysNote">
+        <div class="sysNote" id="sysSubsetNote">
           ⚠ Dashboard has rows for all accounts, but orchestrator is only running a subset.
+        </div>
+      {% else %}
+        <div class="sysNote" id="sysSubsetNote" style="display:none;">
+          ⚠ Dashboard has rows for all accounts, but orchestrator is only running a subset.
+        </div>
+      {% endif %}
+
+      {% if not (m.get('config_loader_ok', true) if m else true) %}
+        <div class="sysNote" id="sysConfigNote">
+          ⚠ Config loader degraded. Dashboard rows may lose strategy or mode truth until YAML support is restored.
+        </div>
+      {% else %}
+        <div class="sysNote" id="sysConfigNote" style="display:none;">
+          ⚠ Config loader degraded. Dashboard rows may lose strategy or mode truth until YAML support is restored.
         </div>
       {% endif %}
     </div>
   </details>
 
-  {% set ns = namespace(acct_count=0, online_count=0, total_trades=0, pnl_sum=0.0, stale_count=0, dead_count=0, sim_count=0) %}
+  {% set ns = namespace(acct_count=0, online_count=0, total_trades=0, wins=0, losses=0, pnl_sum=0.0, stale_count=0, dead_count=0, sim_count=0, live_count=0, paper_count=0, ai_count=0, manual_count=0, ready_count=0, entries_total=0) %}
   {% for r in rows %}
     {% if r.account_label %}
       {% set ns.acct_count = ns.acct_count + 1 %}
       {% if r.is_online %}{% set ns.online_count = ns.online_count + 1 %}{% endif %}
       {% set ns.total_trades = ns.total_trades + (r.total_trades or 0) %}
+      {% set ns.wins = ns.wins + (r.wins or 0) %}
+      {% set ns.losses = ns.losses + (r.losses or 0) %}
       {% set ns.pnl_sum = ns.pnl_sum + (r.pnl_usd_total or 0.0) %}
       {% set f = (r.outcomes_freshness_sec if r.outcomes_freshness_sec is not none else none) %}
       {% if f is not none and f|float > 3600 %}{% set ns.stale_count = ns.stale_count + 1 %}{% endif %}
       {% if f is not none and f|float > 86400 %}{% set ns.dead_count = ns.dead_count + 1 %}{% endif %}
       {% set m2 = (r.automation_mode or "")|upper %}
       {% if "LIVE" not in m2 %}{% set ns.sim_count = ns.sim_count + 1 %}{% endif %}
+      {% if r.is_live_mode %}{% set ns.live_count = ns.live_count + 1 %}{% endif %}
+      {% if r.is_paper_mode %}{% set ns.paper_count = ns.paper_count + 1 %}{% endif %}
+      {% if r.is_ai_lane %}{% set ns.ai_count = ns.ai_count + 1 %}{% endif %}
+      {% if r.is_manual_mode %}{% set ns.manual_count = ns.manual_count + 1 %}{% endif %}
+      {% if r.ready_for_live_by_n %}{% set ns.ready_count = ns.ready_count + 1 %}{% endif %}
+      {% set ns.entries_total = ns.entries_total + (r.ledger_trades_entered or r.total_trades or 0) %}
     {% endif %}
   {% endfor %}
+
+  {% set fleet_win_rate = ((ns.wins / ns.total_trades) * 100.0) if ns.total_trades > 0 else 0.0 %}
 
   <div class="summary">
     <div class="sCard">
       <div>
-        <div class="sK">Total Trades ({{ window|default("all") }})</div>
+        <div class="sK">Configured Live / Paper</div>
+        <div class="sV" id="sumLivePaper">{{ ns.live_count }} / {{ ns.paper_count }}</div>
+      </div>
+    </div>
+
+    <div class="sCard">
+      <div>
+        <div class="sK">AI / Manual Lanes</div>
+        <div class="sV" id="sumAiManual">{{ ns.ai_count }} / {{ ns.manual_count }}</div>
+      </div>
+    </div>
+
+    <div class="sCard">
+      <div>
+        <div class="sK">Ledger Entries</div>
+        <div class="sV" id="sumEntries">{{ ns.entries_total }}</div>
+      </div>
+    </div>
+
+    <div class="sCard">
+      <div>
+        <div class="sK">Outcome Trades ({{ window|default("all") }})</div>
         <div class="sV" id="sumTotalTrades">{{ ns.total_trades }}</div>
       </div>
     </div>
 
     <div class="sCard">
       <div>
+        <div class="sK">Fleet Win Rate</div>
+        <div class="sV" id="sumWinRate">{{ "%.2f"|format(fleet_win_rate) }}%</div>
+      </div>
+    </div>
+
+    <div class="sCard">
+      <div>
         <div class="sK">PnL Total USD ({{ window|default("all") }})</div>
-        <div class="sV {% if ns.pnl_sum >= 0 %}pos{% else %}neg{% endif %}" id="sumPnlTotal">
-          ${{ "%.2f"|format(ns.pnl_sum) }}
-        </div>
+        <div class="sV {% if ns.pnl_sum >= 0 %}pos{% else %}neg{% endif %}" id="sumPnlTotal">${{ "%.2f"|format(ns.pnl_sum) }}</div>
+      </div>
+    </div>
+
+    <div class="sCard">
+      <div>
+        <div class="sK">Ready By N</div>
+        <div class="sV" id="sumReadyCount">{{ ns.ready_count }}</div>
       </div>
     </div>
 
@@ -140,18 +334,46 @@
 
     <div class="sCard">
       <div>
-        <div class="sK">Stale / Dead Outcomes</div>
-        <div class="sV" id="sumStaleDead">{{ ns.stale_count }} / {{ ns.dead_count }}</div>
+        <div class="sK">Pending Approvals</div>
+        <div class="sV" id="sumApprovalQueue">{{ (meta.approval_queue_count if meta else 0) or 0 }}</div>
       </div>
     </div>
 
     <div class="sCard">
       <div>
-        <div class="sK">SIMULATED Cards</div>
-        <div class="sV" id="sumSimCards">{{ ns.sim_count }}</div>
+        <div class="sK">Portfolio Heat</div>
+        {% set ps = (meta.portfolio_summary if meta and meta.portfolio_summary else {}) %}
+        <div class="sV" id="sumPortfolioHeat">{{ "%.3f"|format((((ps.get('portfolio_heat') if ps else 0.0) or 0.0) * 100.0)) }}%</div>
+        <div class="metricSub" id="sumPortfolioHeatCap">Cap {{ "%.1f"|format((((ps.get('portfolio_heat_cap_pct') if ps else 0.0) or 0.0) * 100.0)) }}%</div>
+      </div>
+    </div>
+
+    <div class="sCard">
+      <div>
+        <div class="sK">Rebuild Targets</div>
+        <div class="sV" id="sumRebuildCount">{{ (meta.rebuild_count if meta else 0) or 0 }}</div>
       </div>
     </div>
   </div>
+
+  <details class="sysPanel">
+    <summary class="sysSummary">
+      <span class="sysTitle">Operator Queue</span>
+      <span class="sysMini">
+        <span class="sysItem">Approvals: <span class="mono" id="queueApprovalCount">{{ (meta.approval_queue_count if meta else 0) or 0 }}</span></span>
+        <span class="sysItem">Rebuilds: <span class="mono" id="queueRebuildCount">{{ (meta.rebuild_count if meta else 0) or 0 }}</span></span>
+      </span>
+    </summary>
+    <div class="sysBody">
+      <div class="sysPills">
+        <span class="sysPill">Top approvals: <span class="mono" id="queueApprovalLabels">{% if meta and meta.approval_queue %}{{ meta.approval_queue|map(attribute='label')|join(', ') }}{% else %}none{% endif %}</span></span>
+        <span class="sysPill">Top rebuilds: <span class="mono" id="queueRebuildLabels">{% if meta and meta.rebuild_targets %}{{ meta.rebuild_targets|map(attribute='target_label')|join(', ') }}{% else %}none{% endif %}</span></span>
+      </div>
+      <div class="sysNote" id="queueGuide">
+        Dashboard + Telegram ops: CANARY flashback08 | LIVE flashback08 | DRY flashback08 | PAUSE flashback04 | RESUME flashback04 | MAINUTILS STATUS | MAINUTILS RESTART | SYNC | QUEUE | STATUS | REBUILD
+      </div>
+    </div>
+  </details>
 
   {% set fb_rows = rows|rejectattr('account_label','equalto','main')|list %}
   {% set main_rows = rows|selectattr('account_label','equalto','main')|list %}
@@ -214,6 +436,8 @@
       {% set is_live = (true if "LIVE" in mU else false) %}
       {% set funds_source = ("REAL" if is_live else "SIM") %}
       {% set is_sim = (not is_live) %}
+      {% set lane_type = ("AI" if r.is_ai_lane else "MANUAL") %}
+      {% set ledger_entries = (r.ledger_trades_entered if r.ledger_trades_entered is not none else trades) %}
 
       {% set cardFlags = "" %}
       {% if is_sim %}{% set cardFlags = cardFlags ~ " sim" %}{% endif %}
@@ -222,11 +446,24 @@
            data-acct="{{ acct|e }}"
            data-strat="{{ strat|e }}"
            data-role="{{ role|e }}"
+           data-group="{{ (r.group_name or 'Other')|e }}"
+           data-group-order="{{ r.group_order if r.group_order is not none else 99 }}"
            data-status="{{ status_norm|e }}"
            data-fresh="{{ fresh if fresh is not none else 0 }}"
            data-pnl="{{ pnl }}"
-           data-trades="{{ trades }}">
-        <div class="watermark">SIMULATED</div>
+           data-trades="{{ trades }}"
+           data-live="{{ 1 if r.is_live_mode else 0 }}"
+           data-paper="{{ 1 if r.is_paper_mode else 0 }}"
+           data-ai="{{ 1 if r.is_ai_lane else 0 }}"
+           data-manual="{{ 1 if r.is_manual_mode else 0 }}"
+           data-ready="{{ 1 if r.ready_for_live_by_n else 0 }}"
+           data-enabled="{{ 1 if enabled else 0 }}">
+        <div class="watermark" {% if not r.is_paper_mode %}style="display:none;"{% endif %}>PAPER</div>
+        <div class="ribbons">
+          <span class="ribbon js-ribbonStage">{{ r.graduation_stage or "unknown" }}</span>
+          <span class="ribbon blue js-ribbonAction">{{ r.capital_action or "paper_hold" }}</span>
+          <span class="ribbon gold js-ribbonFresh">{% if fresh is not none %}{{ (fresh|round(0, 'common')|int) }}s{% else %}n/a{% endif %}</span>
+        </div>
 
         <div class="header">
           <div class="acctWrap">
@@ -236,7 +473,9 @@
               <div class="acctMeta">
                 <span class="badge {% if is_live %}green{% else %}gray{% endif %} js-mode">{{ mU }}</span>
                 <span class="badge {% if r.funds_source == "REAL" %}green{% else %}gray{% endif %}">FUNDS: {{ r.funds_source if r.funds_source else funds_source }}</span>
+                <span class="badge {% if r.is_ai_lane %}green{% else %}gray{% endif %} js-laneType">{{ lane_type }}</span>
                 <span class="chip truncate js-strategy" title="Strategy: {{ strat }}">Strategy: {{ strat }}</span>
+                <span class="chip js-group" title="Group: {{ r.group_name or 'Other' }}">Group: {{ r.group_name or "Other" }}</span>
                 {% if role %}<span class="chip truncate js-role" title="Role: {{ role }}">Role: {{ role }}</span>{% endif %}
                 {% if meta and meta.orch_only_labels and (acct not in meta.orch_only_labels) %}
                   <span class="chip" style="opacity:.75;">Not scheduled (subset)</span>
@@ -247,24 +486,32 @@
 
           <div class="rightPills">
             <div class="badge js-status">{{ status_norm }}</div>
-            {% if status_norm != "ONLINE" %}
-              {% set why = "" %}
-              {% if r.status_reason %}{% set why = r.status_reason %}
-              {% elif r.orch_reason %}{% set why = r.orch_reason %}
-              {% elif r.orch_status and (r.orch_status|string|upper) == "SKIPPED" %}{% set why = "SKIPPED: " ~ (r.orch_reason or "not scheduled") %}
-              {% elif status_norm == "STOPPED" %}{% set why = "Disabled" %}
-              {% elif status_norm == "OFFLINE" %}{% set why = "Supervisor not running" %}
-              {% elif status_norm == "DEGRADED" %}{% set why = "Degraded workers / supervisor" %}
-              {% else %}{% set why = "Unknown" %}
-              {% endif %}
-              {% if why %}
-                <div class="statusReason" title="{{ why }}">{{ why }}</div>
-              {% endif %}
+            {% set why = "" %}
+            {% if r.status_reason %}{% set why = r.status_reason %}
+            {% elif r.orch_reason %}{% set why = r.orch_reason %}
+            {% elif r.orch_status and (r.orch_status|string|upper) == "SKIPPED" %}{% set why = "SKIPPED: " ~ (r.orch_reason or "not scheduled") %}
+            {% elif status_norm == "STOPPED" %}{% set why = "Disabled" %}
+            {% elif status_norm == "OFFLINE" %}{% set why = "Supervisor not running" %}
+            {% elif status_norm == "DEGRADED" %}{% set why = "Degraded workers / supervisor" %}
             {% endif %}
+            <div class="statusReason js-statusReason" title="{{ why }}" {% if not why %}style="display:none;"{% endif %}>{{ why }}</div>
           </div>
         </div>
 
+        <div class="specStrip">
+          <span class="specPill js-configRisk">Risk/Trade: {{ "%.2f"|format((r.risk_pct or 0.0) * 100.0) }}%</span>
+          <span class="specPill js-symbols">Pairs: {{ (r.symbols|join(", ")) if r.symbols else (r.pinned_symbol or "—") }}</span>
+          <span class="specPill js-timeframes">TF: {{ (r.timeframes|join(", ")) if r.timeframes else "—" }}</span>
+          <span class="specPill js-setupCount">Setups: {{ (r.setup_types|length) if r.setup_types else 0 }}</span>
+        </div>
+
         <div class="quad">
+          <div class="metric">
+            <div class="metricK js-balanceLabel">{{ "Balance" if funds_source == "REAL" else "Paper Balance" }}</div>
+            <div class="metricV js-balanceValue">${{ "%.2f"|format(r.balance or 0.0) }}</div>
+            <div class="metricSub js-balanceSub">Entries: {{ ledger_entries }} | Open: {{ r.paper_open_positions if r.paper_open_positions is not none else 0 }} | Closed: {{ r.paper_closed_trades if r.paper_closed_trades is not none else 0 }}</div>
+          </div>
+
           <div class="metric">
             <div class="metricK">PnL ({{ window|default("all") }})</div>
             <div class="metricV {% if pnl >= 0 %}pos{% else %}neg{% endif %} js-pnlTotal">${{ "%.2f"|format(pnl) }}</div>
@@ -272,27 +519,21 @@
           </div>
 
           <div class="metric">
-            <div class="metricK">Trades</div>
-            <div class="metricV js-trades">{{ trades }}</div>
-            <div class="metricSub">24h LTM: {{ r.ltm_trades_24h if r.ltm_trades_24h is not none else 0 }}</div>
+            <div class="metricK">Record</div>
+            <div class="metricV js-record">{{ r.wins if r.wins is not none else 0 }} / {{ r.losses if r.losses is not none else 0 }}</div>
+            <div class="metricSub js-recordSub">Trades: {{ trades }} | Win {{ "%.2f"|format(win_pct) }}%</div>
           </div>
 
           <div class="metric">
-            <div class="metricK">Win %</div>
-            <div class="metricV js-winRate">{{ "%.2f"|format(win_pct) }}%</div>
-            <div class="metricSub">Mode: {{ mU }}</div>
-          </div>
-
-          <div class="metric">
-            <div class="metricK">Age</div>
-            <div class="metricV mono">
-              {% if trades|int > 0 and fresh is not none %}
-                <span class="freshHuman js-freshHuman" data-sec="{{ fresh|float }}">—</span>
+            <div class="metricK">N Outcomes</div>
+            <div class="metricV js-outcomes">{{ r.n_outcomes if r.n_outcomes is not none else trades }}</div>
+            <div class="metricSub js-outcomesGate">
+              {% if r.min_outcomes_to_live %}
+                Target {{ r.min_outcomes_to_live }} | Remaining {{ r.outcomes_remaining_to_live }}
               {% else %}
-                —
+                No live target configured
               {% endif %}
             </div>
-            <div class="metricSub">Last: <span class="js-lastOutcome">{{ last_iso }}</span></div>
           </div>
         </div>
 
@@ -301,27 +542,248 @@
         <details>
           <summary>Details (debug + ops)</summary>
           <div class="chips">
-            <span class="truthPill">Enabled: {{ "YES" if enabled else "NO" }}</span>
-            <span class="truthPill">AI Stack: {{ "ON" if (r.get("enable_ai_stack")) else "OFF" }}</span>
-            <span class="truthPill">Workers Running: {{ r.get('workers_running') if r.get('workers_running') is not none else 0 }}</span>
-
-            {% if r.funds_source == "REAL" %}
-              <span class="chip">Balance: ${{ "%.2f"|format(r.balance or 0.0) }}</span>
-            {% else %}
-              <span class="chip">Balance: — (SIM)</span>
+            <span class="truthPill js-enabled">Enabled: {{ "YES" if enabled else "NO" }}</span>
+            <span class="truthPill js-aiStack">AI Stack: {{ "ON" if (r.get("enable_ai_stack")) else "OFF" }}</span>
+            <span class="truthPill js-workersRunning">Workers Running: {{ r.get('workers_running') if r.get('workers_running') is not none else 0 }}</span>
+            <span class="truthPill">Group: {{ r.group_name or "Other" }}</span>
+            <span class="truthPill js-liveReady">Go Live By N: {{ "READY" if r.ready_for_live_by_n else "NOT READY" }}</span>
+            <span class="truthPill js-winRate">Win Rate: {{ "%.2f"|format(win_pct) }}%</span>
+            <span class="truthPill js-stage">Stage: {{ r.graduation_stage or "unknown" }}</span>
+            <span class="truthPill js-action">Action: {{ r.commercial_action or "keep_learning" }}</span>
+            {% if acct == "main" %}
+              <span class="truthPill js-mainUtils">Main Utils: {{ r.main_utils_running or 0 }}/{{ r.main_utils_enabled or 0 }}</span>
+              {% if r.main_utils_workers %}
+                {% for worker_name, worker_meta in r.main_utils_workers.items() %}
+                  <span class="chip">MAIN {{ worker_name }}: {{ "UP" if worker_meta.alive else "DOWN" }}</span>
+                {% endfor %}
+              {% endif %}
             {% endif %}
+            {% if r.min_outcomes_to_live %}
+              <span class="truthPill js-nTarget">N Target: {{ r.min_outcomes_to_live }}</span>
+              <span class="truthPill js-nRemaining">N Remaining: {{ r.outcomes_remaining_to_live }}</span>
+            {% endif %}
+            {% if r.pinned_symbol %}
+              <span class="truthPill">Pinned: {{ r.pinned_symbol }}</span>
+            {% endif %}
+
+            {% if r.balance_display_mode == "SHOW" %}
+              <span class="chip js-balanceChip">{{ "Balance" if r.funds_source == "REAL" else "Paper Balance" }}: ${{ "%.2f"|format(r.balance or 0.0) }}</span>
+            {% else %}
+              <span class="chip js-balanceChip">Balance: —</span>
+            {% endif %}
+            <span class="chip js-paperEntries">Ledger Entries: {{ ledger_entries }}</span>
+            <span class="chip js-paperOpen">Ledger Open: {{ r.paper_open_positions if r.paper_open_positions is not none else 0 }}</span>
+            <span class="chip js-paperClosed">Ledger Closed: {{ r.paper_closed_trades if r.paper_closed_trades is not none else 0 }}</span>
+            <span class="chip js-recon">Recon: {{ r.reconciliation_summary or "n/a" }}</span>
+            <span class="chip js-totalTrades">Trades: {{ r.total_trades if r.total_trades is not none else 0 }}</span>
+            <span class="chip js-wins">Wins: {{ r.wins if r.wins is not none else 0 }}</span>
+            <span class="chip js-losses">Losses: {{ r.losses if r.losses is not none else 0 }}</span>
+            <span class="chip js-analyticsPnl">Outcome PnL: ${{ "%.2f"|format(r.analytics_pnl_usd_total or 0.0) }}</span>
+            <span class="chip js-contribScore">Contribution: {{ "%.0f"|format((r.portfolio_contribution_score or 0.0) * 100.0) }}%</span>
+            <span class="chip js-uniquenessScore">Uniqueness: {{ "%.0f"|format((r.portfolio_uniqueness_score or 0.0) * 100.0) }}%</span>
+            <span class="chip js-insightScore">Insight Yield: {{ "%.0f"|format((r.insight_yield_score or 0.0) * 100.0) }}%</span>
+            <span class="chip js-progressScore">Sample Progress: {{ "%.0f"|format((r.sample_progress or 0.0) * 100.0) }}%</span>
+            <span class="chip js-familyPeers">Family Peers: {{ r.family_peer_count if r.family_peer_count is not none else 0 }}</span>
+            <span class="chip js-capitalAction">Capital: {{ r.capital_action or "paper_hold" }}</span>
+            <span class="chip js-rankScore">Rank: {{ "%.0f"|format((r.executive_rank_score or 0.0) * 100.0) }}%</span>
+            <span class="chip js-riskPct">Risk: {{ "%.3f"|format((r.recommended_risk_pct or 0.0) * 100.0) }}%</span>
+            <span class="chip js-correlation">Corr: {{ "%.0f"|format((r.correlation_score or 0.0) * 100.0) }}%</span>
+            <span class="chip js-halfLife">Half-Life: {{ "%.0f"|format((r.half_life_score or 0.0) * 100.0) }}%</span>
+            <span class="chip js-regimeWeight">Regime Wt: {{ "%.2f"|format(r.regime_capital_weight or 1.0) }}x</span>
+            <span class="chip js-shadowLive">Shadow: {{ "YES" if r.shadow_live_ready else "NO" }}</span>
+            <span class="chip js-killFast">Kill-Fast: {{ "YES" if r.kill_fast_candidate else "NO" }}</span>
+            <span class="chip js-approval">Approval: {{ (r.approval_mode or r.approval_priority or "none") if r.approval_required else "none" }}</span>
+            <span class="chip js-operatorDecision">Operator: {{ r.operator_decision or ("suppressed" if r.approval_suppressed else "none") }}</span>
+            <span class="chip js-paperLedger">
+              Ledger:
+              {% if r.paper_ledger_exists and r.paper_ledger_updated_ts_ms %}
+                updated {{ ((r.updated_ms - r.paper_ledger_updated_ts_ms) / 1000.0)|round(0, 'common')|int }}s ago
+              {% elif r.paper_ledger_exists %}
+                updated unknown
+              {% else %}
+                missing
+              {% endif %}
+            </span>
+            <span class="chip js-freshHuman" data-sec="{{ r.outcomes_freshness_sec if r.outcomes_freshness_sec is not none else 0 }}">
+              Outcomes Freshness:
+              {% if r.outcomes_freshness_sec is not none %}
+                {{ (r.outcomes_freshness_sec|round(0, 'common')|int) }}s
+              {% else %}
+                n/a
+              {% endif %}
+            </span>
           </div>
+
+          {% if acct != "main" and r.is_ai_lane %}
+          <div class="cardActions">
+            <button class="btn operatorBtn" type="button" data-operator-cmd="CANARY {{ acct }}">Approve Canary</button>
+            <button class="btn operatorBtn" type="button" data-operator-cmd="LIVE {{ acct }}">Switch To Real Money</button>
+            <button class="btn operatorBtn" type="button" data-operator-cmd="DRY {{ acct }}">Return To Paper</button>
+            <button class="btn operatorBtn" type="button" data-operator-cmd="REJECT {{ acct }}">Reject</button>
+            <button class="btn operatorBtn js-pauseResumeBtn" type="button" data-operator-cmd="{% if mU == 'OFF' %}RESUME {{ acct }}{% else %}PAUSE {{ acct }}{% endif %}">{% if mU == "OFF" %}Resume{% else %}Pause{% endif %}</button>
+          </div>
+          <div class="operatorStatus js-operatorStatus"></div>
+          {% endif %}
+
+          {% if acct == "main" %}
+          <div class="cardActions">
+            <button class="btn operatorBtn" type="button" data-operator-cmd="MAINUTILS STATUS">Main Utils Status</button>
+            <button class="btn operatorBtn" type="button" data-operator-cmd="MAINUTILS RESTART">Restart Main Utils</button>
+            <button class="btn operatorBtn" type="button" data-operator-cmd="MAINUTILS START">Start Main Utils</button>
+            <button class="btn operatorBtn" type="button" data-operator-cmd="MAINUTILS STOP">Stop Main Utils</button>
+          </div>
+          <div class="operatorStatus js-operatorStatus"></div>
+          {% endif %}
 
           <div class="footer">
             <div class="dim">Truth: <span class="mono">hydrate_dashboard_rows(window={{ window|default("all") }})</span></div>
-            <div class="dim">Last: <span class="mono">{{ last_iso }}</span></div>
+            <div class="dim">Last: <span class="mono js-lastOutcome">{{ last_iso }}</span></div>
           </div>
         </details>
       </div>
     {% endfor %}
   </div>
 
+  <aside class="focusDrawer" id="focusDrawer">
+    <div class="focusHead">
+      <div>
+        <div class="focusEyebrow">Lane Focus</div>
+        <div class="focusTitle" id="focusTitle">Select a card</div>
+      </div>
+      <button class="btn" type="button" id="focusClose">Close</button>
+    </div>
+    <div class="focusBody">
+      <div class="focusGrid">
+        <div class="focusMetric">
+          <div class="focusMetricK">Capital Action</div>
+          <div class="focusMetricV" id="focusCapital">—</div>
+        </div>
+        <div class="focusMetric">
+          <div class="focusMetricK">Risk / Trade</div>
+          <div class="focusMetricV" id="focusRisk">—</div>
+        </div>
+        <div class="focusMetric">
+          <div class="focusMetricK">Pairs</div>
+          <div class="focusMetricV" id="focusPairs">—</div>
+        </div>
+        <div class="focusMetric">
+          <div class="focusMetricK">Win / PnL</div>
+          <div class="focusMetricV" id="focusPerf">—</div>
+        </div>
+      </div>
+      <div class="focusNotes" id="focusSummary">Click any card to inspect its lane configuration, allocator state, and operator status.</div>
+      <div class="focusList">
+        <div><span class="mono">Stage:</span> <span id="focusStage">—</span></div>
+        <div><span class="mono">Strategy:</span> <span id="focusStrategy">—</span></div>
+        <div><span class="mono">Timeframes:</span> <span id="focusTimeframes">—</span></div>
+        <div><span class="mono">Setups:</span> <span id="focusSetups">—</span></div>
+        <div><span class="mono">Learning Pace:</span> <span id="focusLearningPace">—</span></div>
+        <div><span class="mono">Mix:</span> <span id="focusMix">—</span></div>
+        <div><span class="mono">Approval:</span> <span id="focusApproval">—</span></div>
+        <div><span class="mono">Operator:</span> <span id="focusOperator">—</span></div>
+      </div>
+    </div>
+  </aside>
+
   <script>
+    let selectedAccount = null;
+
+    function renderFocusDrawer(r){
+      if(!r) return;
+      selectedAccount = String(r.account_label || "");
+      const drawer = document.getElementById("focusDrawer");
+      if(drawer) drawer.classList.add("open");
+
+      const pairs = Array.isArray(r.symbols) && r.symbols.length ? r.symbols.join(", ") : String(r.pinned_symbol || "—");
+      const tfs = Array.isArray(r.timeframes) && r.timeframes.length ? r.timeframes.join(", ") : "—";
+      const setups = Array.isArray(r.setup_types) && r.setup_types.length ? r.setup_types.join(", ") : "—";
+      const wr = (Number(r.win_rate_pct || 0)).toFixed(2) + "%";
+      const pnl = "$" + Number(r.pnl_usd_total || 0).toFixed(2);
+      const learningPace = `${Number(r.fills_per_day || 0).toFixed(2)} fills/day · ${Number(r.outcomes_per_day || 0).toFixed(2)} outcomes/day`;
+      const mixText = formatMix(r.symbol_mix) || formatMix(r.setup_mix) || "No outcome mix yet";
+
+      const setText = (id, value) => {
+        const el = document.getElementById(id);
+        if(el) el.textContent = String(value ?? "—");
+      };
+
+      setText("focusTitle", `${String(r.account_label || "lane")} · ${String(r.group_name || "Other")}`);
+      setText("focusCapital", r.capital_action || "paper_hold");
+      setText("focusRisk", `${(Number(r.risk_pct || 0) * 100).toFixed(2)}%`);
+      setText("focusPairs", pairs);
+      setText("focusPerf", `${wr} / ${pnl}`);
+      setText("focusSummary", r.meta_brain_summary || r.allocator_summary || r.governance_summary || "No allocator summary.");
+      setText("focusStage", r.graduation_stage || "unknown");
+      setText("focusStrategy", r.strategy || r.strategy_name || "unknown");
+      setText("focusTimeframes", tfs);
+      setText("focusSetups", setups);
+      setText("focusLearningPace", learningPace);
+      setText("focusMix", mixText);
+      setText("focusApproval", r.approval_required ? (r.approval_mode || r.approval_priority || "required") : "none");
+      setText("focusOperator", r.operator_decision || (r.approval_suppressed ? "suppressed" : "none"));
+    }
+
+    function formatMix(items){
+      if(!Array.isArray(items) || !items.length) return "";
+      const rows = items
+        .map(item => Array.isArray(item) ? item : [item && item.key, item && item.value])
+        .filter(item => item && item[0]);
+      if(!rows.length) return "";
+      const total = rows.reduce((sum, item) => sum + Number(item[1] || 0), 0);
+      return rows.slice(0, 4).map(item => {
+        const name = String(item[0] || "");
+        const count = Number(item[1] || 0);
+        const pct = total > 0 ? Math.round((count / total) * 100) : 0;
+        return `${name} ${pct}%`;
+      }).join(" · ");
+    }
+
+    function renderSuperPanel(row, meta){
+      const superLabel = String((meta && meta.super_ai_label) || "flashback06");
+      const setText = (id, value) => {
+        const el = document.getElementById(id);
+        if(el) el.textContent = String(value ?? "—");
+      };
+      if(!row){
+        setText("superTitle", `${superLabel} pending`);
+        setText("superCopy", "Waiting for lane telemetry.");
+        setText("superRisk", "Risk —");
+        setText("superFresh", "Fresh n/a");
+        setText("superFillsDay", "0.00");
+        setText("superFillDays", "Active fill days: 0");
+        setText("superOutcomesDay", "0.00");
+        setText("superOutcomeDays", "Active outcome days: 0");
+        setText("superAvgOutcome", "—");
+        setText("superOutcomes24h", "24h outcomes: 0");
+        setText("superPerf", "—");
+        setText("superPairs", "Pairs: —");
+        setText("superSetupMix", "No outcome mix yet");
+        setText("superSymbolMix", "No outcome split yet");
+        return;
+      }
+
+      const pairs = Array.isArray(row.symbols) && row.symbols.length ? row.symbols.join(", ") : String(row.pinned_symbol || "—");
+      const fresh = row.outcomes_freshness_sec === null || row.outcomes_freshness_sec === undefined ? "n/a" : humanSec(Number(row.outcomes_freshness_sec || 0));
+      const avgOutcome = row.avg_time_to_outcome_sec === null || row.avg_time_to_outcome_sec === undefined
+        ? "—"
+        : humanSec(Number(row.avg_time_to_outcome_sec || 0));
+
+      setText("superTitle", String(row.strategy_name || row.strategy || superLabel));
+      setText("superCopy", `${String(row.account_label || superLabel)} on ${pairs}.`);
+      setText("superRisk", `Risk ${(Number(row.risk_pct || 0) * 100).toFixed(2)}%`);
+      setText("superFresh", `Fresh ${fresh}`);
+      setText("superFillsDay", Number(row.fills_per_day || 0).toFixed(2));
+      setText("superFillDays", `Active fill days: ${Number(row.active_fill_days || 0)}`);
+      setText("superOutcomesDay", Number(row.outcomes_per_day || 0).toFixed(2));
+      setText("superOutcomeDays", `Active outcome days: ${Number(row.active_outcome_days || 0)}`);
+      setText("superAvgOutcome", avgOutcome);
+      setText("superOutcomes24h", `24h outcomes: ${Number(row.ltm_trades_24h || 0)}`);
+      setText("superPerf", `${Number(row.win_rate_pct || 0).toFixed(2)}% / $${Number(row.pnl_usd_total || 0).toFixed(2)}`);
+      setText("superPairs", `Pairs: ${pairs}`);
+      setText("superSetupMix", formatMix(row.setup_mix) || "No outcome mix yet");
+      setText("superSymbolMix", formatMix(row.symbol_mix) || "No outcome split yet");
+    }
+
     // GROUP A: tag status badges with semantic classes for color-only status
     function tagStatusBadges(){
       document.querySelectorAll(".badge.js-status").forEach(el=>{
@@ -347,22 +809,53 @@
       return parts.join(' ');
     }
 
-    const pageLoadedAt = Date.now();
+    let lastRefreshAt = Date.now();
     function tickUpdated(){
-      const agoSec = Math.floor((Date.now() - pageLoadedAt)/1000);
-      document.getElementById('lastRefresh').textContent = new Date(pageLoadedAt).toLocaleTimeString();
+      const agoSec = Math.floor((Date.now() - lastRefreshAt)/1000);
+      document.getElementById('lastRefresh').textContent = new Date(lastRefreshAt).toLocaleTimeString();
       document.querySelectorAll('.updatedAgo').forEach(el=> el.textContent = humanSec(agoSec) + ' ago');
     }
 
     function renderFresh(){
-      document.querySelectorAll('.freshHuman').forEach(el=>{
+      document.querySelectorAll('.js-freshHuman').forEach(el=>{
         const sec = Number(el.getAttribute('data-sec')||0);
-        el.textContent = humanSec(sec);
+        el.textContent = 'Outcomes Freshness: ' + (sec > 0 ? humanSec(sec) : 'n/a');
       });
+    }
+
+    function deriveStatusNorm(r){
+      const enabled = !!r.enabled;
+      const isOnline = !!r.is_online;
+      const supOk = !!r.supervisor_ok;
+      const deadCount = Array.isArray(r.workers_dead) ? r.workers_dead.length : 0;
+      if(!enabled) return "STOPPED";
+      if(isOnline && supOk && deadCount === 0) return "ONLINE";
+      if(isOnline && (!supOk || deadCount > 0)) return "DEGRADED";
+      if(enabled && !isOnline) return "OFFLINE";
+      return "UNKNOWN";
+    }
+
+    function deriveStatusReason(r, statusNorm){
+      if(r.status_reason) return String(r.status_reason);
+      if(r.orch_reason) return String(r.orch_reason);
+      if(String(r.orch_status||"").toUpperCase() === "SKIPPED"){
+        return "SKIPPED: " + String(r.orch_reason || "not scheduled");
+      }
+      if(statusNorm === "STOPPED") return "Disabled";
+      if(statusNorm === "OFFLINE") return "Supervisor not running";
+      if(statusNorm === "DEGRADED") return "Degraded workers / supervisor";
+      return "";
+    }
+
+    function countMetaCollection(value){
+      if(Array.isArray(value)) return value.length;
+      const n = Number(value);
+      return Number.isFinite(n) ? n : 0;
     }
 
     function applySearchSort(){
       const q = (document.getElementById('searchBox').value||'').toLowerCase().trim();
+      const viewFilter = document.getElementById('viewFilter').value;
       const sortBy = document.getElementById('sortBy').value;
       const grid = document.getElementById('cardsGrid');
       const cards = Array.from(grid.querySelectorAll('.card'));
@@ -372,9 +865,20 @@
           c.getAttribute('data-acct')||'',
           c.getAttribute('data-strat')||'',
           c.getAttribute('data-role')||'',
+          c.getAttribute('data-group')||'',
           c.getAttribute('data-status')||''
         ].join(' ').toLowerCase();
-        c.style.display = (q==='' || hay.includes(q)) ? '' : 'none';
+        const matchesSearch = (q==='' || hay.includes(q));
+        const matchesView =
+          viewFilter === 'all' ? true :
+          viewFilter === 'live' ? c.getAttribute('data-live') === '1' :
+          viewFilter === 'paper' ? c.getAttribute('data-paper') === '1' :
+          viewFilter === 'ai' ? c.getAttribute('data-ai') === '1' :
+          viewFilter === 'manual' ? c.getAttribute('data-manual') === '1' :
+          viewFilter === 'ready' ? c.getAttribute('data-ready') === '1' :
+          viewFilter === 'offline' ? ['OFFLINE','DEGRADED'].includes(String(c.getAttribute('data-status')||'').toUpperCase()) :
+          true;
+        c.style.display = (matchesSearch && matchesView) ? '' : 'none';
       });
 
       const visible = cards.filter(c=>c.style.display !== 'none');
@@ -390,6 +894,12 @@
 
       visible.sort((a,b)=>{
         if (sortBy==='acct'){
+          return String(a.getAttribute('data-acct')).localeCompare(String(b.getAttribute('data-acct')));
+        }
+        if (sortBy==='group'){
+          const ga = Number(a.getAttribute('data-group-order')||99);
+          const gb = Number(b.getAttribute('data-group-order')||99);
+          if (ga !== gb) return ga - gb;
           return String(a.getAttribute('data-acct')).localeCompare(String(b.getAttribute('data-acct')));
         }
         if (sortBy==='status'){
@@ -411,6 +921,7 @@
     }
 
     document.getElementById('searchBox').addEventListener('input', applySearchSort);
+    document.getElementById('viewFilter').addEventListener('change', applySearchSort);
     document.getElementById('sortBy').addEventListener('change', applySearchSort);
 
     renderFresh();
@@ -443,6 +954,55 @@
       });
     })();
 
+    // Card size toggle (persist in localStorage)
+    (function(){
+      const key = "fb_card_size";
+      const body = document.body;
+      const btn = document.getElementById("cardSizeToggle");
+      if(!btn) return;
+
+      function applyMode(mode){
+        const expanded = mode === "expanded";
+        body.classList.toggle("expanded-cards", expanded);
+        btn.textContent = expanded ? "Compact Cards" : "Expanded Cards";
+        try{ localStorage.setItem(key, expanded ? "expanded" : "compact"); } catch(e){}
+      }
+
+      let saved = "compact";
+      try{ saved = localStorage.getItem(key) || "compact"; } catch(e){}
+      applyMode(saved);
+
+      btn.addEventListener("click", function(){
+        const expanded = body.classList.contains("expanded-cards");
+        applyMode(expanded ? "compact" : "expanded");
+      });
+    })();
+
+    async function postOperatorCommand(command, statusEl){
+      if(!command) return;
+      if(statusEl) statusEl.textContent = `Running: ${command}`;
+      try{
+        const resp = await fetch("/api/operator_action", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ command })
+        });
+        const payload = await resp.json().catch(() => ({}));
+        if(!resp.ok || !payload.ok){
+          const msg = String(payload.error || payload.reply || "operator command failed");
+          if(statusEl) statusEl.textContent = `Error: ${msg}`;
+          else alert(msg);
+          return;
+        }
+        if(statusEl) statusEl.textContent = String(payload.reply || "Done.");
+        setTimeout(()=>{ softRefresh(); }, 800);
+      }catch(err){
+        const msg = (err && err.message) ? err.message : String(err || "network error");
+        if(statusEl) statusEl.textContent = `Error: ${msg}`;
+        else alert(msg);
+      }
+    }
+
     async function softRefresh(){
       try{
         const windowParam = "{{ window|default('all') }}";
@@ -453,15 +1013,19 @@
 
         if(!subsResp.ok) return;
         const rows = await subsResp.json();
+        const meta = metaResp.ok ? await metaResp.json() : null;
 
         // Summary recompute from rows (mirror server logic)
-        let acctCount=0, onlineCount=0, totalTrades=0, pnlSum=0, staleCount=0, deadCount=0, simCount=0;
+        let acctCount=0, onlineCount=0, totalTrades=0, winsTotal=0, lossesTotal=0, pnlSum=0, staleCount=0, deadCount=0, simCount=0;
+        let liveCount=0, paperCount=0, aiCount=0, manualCount=0, readyCount=0, entriesTotal=0;
 
         for(const r of rows){
           if(!r || !r.account_label) continue;
           acctCount++;
           if(r.is_online) onlineCount++;
           totalTrades += Number(r.total_trades||0);
+          winsTotal += Number(r.wins||0);
+          lossesTotal += Number(r.losses||0);
           pnlSum += Number(r.pnl_usd_total||0);
 
           const f = (r.outcomes_freshness_sec===null || r.outcomes_freshness_sec===undefined) ? null : Number(r.outcomes_freshness_sec);
@@ -470,10 +1034,29 @@
 
           const m = String(r.automation_mode||"").toUpperCase();
           if(!m.includes("LIVE")) simCount++;
+          if(r.is_live_mode) liveCount++;
+          if(r.is_paper_mode) paperCount++;
+          if(r.is_ai_lane) aiCount++;
+          if(r.is_manual_mode) manualCount++;
+          if(r.ready_for_live_by_n) readyCount++;
+          entriesTotal += Number(r.ledger_trades_entered ?? r.paper_trades_entered ?? r.total_trades ?? 0);
         }
+        const fleetWinRate = totalTrades > 0 ? ((winsTotal / totalTrades) * 100.0) : 0;
+
+        const elLivePaper = document.getElementById("sumLivePaper");
+        if(elLivePaper) elLivePaper.textContent = `${liveCount} / ${paperCount}`;
+
+        const elAiManual = document.getElementById("sumAiManual");
+        if(elAiManual) elAiManual.textContent = `${aiCount} / ${manualCount}`;
+
+        const elEntries = document.getElementById("sumEntries");
+        if(elEntries) elEntries.textContent = String(entriesTotal);
 
         const elTotalTrades = document.getElementById("sumTotalTrades");
         if(elTotalTrades) elTotalTrades.textContent = String(totalTrades);
+
+        const elWinRate = document.getElementById("sumWinRate");
+        if(elWinRate) elWinRate.textContent = `${fleetWinRate.toFixed(2)}%`;
 
         const elPnl = document.getElementById("sumPnlTotal");
         if(elPnl){
@@ -482,14 +1065,93 @@
           elPnl.classList.toggle("neg", pnlSum<0);
         }
 
+        const elReady = document.getElementById("sumReadyCount");
+        if(elReady) elReady.textContent = String(readyCount);
+
         const elOnline = document.getElementById("sumOnlineTotal");
         if(elOnline) elOnline.textContent = `${onlineCount} / ${acctCount}`;
 
-        const elStaleDead = document.getElementById("sumStaleDead");
-        if(elStaleDead) elStaleDead.textContent = `${staleCount} / ${deadCount}`;
+        if(meta){
+          const onlyLabels = Array.isArray(meta.orch_only_labels) && meta.orch_only_labels.length
+            ? meta.orch_only_labels.join(", ")
+            : "ALL";
+          const present = Array.isArray(meta.present_accounts) ? meta.present_accounts.length : rows.length;
+          const expected = Array.isArray(meta.expected_accounts) ? meta.expected_accounts.length : rows.length;
+          const missing = Array.isArray(meta.missing_accounts) ? meta.missing_accounts.length : Math.max(expected - present, 0);
+          const runningSubset = Array.isArray(meta.orch_only_labels)
+            && meta.orch_only_labels.length > 0
+            && meta.orch_only_labels.length < expected;
 
-        const elSim = document.getElementById("sumSimCards");
-        if(elSim) elSim.textContent = String(simCount);
+          const metaCards = document.getElementById("metaCardsCount");
+          if(metaCards) metaCards.textContent = String(rows.length);
+          const metaMode = document.getElementById("metaMode");
+          if(metaMode) metaMode.textContent = String(meta.orch_mode || "UNKNOWN").toUpperCase();
+          const metaSubset = document.getElementById("metaSubset");
+          if(metaSubset) metaSubset.textContent = onlyLabels;
+
+          const sysMode = document.getElementById("sysMode");
+          if(sysMode) sysMode.textContent = String(meta.orch_mode || "UNKNOWN").toUpperCase();
+          const sysSubset = document.getElementById("sysSubset");
+          if(sysSubset) sysSubset.textContent = onlyLabels.replaceAll(", ", ",");
+          const sysFleetPresent = document.getElementById("sysFleetPresent");
+          if(sysFleetPresent) sysFleetPresent.textContent = String(present);
+          const sysFleetExpected = document.getElementById("sysFleetExpected");
+          if(sysFleetExpected) sysFleetExpected.textContent = String(expected);
+          const sysExpected = document.getElementById("sysExpected");
+          if(sysExpected) sysExpected.textContent = String(expected);
+          const sysPresent = document.getElementById("sysPresent");
+          if(sysPresent) sysPresent.textContent = String(present);
+          const sysMissing = document.getElementById("sysMissing");
+          if(sysMissing) sysMissing.textContent = String(missing);
+          const sysLiveAccounts = document.getElementById("sysLiveAccounts");
+          if(sysLiveAccounts) sysLiveAccounts.textContent = String(countMetaCollection(meta.live_accounts));
+          const sysPaperAccounts = document.getElementById("sysPaperAccounts");
+          if(sysPaperAccounts) sysPaperAccounts.textContent = String(countMetaCollection(meta.paper_accounts));
+          const sysAiAccounts = document.getElementById("sysAiAccounts");
+          if(sysAiAccounts) sysAiAccounts.textContent = String(countMetaCollection(meta.ai_stack_accounts));
+          const sysConfigLoader = document.getElementById("sysConfigLoader");
+          if(sysConfigLoader) sysConfigLoader.textContent = meta.config_loader_ok ? "OK" : "DEGRADED";
+          const sysModePill = document.getElementById("sysModePill");
+          if(sysModePill) sysModePill.textContent = String(meta.orch_mode || "UNKNOWN").toUpperCase();
+          const sysOnlyLabels = document.getElementById("sysOnlyLabels");
+          if(sysOnlyLabels) sysOnlyLabels.textContent = onlyLabels;
+          const sysSubsetWarn = document.getElementById("sysSubsetWarn");
+          if(sysSubsetWarn) sysSubsetWarn.style.display = runningSubset ? "" : "none";
+          const sysSubsetNote = document.getElementById("sysSubsetNote");
+          if(sysSubsetNote) sysSubsetNote.style.display = runningSubset ? "" : "none";
+          const sysConfigNote = document.getElementById("sysConfigNote");
+          if(sysConfigNote) sysConfigNote.style.display = meta.config_loader_ok ? "none" : "";
+
+          const approvalQueue = Array.isArray(meta.approval_queue) ? meta.approval_queue : [];
+          const rebuildTargets = Array.isArray(meta.rebuild_targets) ? meta.rebuild_targets : [];
+          const portfolioSummary = (meta.portfolio_summary && typeof meta.portfolio_summary === "object") ? meta.portfolio_summary : {};
+
+          const sumApprovalQueue = document.getElementById("sumApprovalQueue");
+          if(sumApprovalQueue) sumApprovalQueue.textContent = String(meta.approval_queue_count ?? approvalQueue.length ?? 0);
+          const ccApprovals = document.getElementById("ccApprovals");
+          if(ccApprovals) ccApprovals.textContent = String(meta.approval_queue_count ?? approvalQueue.length ?? 0);
+          const sumPortfolioHeat = document.getElementById("sumPortfolioHeat");
+          if(sumPortfolioHeat) sumPortfolioHeat.textContent = `${(Number(portfolioSummary.portfolio_heat || 0) * 100).toFixed(3)}%`;
+          const ccPortfolioHeat = document.getElementById("ccPortfolioHeat");
+          if(ccPortfolioHeat) ccPortfolioHeat.textContent = `${(Number(portfolioSummary.portfolio_heat || 0) * 100).toFixed(1)}%`;
+          const sumPortfolioHeatCap = document.getElementById("sumPortfolioHeatCap");
+          if(sumPortfolioHeatCap) sumPortfolioHeatCap.textContent = `Cap ${(Number(portfolioSummary.portfolio_heat_cap_pct || 0) * 100).toFixed(1)}%`;
+          const sumRebuildCount = document.getElementById("sumRebuildCount");
+          if(sumRebuildCount) sumRebuildCount.textContent = String(meta.rebuild_count ?? rebuildTargets.length ?? 0);
+          const ccRebuilds = document.getElementById("ccRebuilds");
+          if(ccRebuilds) ccRebuilds.textContent = String(meta.rebuild_count ?? rebuildTargets.length ?? 0);
+          const ccScaleReady = document.getElementById("ccScaleReady");
+          if(ccScaleReady) ccScaleReady.textContent = String(Number(portfolioSummary.shadow_live_ready_count || 0));
+
+          const queueApprovalCount = document.getElementById("queueApprovalCount");
+          if(queueApprovalCount) queueApprovalCount.textContent = String(meta.approval_queue_count ?? approvalQueue.length ?? 0);
+          const queueRebuildCount = document.getElementById("queueRebuildCount");
+          if(queueRebuildCount) queueRebuildCount.textContent = String(meta.rebuild_count ?? rebuildTargets.length ?? 0);
+          const queueApprovalLabels = document.getElementById("queueApprovalLabels");
+          if(queueApprovalLabels) queueApprovalLabels.textContent = approvalQueue.length ? approvalQueue.map(x => String(x.label || "")).filter(Boolean).join(", ") : "none";
+          const queueRebuildLabels = document.getElementById("queueRebuildLabels");
+          if(queueRebuildLabels) queueRebuildLabels.textContent = rebuildTargets.length ? rebuildTargets.map(x => String(x.target_label || "")).filter(Boolean).join(", ") : "none";
+        }
 
         // Update per-card fields
         const byAcct = new Map(rows.map(r => [String(r.account_label), r]));
@@ -503,10 +1165,19 @@
           const pnl = Number(r.pnl_usd_total||0);
           const trades = Number(r.total_trades||0);
           const fresh = (r.outcomes_freshness_sec===null || r.outcomes_freshness_sec===undefined) ? 0 : Number(r.outcomes_freshness_sec);
+          const statusNorm = deriveStatusNorm(r);
+          const statusReason = deriveStatusReason(r, statusNorm);
 
           card.setAttribute("data-pnl", String(pnl));
           card.setAttribute("data-trades", String(trades));
           card.setAttribute("data-fresh", String(fresh));
+          card.setAttribute("data-status", statusNorm);
+          card.setAttribute("data-live", r.is_live_mode ? "1" : "0");
+          card.setAttribute("data-paper", r.is_paper_mode ? "1" : "0");
+          card.setAttribute("data-ai", r.is_ai_lane ? "1" : "0");
+          card.setAttribute("data-manual", r.is_manual_mode ? "1" : "0");
+          card.setAttribute("data-ready", r.ready_for_live_by_n ? "1" : "0");
+          card.setAttribute("data-enabled", r.enabled ? "1" : "0");
 
           // Strategy/Role chips
           const stratEl = card.querySelector(".js-strategy");
@@ -518,9 +1189,22 @@
             roleEl.textContent = "Role: " + role;
           }
 
+          const groupEl = card.querySelector(".js-group");
+          if(groupEl) groupEl.textContent = "Group: " + String(r.group_name||"Other");
+          const laneTypeEl = card.querySelector(".js-laneType");
+          if(laneTypeEl) laneTypeEl.textContent = r.is_ai_lane ? "AI" : "MANUAL";
+
           // Mode badge
           const modeEl = card.querySelector(".js-mode");
           if(modeEl) modeEl.textContent = String(r.automation_mode||"").toUpperCase();
+          const statusEl = card.querySelector(".js-status");
+          if(statusEl) statusEl.textContent = statusNorm;
+          const statusReasonEl = card.querySelector(".js-statusReason");
+          if(statusReasonEl){
+            statusReasonEl.textContent = statusReason;
+            statusReasonEl.title = statusReason;
+            statusReasonEl.style.display = statusReason ? "" : "none";
+          }
 
           // PnL fields
           const pnlEl = card.querySelector(".js-pnlTotal");
@@ -534,28 +1218,173 @@
           const pnlAvgEl = card.querySelector(".js-pnlAvg");
           if(pnlAvgEl) pnlAvgEl.textContent = "Avg/trade: $" + pnlAvg.toFixed(2);
 
+          const balanceValEl = card.querySelector(".js-balanceValue");
+          if(balanceValEl) balanceValEl.textContent = "$" + Number(r.balance||0).toFixed(2);
+          const balanceLabelEl = card.querySelector(".js-balanceLabel");
+          if(balanceLabelEl){
+            balanceLabelEl.textContent = String(r.funds_source||"SIM").toUpperCase() === "REAL" ? "Balance" : "Paper Balance";
+          }
+          const balanceSubEl = card.querySelector(".js-balanceSub");
+          if(balanceSubEl){
+            const ledgerEntries = Number(r.ledger_trades_entered ?? r.paper_trades_entered ?? r.total_trades ?? 0);
+            balanceSubEl.textContent = `Entries: ${ledgerEntries} | Open: ${Number(r.paper_open_positions||0)} | Closed: ${Number(r.paper_closed_trades||0)}`;
+          }
+
           // Last outcome
           const lastEl = card.querySelector(".js-lastOutcome");
           if(lastEl) lastEl.textContent = String(r.outcomes_last_ts_iso||"—");
 
-          // Trades / Win
-          const tradesEl = card.querySelector(".js-trades");
-          if(tradesEl) tradesEl.textContent = String(trades);
+          // Record / win rate
+          const wins = Number(r.wins||0);
+          const losses = Number(r.losses||0);
+          const winPct = Number(r.win_rate_pct||0);
+          const recordEl = card.querySelector(".js-record");
+          if(recordEl) recordEl.textContent = `${wins} / ${losses}`;
+          const recordSubEl = card.querySelector(".js-recordSub");
+          if(recordSubEl){
+            recordSubEl.textContent = `Trades: ${trades} | Win ${winPct.toFixed(2)}%`;
+          }
 
-          const winEl = card.querySelector(".js-winRate");
-          if(winEl){
-            const winPct = Number(r.win_rate_pct||0);
-            winEl.textContent = winPct.toFixed(2) + "%";
+          const outcomesEl = card.querySelector(".js-outcomes");
+          if(outcomesEl) outcomesEl.textContent = String(r.n_outcomes ?? trades);
+
+          const gateEl = card.querySelector(".js-outcomesGate");
+          if(gateEl){
+            const target = Number(r.min_outcomes_to_live||0);
+            const remaining = Number(r.outcomes_remaining_to_live||0);
+            gateEl.textContent = target > 0 ? `Target ${target} | Remaining ${remaining}` : "No live target configured";
+          }
+
+          const enabledEl = card.querySelector(".js-enabled");
+          if(enabledEl) enabledEl.textContent = "Enabled: " + (r.enabled ? "YES" : "NO");
+          const aiStackEl = card.querySelector(".js-aiStack");
+          if(aiStackEl) aiStackEl.textContent = "AI Stack: " + (r.enable_ai_stack ? "ON" : "OFF");
+          const winRateEl = card.querySelector(".js-winRate");
+          if(winRateEl) winRateEl.textContent = "Win Rate: " + winPct.toFixed(2) + "%";
+          const stageEl = card.querySelector(".js-stage");
+          if(stageEl) stageEl.textContent = "Stage: " + String(r.graduation_stage || "unknown");
+          const actionEl = card.querySelector(".js-action");
+          if(actionEl) actionEl.textContent = "Action: " + String(r.commercial_action || "keep_learning");
+          const workersEl = card.querySelector(".js-workersRunning");
+          if(workersEl) workersEl.textContent = "Workers Running: " + String(Number(r.workers_running||0));
+          const liveReadyEl = card.querySelector(".js-liveReady");
+          if(liveReadyEl) liveReadyEl.textContent = "Go Live By N: " + (r.ready_for_live_by_n ? "READY" : "NOT READY");
+          const targetEl = card.querySelector(".js-nTarget");
+          if(targetEl && Number(r.min_outcomes_to_live||0) > 0) targetEl.textContent = "N Target: " + String(Number(r.min_outcomes_to_live||0));
+          const remainingEl = card.querySelector(".js-nRemaining");
+          if(remainingEl && Number(r.min_outcomes_to_live||0) > 0) remainingEl.textContent = "N Remaining: " + String(Number(r.outcomes_remaining_to_live||0));
+
+          const balanceEl = card.querySelector(".js-balanceChip");
+          if(balanceEl){
+            const showBalance = String(r.balance_display_mode||"HIDE").toUpperCase() === "SHOW";
+            if(showBalance){
+              const label = String(r.funds_source||"SIM").toUpperCase() === "REAL" ? "Balance" : "Paper Balance";
+              balanceEl.textContent = `${label}: $${Number(r.balance||0).toFixed(2)}`;
+            } else {
+              balanceEl.textContent = "Balance: —";
+            }
+          }
+          const paperEntriesEl = card.querySelector(".js-paperEntries");
+          if(paperEntriesEl) paperEntriesEl.textContent = "Ledger Entries: " + String(Number(r.ledger_trades_entered ?? r.paper_trades_entered ?? r.total_trades ?? 0));
+          const paperOpenEl = card.querySelector(".js-paperOpen");
+          if(paperOpenEl) paperOpenEl.textContent = "Ledger Open: " + String(Number(r.paper_open_positions||0));
+          const paperClosedEl = card.querySelector(".js-paperClosed");
+          if(paperClosedEl) paperClosedEl.textContent = "Ledger Closed: " + String(Number(r.paper_closed_trades||0));
+          const reconEl = card.querySelector(".js-recon");
+          if(reconEl) reconEl.textContent = "Recon: " + String(r.reconciliation_summary || "n/a");
+          const totalTradesEl = card.querySelector(".js-totalTrades");
+          if(totalTradesEl) totalTradesEl.textContent = "Trades: " + String(trades);
+          const winsEl = card.querySelector(".js-wins");
+          if(winsEl) winsEl.textContent = "Wins: " + String(wins);
+          const lossesEl = card.querySelector(".js-losses");
+          if(lossesEl) lossesEl.textContent = "Losses: " + String(losses);
+          const analyticsPnlEl = card.querySelector(".js-analyticsPnl");
+          if(analyticsPnlEl) analyticsPnlEl.textContent = "Outcome PnL: $" + Number(r.analytics_pnl_usd_total||0).toFixed(2);
+          const configRiskEl = card.querySelector(".js-configRisk");
+          if(configRiskEl) configRiskEl.textContent = "Risk/Trade: " + String((Number(r.risk_pct||0) * 100).toFixed(2)) + "%";
+          const symbolsEl = card.querySelector(".js-symbols");
+          if(symbolsEl){
+            const pairs = Array.isArray(r.symbols) && r.symbols.length ? r.symbols.join(", ") : String(r.pinned_symbol || "—");
+            symbolsEl.textContent = "Pairs: " + pairs;
+          }
+          const timeframesEl = card.querySelector(".js-timeframes");
+          if(timeframesEl){
+            const tfs = Array.isArray(r.timeframes) && r.timeframes.length ? r.timeframes.join(", ") : "—";
+            timeframesEl.textContent = "TF: " + tfs;
+          }
+          const setupCountEl = card.querySelector(".js-setupCount");
+          if(setupCountEl) setupCountEl.textContent = "Setups: " + String(Array.isArray(r.setup_types) ? r.setup_types.length : 0);
+          const contribEl = card.querySelector(".js-contribScore");
+          if(contribEl) contribEl.textContent = "Contribution: " + String(Math.round(Number(r.portfolio_contribution_score||0) * 100)) + "%";
+          const uniqueEl = card.querySelector(".js-uniquenessScore");
+          if(uniqueEl) uniqueEl.textContent = "Uniqueness: " + String(Math.round(Number(r.portfolio_uniqueness_score||0) * 100)) + "%";
+          const insightEl = card.querySelector(".js-insightScore");
+          if(insightEl) insightEl.textContent = "Insight Yield: " + String(Math.round(Number(r.insight_yield_score||0) * 100)) + "%";
+          const progressEl = card.querySelector(".js-progressScore");
+          if(progressEl) progressEl.textContent = "Sample Progress: " + String(Math.round(Number(r.sample_progress||0) * 100)) + "%";
+          const peersEl = card.querySelector(".js-familyPeers");
+          if(peersEl) peersEl.textContent = "Family Peers: " + String(Number(r.family_peer_count||0));
+          const capitalEl = card.querySelector(".js-capitalAction");
+          if(capitalEl) capitalEl.textContent = "Capital: " + String(r.capital_action || "paper_hold");
+          const rankEl = card.querySelector(".js-rankScore");
+          if(rankEl) rankEl.textContent = "Rank: " + String(Math.round(Number(r.executive_rank_score||0) * 100)) + "%";
+          const riskEl = card.querySelector(".js-riskPct");
+          if(riskEl) riskEl.textContent = "Risk: " + String((Number(r.recommended_risk_pct||0) * 100).toFixed(3)) + "%";
+          const corrEl = card.querySelector(".js-correlation");
+          if(corrEl) corrEl.textContent = "Corr: " + String(Math.round(Number(r.correlation_score||0) * 100)) + "%";
+          const halfEl = card.querySelector(".js-halfLife");
+          if(halfEl) halfEl.textContent = "Half-Life: " + String(Math.round(Number(r.half_life_score||0) * 100)) + "%";
+          const regimeEl = card.querySelector(".js-regimeWeight");
+          if(regimeEl) regimeEl.textContent = "Regime Wt: " + String(Number(r.regime_capital_weight||1).toFixed(2)) + "x";
+          const shadowEl = card.querySelector(".js-shadowLive");
+          if(shadowEl) shadowEl.textContent = "Shadow: " + ((r.shadow_live_ready) ? "YES" : "NO");
+          const killEl = card.querySelector(".js-killFast");
+          if(killEl) killEl.textContent = "Kill-Fast: " + ((r.kill_fast_candidate) ? "YES" : "NO");
+          const approvalEl = card.querySelector(".js-approval");
+          if(approvalEl) approvalEl.textContent = "Approval: " + ((r.approval_required) ? String(r.approval_mode || r.approval_priority || "required") : "none");
+          const operatorDecisionEl = card.querySelector(".js-operatorDecision");
+          if(operatorDecisionEl) operatorDecisionEl.textContent = "Operator: " + String(r.operator_decision || (r.approval_suppressed ? "suppressed" : "none"));
+          const ribbonStageEl = card.querySelector(".js-ribbonStage");
+          if(ribbonStageEl) ribbonStageEl.textContent = String(r.graduation_stage || "unknown");
+          const ribbonActionEl = card.querySelector(".js-ribbonAction");
+          if(ribbonActionEl) ribbonActionEl.textContent = String(r.capital_action || "paper_hold");
+          const ribbonFreshEl = card.querySelector(".js-ribbonFresh");
+          if(ribbonFreshEl) ribbonFreshEl.textContent = fresh > 0 ? humanSec(fresh) : "n/a";
+          const paperLedgerEl = card.querySelector(".js-paperLedger");
+          if(paperLedgerEl){
+            const ts = r.paper_ledger_updated_ts_ms;
+            if(r.paper_ledger_exists){
+              const ageSec = ts ? Math.max(0, Math.floor((Date.now() - Number(ts)) / 1000)) : null;
+              paperLedgerEl.textContent = "Ledger: " + (ageSec === null ? "updated unknown" : `updated ${humanSec(ageSec)} ago`);
+            } else {
+              paperLedgerEl.textContent = "Ledger: missing";
+            }
           }
 
           // Freshness
           const freshEl = card.querySelector(".js-freshHuman");
           if(freshEl){
             freshEl.setAttribute("data-sec", String(fresh));
-            freshEl.textContent = humanSec(fresh);
+            freshEl.textContent = "Outcomes Freshness: " + (fresh > 0 ? humanSec(fresh) : "n/a");
+          }
+          const pauseBtn = card.querySelector(".js-pauseResumeBtn");
+          if(pauseBtn){
+            const modeNow = String(r.automation_mode || "").toUpperCase();
+            const shouldResume = modeNow === "OFF";
+            pauseBtn.textContent = shouldResume ? "Resume" : "Pause";
+            pauseBtn.setAttribute("data-operator-cmd", `${shouldResume ? "RESUME" : "PAUSE"} ${String(r.account_label || "")}`);
+          }
+          const mainUtilsEl = card.querySelector(".js-mainUtils");
+          if(mainUtilsEl) mainUtilsEl.textContent = "Main Utils: " + String(Number(r.main_utils_running||0)) + "/" + String(Number(r.main_utils_enabled||0));
+
+          if(selectedAccount && selectedAccount === String(r.account_label || "")){
+            renderFocusDrawer(r);
           }
         });
 
+        renderSuperPanel(byAcct.get(String((meta && meta.super_ai_label) || "flashback06")) || null, meta);
+
+        lastRefreshAt = Date.now();
         applySearchSort();
         tickUpdated();
         tagStatusBadges();
@@ -566,6 +1395,40 @@
     }
 
     setInterval(softRefresh, 4000);
+
+    document.addEventListener("click", function(ev){
+      const card = ev.target && ev.target.closest ? ev.target.closest(".card") : null;
+      const ignore = ev.target && ev.target.closest ? ev.target.closest("button,a,input,select,summary,details") : null;
+      if(card && !ignore){
+        const acct = card.getAttribute("data-acct");
+        if(acct){
+          fetch(`/api/subaccounts?window=${encodeURIComponent("{{ window|default('all') }}")}`, { cache: "no-store" })
+            .then(resp => resp.ok ? resp.json() : [])
+            .then(rows => {
+              const found = Array.isArray(rows) ? rows.find(x => String(x.account_label || "") === acct) : null;
+              if(found) renderFocusDrawer(found);
+            })
+            .catch(()=>{});
+        }
+      }
+
+      const btn = ev.target && ev.target.closest ? ev.target.closest("[data-operator-cmd]") : null;
+      if(!btn) return;
+      const command = btn.getAttribute("data-operator-cmd");
+      if(!command) return;
+      const opCard = btn.closest(".card");
+      const statusEl = opCard ? opCard.querySelector(".js-operatorStatus") : null;
+      postOperatorCommand(command, statusEl);
+    });
+
+    const focusClose = document.getElementById("focusClose");
+    if(focusClose){
+      focusClose.addEventListener("click", function(){
+        const drawer = document.getElementById("focusDrawer");
+        if(drawer) drawer.classList.remove("open");
+        selectedAccount = null;
+      });
+    }
   </script>
 </body>
 </html>
