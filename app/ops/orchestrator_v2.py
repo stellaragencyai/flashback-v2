@@ -19,6 +19,14 @@ NEW (v2.1):
   - lock file: state/orchestrator_locks/orchestrator_v2_<label>.lock
   - if lock exists and PID is alive -> this instance exits immediately
   - if lock exists but PID is dead -> lock is reclaimed automatically
+
+PATCH (v2.2 - Lane purity hardening):
+- EXEC_BUS_PATH and EXECUTIONS_PATH now live inside AI_EVENTS_DIR (per-lane):
+    state/ai_events_<label>/ws_executions.jsonl
+  instead of:
+    state/ws_executions_<label>.jsonl
+- Health reporter now checks lane exec bus path (not legacy root bus).
+- Safety rail: when LANE_REQUIRED=1, assert EXEC_BUS_PATH is inside AI_EVENTS_DIR.
 """
 
 from __future__ import annotations
@@ -32,6 +40,11 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
+
+try:
+    from app.core.subs import get_sub_by_label  # type: ignore
+except Exception:  # pragma: no cover
+    get_sub_by_label = None  # type: ignore
 
 
 @dataclass
@@ -55,10 +68,66 @@ def _root_from_here() -> Path:
 
 
 def _venv_python(root: Path) -> Path:
-    py = root / ".venv" / "Scripts" / "python.exe"
+    if os.name == "nt":
+        py = root / ".venv" / "Scripts" / "python.exe"
+    else:
+        py = root / ".venv" / "bin" / "python"
     if not py.exists():
         raise FileNotFoundError(f"Missing venv python: {py}")
     return py
+
+
+def _venv_site_packages(root: Path) -> Path:
+    if os.name == "nt":
+        return root / ".venv" / "Lib" / "site-packages"
+    version = f"python{sys.version_info.major}.{sys.version_info.minor}"
+    return root / ".venv" / "lib" / version / "site-packages"
+
+
+def _truthy_env(name: str, default: str = "0") -> bool:
+    return str(os.getenv(name, default)).strip().lower() in ("1", "true", "yes", "y", "on")
+
+
+def _runtime_python(root: Path) -> Path:
+    if os.name == "nt" and _truthy_env("FLASHBACK_DIRECT_BASE_PYTHON", "0"):
+        override = str(os.getenv("FLASHBACK_RUNTIME_BASE_PYTHON", "")).strip()
+        if override:
+            p = Path(override)
+            if p.exists():
+                return p.resolve()
+        base_exe = getattr(sys, "_base_executable", "") or sys.executable
+        p = Path(str(base_exe))
+        if p.exists():
+            return p.resolve()
+    return _venv_python(root)
+
+
+def _runtime_env(root: Path, seed_env: Optional[Dict[str, str]] = None) -> Dict[str, str]:
+    env = dict(seed_env or os.environ)
+    venv_dir = root / ".venv"
+    scripts_dir = venv_dir / ("Scripts" if os.name == "nt" else "bin")
+    site_packages = _venv_site_packages(root)
+
+    env.setdefault("PYTHONNOUSERSITE", "1")
+    env["VIRTUAL_ENV"] = str(venv_dir)
+    env["FLASHBACK_RUNTIME_VENV"] = str(venv_dir)
+    env["FLASHBACK_RUNTIME_SITE_PACKAGES"] = str(site_packages)
+
+    if os.name == "nt" and _truthy_env("FLASHBACK_DIRECT_BASE_PYTHON", "0"):
+        runtime_py = _runtime_python(root)
+        env["FLASHBACK_DIRECT_BASE_PYTHON"] = "1"
+        env["FLASHBACK_RUNTIME_BASE_PYTHON"] = str(runtime_py)
+
+        py_path_parts = [str(root), str(site_packages)]
+        existing_pythonpath = str(env.get("PYTHONPATH", "")).strip()
+        if existing_pythonpath:
+            py_path_parts.append(existing_pythonpath)
+        env["PYTHONPATH"] = os.pathsep.join(py_path_parts)
+
+        existing_path = str(env.get("PATH", "")).strip()
+        env["PATH"] = os.pathsep.join([str(scripts_dir), existing_path]) if existing_path else str(scripts_dir)
+
+    return env
 
 
 def _ensure_dir(p: Path) -> None:
@@ -73,15 +142,28 @@ def _norm_path_str(p: Path) -> str:
         return str(p).lower()
 
 
+def _lane_automation_mode(label: str) -> str:
+    try:
+        if get_sub_by_label is None:
+            return "LIVE" if (label or "").strip().lower() == "main" else "LEARN_DRY"
+        sub = get_sub_by_label(label)
+        mode = str((sub or {}).get("automation_mode") or "").strip().upper()
+        if mode:
+            return mode
+    except Exception:
+        pass
+    return "LIVE" if (label or "").strip().lower() == "main" else "LEARN_DRY"
+
+
 def _enforce_running_under_venv(py_expected: Path) -> None:
     """
-    Hard-fails if sys.executable != venv python.
+    Hard-fails if sys.executable != the expected runtime python.
     """
     exe_now = _norm_path_str(Path(sys.executable))
     exe_need = _norm_path_str(py_expected)
     if exe_now != exe_need:
         msg = (
-            "[orchestrator_v2] HARD FAIL: orchestrator_v2 must be launched with venv python.\n"
+            "[orchestrator_v2] HARD FAIL: orchestrator_v2 must be launched with the expected runtime python.\n"
             f"[orchestrator_v2]   expected: {py_expected}\n"
             f"[orchestrator_v2]   actual  : {sys.executable}\n"
             "[orchestrator_v2] Fix: run like:\n"
@@ -101,11 +183,31 @@ def _pid_is_alive(pid: int) -> bool:
     try:
         if os.name != "nt":
             os.kill(pid, 0)
+            proc_cmd = Path(f"/proc/{pid}/cmdline")
+            if proc_cmd.exists():
+                cmdline = proc_cmd.read_text(encoding="utf-8", errors="ignore").replace("\x00", " ").lower()
+                return ("python" in cmdline) and ("orchestrator_v2.py" in cmdline)
             return True
-        # Windows: use tasklist (available by default)
-        out = subprocess.check_output(["tasklist", "/FI", f"PID eq {pid}"], text=True, errors="replace")
-        # When PID not found, tasklist prints "No tasks are running which match the specified criteria."
-        return str(pid) in out and "No tasks are running" not in out
+        # Windows: require that the PID still belongs to a python orchestrator process,
+        # not just any recycled PID like a surviving conhost.
+        probe = (
+            f'$p = Get-CimInstance Win32_Process -Filter "ProcessId = {pid}" -ErrorAction SilentlyContinue; '
+            'if ($null -eq $p) { exit 1 }; '
+            '$name = [string]$p.Name; '
+            '$cmd = [string]$p.CommandLine; '
+            'Write-Output ($name + "||" + $cmd)'
+        )
+        out = subprocess.check_output(
+            ["powershell", "-NoProfile", "-Command", probe],
+            text=True,
+            errors="replace",
+        ).strip()
+        if not out:
+            return False
+        name, _, cmd = out.partition("||")
+        name_l = name.strip().lower()
+        cmd_l = cmd.strip().lower()
+        return ("python" in name_l) and ("orchestrator_v2.py" in cmd_l)
     except Exception:
         return False
 
@@ -174,6 +276,11 @@ def _release_label_lock(root: Path, label: str) -> None:
 def _lane_env(root: Path, label: str) -> Dict[str, str]:
     """
     The entire point: isolate each lane's state paths.
+
+    Lane Contract v1:
+      - AI_EVENTS_DIR = state/ai_events_<label> (or state/ai_events for main)
+      - EXEC_BUS_PATH / EXECUTIONS_PATH MUST live inside AI_EVENTS_DIR
+        so all lane artifacts are self-contained.
     """
     state = root / "state"
     _ensure_dir(state)
@@ -185,13 +292,21 @@ def _lane_env(root: Path, label: str) -> Dict[str, str]:
         ai_events_dir = state / f"ai_events_{lab}"
     _ensure_dir(ai_events_dir)
 
-    env = dict(os.environ)
+    env = _runtime_env(root, os.environ)
 
     env["ROOT"] = str(root)
     env["ACCOUNT_LABEL"] = label
+    lane_mode = _lane_automation_mode(label)
+    env["FB_MODE"] = lane_mode
+    env["MODE"] = lane_mode
+    env["AUTOMATION_MODE"] = lane_mode
 
-    # Per-lane signals input for executor_v2 (keeps cursors isolated)
+    # Per-lane signals input for executor_v2 (keeps cursors isolated).
+    # EXEC_SIGNALS_PATH is consumed by the canonical AI queue router; keep both
+    # env vars aligned so actions for one lane cannot leak into another lane's
+    # executor queue.
     env["EXEC_SIGNAL_FILE"] = str(root / "signals" / f"observed_{label}.jsonl")
+    env["EXEC_SIGNALS_PATH"] = env["EXEC_SIGNAL_FILE"]
 
     # Tell supervisor: orchestrator already loaded env into process context (avoid double dotenv)
     env["ORCH_ENV_LOADED"] = "1"
@@ -201,17 +316,23 @@ def _lane_env(root: Path, label: str) -> Dict[str, str]:
     env["PYTHONUTF8"] = env.get("PYTHONUTF8", "1")
     env["PYTHONIOENCODING"] = env.get("PYTHONIOENCODING", "utf-8")
 
-    # Bus paths
+    # Bus paths (these can remain in state root; they're per-label anyway)
     env["POSITIONS_BUS_PATH"] = str(state / f"positions_bus_{label}.json")
     env["ORDERBOOK_BUS_PATH"] = str(state / f"orderbook_bus_{label}.json")
     env["TRADES_BUS_PATH"] = str(state / f"trades_bus_{label}.json")
     env["PUBLIC_TRADES_PATH"] = str(state / f"public_trades_{label}.jsonl")
 
-    # Execution stream (critical isolation)
-    env["EXEC_BUS_PATH"] = str(state / f"ws_executions_{label}.jsonl")
+    # -----------------------------------------------------------------
+    # Execution stream (CRITICAL isolation)
+    #
+    # IMPORTANT: Put execution bus INSIDE AI_EVENTS_DIR to keep lane self-contained.
+    # This replaces legacy: state/ws_executions_<label>.jsonl
+    # -----------------------------------------------------------------
+    lane_exec_bus = ai_events_dir / "ws_executions.jsonl"
+    env["EXEC_BUS_PATH"] = str(lane_exec_bus)
 
     # Legacy compatibility: some workers prefer EXECUTIONS_PATH
-    env["EXECUTIONS_PATH"] = str(state / f"ws_executions_{label}.jsonl")
+    env["EXECUTIONS_PATH"] = str(lane_exec_bus)
 
     # Outcome recorder isolation
     env["TRADE_OUTCOME_CURSOR_PATH"] = str(state / f"trade_outcome_recorder_{label}.cursor")
@@ -232,6 +353,26 @@ def _lane_env(root: Path, label: str) -> Dict[str, str]:
     # Heartbeat path (ws_switchboard already uses label, but enforce determinism)
     env["WS_HEARTBEAT_PATH"] = str(state / f"ws_switchboard_heartbeat_{label}.txt")
 
+    # ----------------------------
+    # Safety rail: EXEC_BUS_PATH must live under AI_EVENTS_DIR when lane required
+    # ----------------------------
+    try:
+        lane_required = (env.get("LANE_REQUIRED", "").strip() == "1")
+        if lane_required:
+            ai_dir_abs = Path(env["AI_EVENTS_DIR"]).resolve()
+            exec_abs = Path(env["EXEC_BUS_PATH"]).resolve()
+            # Windows-safe containment check
+            exec_str = _norm_path_str(exec_abs)
+            ai_str = _norm_path_str(ai_dir_abs)
+            if not exec_str.startswith(ai_str):
+                raise RuntimeError(
+                    "LANE_REQUIRED=1 but EXEC_BUS_PATH is not inside AI_EVENTS_DIR. "
+                    f"AI_EVENTS_DIR={ai_dir_abs} EXEC_BUS_PATH={exec_abs}"
+                )
+    except Exception as e:
+        print(f"[orchestrator_v2] HARD FAIL lane isolation guard: {e}")
+        raise SystemExit(5)
+
     return env
 
 
@@ -248,9 +389,9 @@ def _spawn_lane(root: Path, py: Path, label: str, logs_dir: Path) -> LaneProc:
         str(root / "app" / "bots" / "supervisor_ai_stack.py"),
     ]
 
-    # Append mode keeps history across restarts
-    stdout_f = open(stdout_path, "a", encoding="utf-8", errors="replace")
-    stderr_f = open(stderr_path, "a", encoding="utf-8", errors="replace")
+    # Fresh logs keep health checks tied to the current supervisor run instead of stale history.
+    stdout_f = open(stdout_path, "w", encoding="utf-8", errors="replace")
+    stderr_f = open(stderr_path, "w", encoding="utf-8", errors="replace")
 
     creationflags = 0
     if os.name == "nt":
@@ -357,17 +498,25 @@ def _stderr_signal(lines: List[str]) -> Tuple[str, str]:
 
 
 def _lane_paths(root: Path, label: str) -> Dict[str, Path]:
+    """
+    Where HEALTH REPORT looks for proof.
+
+    IMPORTANT: exec_bus is now lane-pure and lives in AI_EVENTS_DIR.
+    """
     state = root / "state"
     lab = label
 
     hb = state / f"ws_switchboard_heartbeat_{lab}.txt"
     pos_bus = state / f"positions_bus_{lab}.json"
-    exec_bus = state / f"ws_executions_{lab}.jsonl"
 
     if label.lower() in ("main", "primary"):
-        outcomes = state / "ai_events" / "outcomes.v1.jsonl"
+        lane_dir = state / "ai_events"
+        outcomes = lane_dir / "outcomes.v1.jsonl"
+        exec_bus = lane_dir / "ws_executions.jsonl"
     else:
-        outcomes = state / f"ai_events_{label.lower()}" / "outcomes.v1.jsonl"
+        lane_dir = state / f"ai_events_{label.lower()}"
+        outcomes = lane_dir / "outcomes.v1.jsonl"
+        exec_bus = lane_dir / "ws_executions.jsonl"
 
     return {
         "hb": hb,
@@ -478,7 +627,7 @@ def main() -> int:
     args = ap.parse_args()
 
     root = _root_from_here()
-    py = _venv_python(root)
+    py = _runtime_python(root)
 
     _enforce_running_under_venv(py)
 

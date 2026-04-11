@@ -1,28 +1,69 @@
-﻿# tools\start_api.ps1
-# Kill anything listening on :5000 then start the Cockpit API (FastAPI via uvicorn).
+# tools\start_api.ps1
+# Start the Cockpit API (FastAPI via uvicorn) on port 8000.
 
-Set-Location C:\flashback
+Set-StrictMode -Version Latest
+$ErrorActionPreference = "Stop"
 
-# Kill listeners on port 5000
-@(Get-NetTCPConnection -State Listen -LocalPort 5000 -ErrorAction SilentlyContinue |
+$RepoRoot = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
+$VenvPy = Join-Path $RepoRoot ".venv\Scripts\python.exe"
+$VenvDir = Join-Path $RepoRoot ".venv"
+$SitePackages = Join-Path $VenvDir "Lib\site-packages"
+$Port = 8000
+$StdOut = Join-Path $RepoRoot "state\api_stdout.log"
+$StdErr = Join-Path $RepoRoot "state\api_stderr.log"
+
+if (-not (Test-Path $VenvPy)) {
+  throw "Missing repo venv python at $VenvPy"
+}
+
+if (-not (Test-Path $SitePackages)) {
+  throw "Missing venv site-packages at $SitePackages"
+}
+
+$RuntimePy = (& $VenvPy -c "import sys; print(getattr(sys, '_base_executable', sys.executable))").Trim()
+if (-not $RuntimePy) {
+  throw "Could not resolve runtime python from $VenvPy"
+}
+if (-not (Test-Path $RuntimePy)) {
+  throw "Resolved runtime python does not exist: $RuntimePy"
+}
+
+Set-Location $RepoRoot
+New-Item -ItemType Directory -Force -Path (Join-Path $RepoRoot "state") | Out-Null
+
+$env:FLASHBACK_DIRECT_BASE_PYTHON = "1"
+$env:FLASHBACK_RUNTIME_BASE_PYTHON = $RuntimePy
+$env:FLASHBACK_RUNTIME_VENV = $VenvDir
+$env:FLASHBACK_RUNTIME_SITE_PACKAGES = $SitePackages
+$env:VIRTUAL_ENV = $VenvDir
+$env:PYTHONNOUSERSITE = "1"
+$env:PYTHONUTF8 = "1"
+$env:PYTHONIOENCODING = "utf-8"
+$env:PYTHONPATH = if ([string]::IsNullOrWhiteSpace($env:PYTHONPATH)) {
+  "$RepoRoot;$SitePackages"
+} else {
+  "$RepoRoot;$SitePackages;$env:PYTHONPATH"
+}
+$env:PATH = if ([string]::IsNullOrWhiteSpace($env:PATH)) {
+  (Join-Path $VenvDir "Scripts")
+} else {
+  "$(Join-Path $VenvDir 'Scripts');$env:PATH"
+}
+
+@(Get-NetTCPConnection -State Listen -LocalPort $Port -ErrorAction SilentlyContinue |
   Select-Object -ExpandProperty OwningProcess -Unique) |
   ForEach-Object { Stop-Process -Id $_ -Force -ErrorAction SilentlyContinue }
 
-# Logs
-$stdout = "C:\flashback\state\api_stdout.log"
-$stderr = "C:\flashback\state\api_stderr.log"
-Remove-Item $stdout,$stderr -Force -ErrorAction SilentlyContinue
+Remove-Item $StdOut, $StdErr -Force -ErrorAction SilentlyContinue
 
-# Start API (new window so this terminal stays usable)
-Start-Process -FilePath "python" -ArgumentList @(
+Start-Process -FilePath $RuntimePy -ArgumentList @(
   "-m","uvicorn",
   "app.api.cockpit_api:app",
   "--host","127.0.0.1",
-  "--port","5000"
-) -WorkingDirectory "C:\flashback" -WindowStyle Normal `
-  -RedirectStandardOutput $stdout -RedirectStandardError $stderr
+  "--port", "$Port"
+) -WorkingDirectory $RepoRoot -WindowStyle Normal `
+  -RedirectStandardOutput $StdOut -RedirectStandardError $StdErr
 
-# Wait a moment then show listener + quick health check
-Start-Sleep -Seconds 1
-Get-NetTCPConnection -State Listen -LocalPort 5000 -ErrorAction SilentlyContinue |
-  Select-Object LocalAddress,LocalPort,OwningProcess
+Start-Sleep -Seconds 2
+Get-NetTCPConnection -State Listen -LocalPort $Port -ErrorAction SilentlyContinue |
+  Select-Object LocalAddress, LocalPort, OwningProcess

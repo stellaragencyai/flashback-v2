@@ -1,19 +1,22 @@
-﻿
-"""
-Flashback — AI Stack Supervisor v3.9.2
-(HARD venv pinning + spawn executable hard lock + validator hard venv + log-safe STOP + ORCH_ENV_LOADED support)
+﻿"""
+Flashback — AI Stack Supervisor v3.9.3
+(HARD runtime pinning + spawn executable hard lock + validator hard runtime + log-safe STOP + ORCH_ENV_LOADED support)
 
 Core guarantees:
-- If supervisor is not running under repo venv python -> HARD STOP (AT IMPORT TIME).
-- Multiprocessing spawn executable is pinned to repo venv python -> HARD PIN (AT IMPORT TIME).
-- If mp/spawn get_executable != expected venv python -> HARD STOP (prevents system Python children).
-- Validator subprocess runs under expected venv python (never system python).
+- If supervisor is not running under the expected repo runtime python -> HARD STOP (AT IMPORT TIME).
+- Multiprocessing spawn executable is pinned to the expected repo runtime python -> HARD PIN (AT IMPORT TIME).
+- If mp/spawn get_executable != expected runtime python -> HARD STOP (prevents drift).
+- Validator subprocess runs under expected runtime python.
 
 Keeps:
 - robust validator (import + file fallback)
 - ASCII-safe logging
 - sync + async worker entry support
 - ops_snapshot writes, per-worker telemetry, restart tracking, rate-limited alerts
+
+v3.9.3 change:
+- trade_outcome_recorder import order fixed: prefers app.bots.trade_outcome_recorder (REAL) over app.ai.trade_outcome_recorder (STUB)
+- refuses stub outcomes unless ALLOW_OUTCOME_STUB=1
 """
 
 from __future__ import annotations
@@ -38,8 +41,108 @@ def _bootstrap_root() -> Path:
     return Path(__file__).resolve().parents[2]
 
 
+def _truthy_env(name: str, default: str = "0") -> bool:
+    return str(os.getenv(name, default)).strip().lower() in ("1", "true", "yes", "y", "on")
+
+
 def _bootstrap_expected_venv_python(root: Path) -> Path:
-    return (root / ".venv" / "Scripts" / "python.exe").resolve()
+    if os.name == "nt":
+        return (root / ".venv" / "Scripts" / "python.exe").resolve()
+    return (root / ".venv" / "bin" / "python")
+
+
+def _bootstrap_expected_runtime_python(root: Path) -> Path:
+    if os.name == "nt" and _truthy_env("FLASHBACK_DIRECT_BASE_PYTHON", "0"):
+        override = str(os.getenv("FLASHBACK_RUNTIME_BASE_PYTHON", "")).strip()
+        if override:
+            candidate = Path(override)
+            if candidate.exists():
+                return candidate.resolve()
+        base_exe = getattr(sys, "_base_executable", "") or sys.executable
+        candidate = Path(str(base_exe))
+        if candidate.exists():
+            return candidate.resolve()
+    return _bootstrap_expected_venv_python(root)
+
+
+def _expected_venv_dir(root: Path) -> Path:
+    return (root / ".venv").resolve()
+
+
+def _expected_site_packages(root: Path) -> Path:
+    if os.name == "nt":
+        return (root / ".venv" / "Lib" / "site-packages").resolve()
+    return (root / ".venv" / "lib" / f"python{sys.version_info.major}.{sys.version_info.minor}" / "site-packages").resolve()
+
+
+def _current_python_executable() -> Path:
+    current = Path(sys.executable)
+    if os.name == "nt":
+        return current.resolve()
+    return current
+
+
+def _direct_base_runtime_active(root: Path) -> bool:
+    if os.name != "nt":
+        return False
+    if not _truthy_env("FLASHBACK_DIRECT_BASE_PYTHON", "0"):
+        return False
+    venv_dir = _expected_venv_dir(root)
+    runtime_venv = str(os.getenv("FLASHBACK_RUNTIME_VENV", "")).strip()
+    if runtime_venv:
+        try:
+            return Path(runtime_venv).resolve() == venv_dir
+        except Exception:
+            return False
+    return True
+
+
+def _pythonpath_contains(path_value: str, target: Path) -> bool:
+    target_norm = str(target.resolve()).lower()
+    for part in str(path_value or "").split(os.pathsep):
+        chunk = part.strip()
+        if not chunk:
+            continue
+        try:
+            if str(Path(chunk).resolve()).lower() == target_norm:
+                return True
+        except Exception:
+            if chunk.lower() == target_norm:
+                return True
+    return False
+
+
+def _running_in_expected_runtime(root: Path, expected_py: Path) -> bool:
+    if os.name == "nt":
+        if _current_python_executable() != expected_py:
+            return False
+        if _direct_base_runtime_active(root):
+            site_packages = _expected_site_packages(root)
+            venv_dir = _expected_venv_dir(root)
+            return (
+                _pythonpath_contains(os.getenv("PYTHONPATH", ""), root)
+                and _pythonpath_contains(os.getenv("PYTHONPATH", ""), site_packages)
+                and str(os.getenv("VIRTUAL_ENV", "")).strip() == str(venv_dir)
+            )
+        return True
+
+    expected_dir = _expected_venv_dir(root)
+
+    try:
+        if Path(sys.prefix).resolve() == expected_dir:
+            return True
+    except Exception:
+        pass
+
+    venv_env = os.getenv("VIRTUAL_ENV", "").strip()
+    if venv_env:
+        try:
+            if Path(venv_env).resolve() == expected_dir:
+                return True
+        except Exception:
+            pass
+
+    return _current_python_executable() == expected_py
 
 
 def _bootstrap_hard_gate_and_pin() -> None:
@@ -49,8 +152,8 @@ def _bootstrap_hard_gate_and_pin() -> None:
     Also pins multiprocessing executable early so Windows spawn can't drift.
     """
     root = _bootstrap_root()
-    expected = _bootstrap_expected_venv_python(root)
-    actual = Path(sys.executable).resolve()
+    expected = _bootstrap_expected_runtime_python(root)
+    actual = _current_python_executable()
 
     # Make environment deterministic and hostile to user-site pollution
     os.environ.setdefault("PYTHONNOUSERSITE", "1")
@@ -59,17 +162,23 @@ def _bootstrap_hard_gate_and_pin() -> None:
 
     if not expected.exists():
         # If the venv doesn't exist, nothing should proceed.
-        sys.stderr.write(f"STOP Missing expected venv python: {expected}\n")
+        sys.stderr.write(f"STOP Missing expected runtime python: {expected}\n")
         raise SystemExit(78)
 
-    if actual != expected:
+    if not _running_in_expected_runtime(root, expected):
         # This is the BIG fix: kill Python312 invocations instantly.
         sys.stderr.write(
             "STOP Interpreter HARD GATE FAIL (IMPORT-TIME):\n"
             f"  sys.executable = {actual}\n"
             f"  expected       = {expected}\n"
+            f"  sys.prefix     = {sys.prefix}\n"
+            f"  VIRTUAL_ENV    = {os.getenv('VIRTUAL_ENV', '')}\n"
+            f"  direct_base    = {os.getenv('FLASHBACK_DIRECT_BASE_PYTHON', '')}\n"
         )
         raise SystemExit(77)
+
+    if os.name != "nt":
+        return
 
     # Ensure "spawn" is used (Windows default), but force to avoid surprises.
     try:
@@ -167,35 +276,38 @@ def _resolve_root() -> Path:
 
 def _expected_venv_python(root: Path) -> Path:
     """
-    Canonical venv python for this repo. This must be the ONLY interpreter allowed.
+    Canonical runtime python for this repo. Direct-base mode is allowed on Windows
+    when the repo venv is injected via environment.
     Windows: <ROOT>\\.venv\\Scripts\\python.exe
     """
-    return (root / ".venv" / "Scripts" / "python.exe").resolve()
+    return _bootstrap_expected_runtime_python(root)
 
 
 def _hard_gate_venv_interpreter(root: Path, log) -> Path:
     """
-    HARD STOP if supervisor is not running under repo venv python.
-    Returns expected venv python path.
+    HARD STOP if supervisor is not running under the expected repo runtime python.
+    Returns expected runtime python path.
     (This is still kept, but the real enforcement is import-time bootstrap.)
     """
     expected = _expected_venv_python(root)
-    actual = Path(sys.executable).resolve()
+    actual = _current_python_executable()
 
     if not expected.exists():
-        msg = f"STOP Missing expected venv python: {expected}"
+        msg = f"STOP Missing expected runtime python: {expected}"
         log.error(_ascii_safe(msg))
         raise SystemExit(msg)
 
-    if actual != expected:
+    if not _running_in_expected_runtime(root, expected):
         msg = (
             f"STOP Interpreter HARD GATE FAIL: sys.executable={actual} "
-            f"!= expected venv python={expected}"
+            f"!= expected runtime python={expected}; sys.prefix={sys.prefix}; "
+            f"VIRTUAL_ENV={os.getenv('VIRTUAL_ENV', '')}; "
+            f"FLASHBACK_DIRECT_BASE_PYTHON={os.getenv('FLASHBACK_DIRECT_BASE_PYTHON', '')}"
         )
         log.error(_ascii_safe(msg))
         raise SystemExit(msg)
 
-    log.info("Interpreter HARD GATE PASS: sys.executable == expected venv python (%s)", str(expected))
+    log.info("Interpreter HARD GATE PASS: sys.executable == expected runtime python (%s)", str(expected))
     return expected
 
 
@@ -237,13 +349,17 @@ def _mp_set_executable(expected_py: Path) -> None:
 def _pin_multiprocessing_executable(expected_py: Path, log) -> None:
     """
     HARD pin spawn executable. If this fails or doesn't stick, STOP.
-    This is the key to preventing system-Python children.
+    This is the key to preventing runtime drift.
     """
+    if os.name != "nt":
+        log.info("Skipping multiprocessing executable pin on non-Windows platform (%s)", os.name)
+        return
+
     try:
         _mp_set_executable(expected_py)
-        log.info("Pinned multiprocessing executable (EXPECTED venv python): %s", str(expected_py))
+        log.info("Pinned multiprocessing executable (expected runtime python): %s", str(expected_py))
     except Exception as e:
-        msg = f"STOP Could not pin multiprocessing executable to expected venv python: {e}"
+        msg = f"STOP Could not pin multiprocessing executable to expected runtime python: {e}"
         log.error(_ascii_safe(msg))
         raise SystemExit(msg)
 
@@ -386,12 +502,18 @@ def _file_first_bool_alias(env_file_vars: Dict[str, str], primary_name: str, ali
     return raw in ("1", "true", "yes", "y", "on")
 
 
+def _file_first_str(env_file_vars: Dict[str, str], name: str, default: str = "") -> str:
+    if name in env_file_vars:
+        return str(env_file_vars[name] or "").strip()
+    return str(os.getenv(name, default) or "").strip()
+
+
 # ---------------------------------------------------------------------------
 # HARD GATE: Config validation (robust import + file fallback)
 # ---------------------------------------------------------------------------
 
 def _run_validator_by_path(root: Path, log, expected_py: Path) -> int:
-    """Fallback: run validate_config.py by file path using expected venv python."""
+    """Fallback: run validate_config.py by file path using expected runtime python."""
     candidate = root / "app" / "tools" / "validate_config.py"
     if not candidate.exists():
         log.error("STOP Config validation missing: %s", candidate)
@@ -401,6 +523,7 @@ def _run_validator_by_path(root: Path, log, expected_py: Path) -> int:
         p = subprocess.run(
             [str(expected_py), str(candidate)],
             cwd=str(root),
+            env=dict(os.environ),
             capture_output=True,
             text=True,
         )
@@ -485,13 +608,22 @@ def _label_ai_stack_allowed(root: Path, log, label: str) -> bool:
         log.warning("Failed to parse %s: %s. Default allow for label=%s", sub_path, e, label)
         return True
 
-    accounts = cfg.get("accounts") or []
-    if not isinstance(accounts, list):
-        return True
+    accounts = []
+
+    accounts_list = cfg.get("accounts")
+    if isinstance(accounts_list, list):
+        accounts = [acc for acc in accounts_list if isinstance(acc, dict)]
+    else:
+        for key, value in cfg.items():
+            if key in ("version", "notes", "legacy"):
+                continue
+            if not isinstance(value, dict):
+                continue
+            entry = dict(value)
+            entry.setdefault("account_label", str(key))
+            accounts.append(entry)
 
     for acc in accounts:
-        if not isinstance(acc, dict):
-            continue
         acc_label = str(acc.get("account_label") or "").strip()
         if not acc_label or acc_label != label:
             continue
@@ -509,6 +641,7 @@ def _label_ai_stack_allowed(root: Path, log, label: str) -> bool:
         log.info("subaccounts.yaml: %s enable_ai_stack=true -> AI stack allowed.", label)
         return True
 
+    log.info("subaccounts.yaml: %s not found; default allow.", label)
     return True
 
 
@@ -529,46 +662,18 @@ def _import_first(log, mod_names: List[str]):
     raise ImportError(f"All imports failed: {mod_names}. Last error: {last_err}")
 
 
-def _run_entry_callable(log, bot_name: str, fn: Callable[..., Any]) -> None:
-    """Run a worker entry callable that might be sync/async/coroutine-returning."""
-    try:
-        if inspect.iscoroutinefunction(fn):
-            log.info("%s entry: async %s()", bot_name, getattr(fn, "__name__", "callable"))
-            asyncio.run(fn())
-            return
-
-        ret = fn()
-        if inspect.iscoroutine(ret):
-            log.info("%s entry: %s() returned coroutine -> asyncio.run()", bot_name, getattr(fn, "__name__", "callable"))
-            asyncio.run(ret)
-            return
-
-        return
-    except RuntimeError as e:
-        msg = _ascii_safe(str(e))
-        log.warning("%s entry: runtime loop issue: %s", bot_name, msg)
-        loop = asyncio.new_event_loop()
-        try:
-            asyncio.set_event_loop(loop)
-            if inspect.iscoroutinefunction(fn):
-                loop.run_until_complete(fn())
-            else:
-                ret2 = fn()
-                if inspect.iscoroutine(ret2):
-                    loop.run_until_complete(ret2)
-        finally:
-            try:
-                loop.close()
-            except Exception:
-                pass
-
-
 def _call_entry(log, module, bot_name: str) -> None:
+    import inspect
+    import asyncio
+
     for fn_name in ("main", "loop", "run"):
         fn = getattr(module, fn_name, None)
         if callable(fn):
             log.info("%s entry: %s.%s()", bot_name, module.__name__, fn_name)
-            _run_entry_callable(log, bot_name, fn)
+            res = fn()
+            # If the entrypoint is async, run it properly.
+            if inspect.iscoroutine(res):
+                asyncio.run(res)
             return
     raise AttributeError(f"{module.__name__} has no callable main/loop/run")
 
@@ -595,7 +700,6 @@ def _run_tp_sl_manager() -> None:
         _call_entry(log, mod, "tp_sl_manager")
     except Exception as e:
         alert_bot_error("tp_sl_manager", f"import/runtime error: {e}", "ERROR")
-
 
 
 def _run_executor_v2() -> None:
@@ -651,10 +755,34 @@ def _run_trade_outcomes() -> None:
     log = _get_logger()
     _, _, alert_bot_error = _load_common(log)
     try:
-        mod = _import_first(log, ["app.ai.trade_outcome_recorder", "app.bots.trade_outcome_recorder"])
+        # IMPORTANT:
+        # Prefer REAL recorder (bots) first. The ai version is a stub/no-op in this repo.
+        mod = _import_first(log, ["app.bots.trade_outcome_recorder", "app.ai.trade_outcome_recorder"])
+
+        # Bulletproof rail: refuse to run the stub silently.
+        if mod.__name__ == "app.ai.trade_outcome_recorder":
+            allow = os.getenv("ALLOW_OUTCOME_STUB", "").strip().lower() in ("1", "true", "yes", "y", "on")
+            if not allow:
+                raise RuntimeError(
+                    "Refusing STUB trade_outcome_recorder import (app.ai.trade_outcome_recorder). "
+                    "Expected app.bots.trade_outcome_recorder. "
+                    "If you *really* want stub behavior, set ALLOW_OUTCOME_STUB=1."
+                )
+            log.warning("ALLOW_OUTCOME_STUB=1 -> running STUB outcomes recorder (no-op).")
+
         _call_entry(log, mod, "trade_outcomes")
     except Exception as e:
         alert_bot_error("trade_outcomes", f"import/runtime error (optional): {e}", "WARN")
+
+
+def _run_ai_events_spine() -> None:
+    log = _get_logger()
+    _, _, alert_bot_error = _load_common(log)
+    try:
+        mod = _import_first(log, ["app.ai.ai_events_spine"])
+        _call_entry(log, mod, "main")
+    except Exception as e:
+        alert_bot_error("ai_events_spine", f"import/runtime error (optional): {e}", "WARN")
 
 
 def _run_paper_price_feeder() -> None:
@@ -672,11 +800,15 @@ def _run_paper_price_feeder() -> None:
 # ---------------------------------------------------------------------------
 
 class WorkerSpec:
-    def __init__(self, name: str, enabled: bool, target: Callable[[], None]) -> None:
+    def __init__(self, name: str, enabled: bool, command_parts: List[str]) -> None:
         self.name = name
         self.enabled = enabled
-        self.target = target
-        self.process: Optional[mp.Process] = None
+        self.command_parts = list(command_parts)
+        self.process: Optional[subprocess.Popen[str]] = None
+        self.stdout_handle: Optional[Any] = None
+        self.stderr_handle: Optional[Any] = None
+        self.stdout_path: Optional[Path] = None
+        self.stderr_path: Optional[Path] = None
         self.restart_count: int = 0
         self.last_restart_ms: int = 0
         self.last_exitcode: Optional[int] = None
@@ -692,18 +824,36 @@ def _build_worker_specs(env_file_vars: Dict[str, str]) -> Dict[str, WorkerSpec]:
     journal = _file_first_bool(env_file_vars, "AI_STACK_ENABLE_AI_JOURNAL", "false")
     risk = _file_first_bool(env_file_vars, "AI_STACK_ENABLE_RISK_DAEMON", "false")
     outcomes = _file_first_bool(env_file_vars, "AI_STACK_ENABLE_TRADE_OUTCOMES", "true")
-    paper = _file_first_bool_alias(env_file_vars, "AI_STACK_ENABLE_PAPER_PRICE_FEEDER", "AI_STACK_ENABLE_PAPER_TICK_DAEMON", "true")
+    spine = _file_first_bool(env_file_vars, "AI_STACK_ENABLE_AI_EVENTS_SPINE", "true")
+    paper = _file_first_bool_alias(env_file_vars, "AI_STACK_ENABLE_PAPER_PRICE_FEEDER", "AI_STACK_ENABLE_PAPER_TICK_DAEMON", "false")
 
     return {
-        "ws_switchboard": WorkerSpec("ws_switchboard", ws, _run_ws_switchboard),
-        "executor_v2": WorkerSpec("executor_v2", execv2, _run_executor_v2),
-        "tp_sl_manager": WorkerSpec("tp_sl_manager", tp, _run_tp_sl_manager),
-        "ai_pilot": WorkerSpec("ai_pilot", pilot, _run_ai_pilot),
-        "ai_action_router": WorkerSpec("ai_action_router", router, _run_ai_action_router),
-        "ai_journal": WorkerSpec("ai_journal", journal, _run_ai_journal),
-        "risk_daemon": WorkerSpec("risk_daemon", risk, _run_risk_daemon),
-        "trade_outcomes": WorkerSpec("trade_outcomes", outcomes, _run_trade_outcomes),
-        "paper_price_feeder": WorkerSpec("paper_price_feeder", paper, _run_paper_price_feeder),
+        "ws_switchboard": WorkerSpec("ws_switchboard", ws, ["-u", "-m", "app.core.ws_switchboard"]),
+        "executor_v2": WorkerSpec("executor_v2", execv2, ["-u", "-m", "app.bots.executor_v2"]),
+        "tp_sl_manager": WorkerSpec("tp_sl_manager", tp, ["-u", "-m", "app.bots.tp_sl_manager"]),
+        "ai_pilot": WorkerSpec("ai_pilot", pilot, ["-u", "-m", "app.bots.ai_pilot"]),
+        "ai_action_router": WorkerSpec(
+            "ai_action_router",
+            router,
+            [
+                "-u",
+                "-c",
+                "from app.core.ai_action_router import execsignal_queue_router_main as _fb_run; _fb_run()",
+            ],
+        ),
+        "ai_journal": WorkerSpec(
+            "ai_journal",
+            journal,
+            [
+                "-u",
+                "-c",
+                "from app.bots.supervisor_ai_stack import _run_ai_journal as _fb_run; _fb_run()",
+            ],
+        ),
+        "risk_daemon": WorkerSpec("risk_daemon", risk, ["-u", "-m", "app.bots.risk_daemon"]),
+        "trade_outcomes": WorkerSpec("trade_outcomes", outcomes, ["-u", "-m", "app.bots.trade_outcome_recorder"]),
+        "ai_events_spine": WorkerSpec("ai_events_spine", spine, ["-u", "-m", "app.ai.ai_events_spine"]),
+        "paper_price_feeder": WorkerSpec("paper_price_feeder", paper, ["-u", "-m", "app.sim.paper_price_feeder"]),
     }
 
 
@@ -721,31 +871,69 @@ def _should_alert(last_alert_ms: int, min_interval_sec: int) -> bool:
 # Supervisor core
 # ---------------------------------------------------------------------------
 
-def _start_worker(log, spec: WorkerSpec, expected_py: Path) -> None:
-    if spec.process is not None and spec.process.is_alive():
+def _worker_is_alive(spec: WorkerSpec) -> bool:
+    return spec.process is not None and spec.process.poll() is None
+
+
+def _worker_pid(spec: WorkerSpec) -> Optional[int]:
+    return spec.process.pid if spec.process is not None else None
+
+
+def _worker_command(spec: WorkerSpec, expected_py: Path) -> List[str]:
+    return [str(expected_py), *spec.command_parts]
+
+
+def _worker_logs_dir(account_label: str) -> Path:
+    logs_dir = _ROOT / "state" / "orchestrator_logs" / "workers" / str(account_label or "main")
+    logs_dir.mkdir(parents=True, exist_ok=True)
+    return logs_dir
+
+
+def _close_worker_log_handles(spec: WorkerSpec) -> None:
+    for handle_name in ("stdout_handle", "stderr_handle"):
+        handle = getattr(spec, handle_name, None)
+        try:
+            if handle is not None:
+                handle.flush()
+                handle.close()
+        except Exception:
+            pass
+        setattr(spec, handle_name, None)
+
+
+def _start_worker(log, spec: WorkerSpec, expected_py: Path, account_label: str) -> None:
+    if _worker_is_alive(spec):
         return
 
-    # Pre-spawn hard check every single time
-    try:
-        got = _mp_get_executable()
-    except Exception as e:
-        msg = f"STOP get_executable read failed right before spawn: {e}"
+    if not expected_py.exists():
+        msg = f"STOP Refusing to start worker {spec.name}: missing runtime python {expected_py}"
         log.error(_ascii_safe(msg))
         raise SystemExit(msg)
 
-    if got != expected_py.resolve():
-        msg = (
-            f"STOP Refusing to spawn worker {spec.name}: "
-            f"get_executable()={got} expected={expected_py.resolve()}"
-        )
-        log.error(_ascii_safe(msg))
-        raise SystemExit(msg)
+    _close_worker_log_handles(spec)
+    worker_logs_dir = _worker_logs_dir(account_label)
+    spec.stdout_path = worker_logs_dir / f"{spec.name}.stdout.log"
+    spec.stderr_path = worker_logs_dir / f"{spec.name}.stderr.log"
+    spec.stdout_handle = open(spec.stdout_path, "a", encoding="utf-8", errors="replace")
+    spec.stderr_handle = open(spec.stderr_path, "a", encoding="utf-8", errors="replace")
 
     log.info("Starting worker %s ...", spec.name)
-    log.info("ABOUT TO SPAWN | sys.executable=%s | get_executable=%s", str(Path(sys.executable).resolve()), str(got))
+    log.info(
+        "ABOUT TO SPAWN | sys.executable=%s | worker_python=%s | worker_stdout=%s | worker_stderr=%s",
+        str(_current_python_executable()),
+        str(expected_py),
+        str(spec.stdout_path),
+        str(spec.stderr_path),
+    )
 
-    p = mp.Process(target=spec.target, name=f"fb_{spec.name}", daemon=False)
-    p.start()
+    p = subprocess.Popen(
+        _worker_command(spec, expected_py),
+        cwd=str(_ROOT),
+        env=dict(os.environ),
+        text=True,
+        stdout=spec.stdout_handle,
+        stderr=spec.stderr_handle,
+    )
     spec.process = p
     log.info("Worker %s started with pid=%s", spec.name, p.pid)
 
@@ -753,10 +941,12 @@ def _start_worker(log, spec: WorkerSpec, expected_py: Path) -> None:
 def _stop_worker(log, spec: WorkerSpec) -> None:
     p = spec.process
     if p is None:
+        _close_worker_log_handles(spec)
         return
 
-    if not p.is_alive():
+    if p.poll() is not None:
         spec.process = None
+        _close_worker_log_handles(spec)
         return
 
     log.info("Stopping worker %s (pid=%s) ...", spec.name, p.pid)
@@ -766,17 +956,18 @@ def _stop_worker(log, spec: WorkerSpec) -> None:
         pass
 
     try:
-        p.join(timeout=10)
+        p.wait(timeout=10)
     except Exception:
         pass
 
-    if p.is_alive():
+    if p.poll() is None:
         try:
-            os.kill(p.pid, signal.SIGKILL)  # type: ignore[arg-type]
+            p.kill()
         except Exception:
             pass
 
     spec.process = None
+    _close_worker_log_handles(spec)
     log.info("Worker %s stopped.", spec.name)
 
 
@@ -797,9 +988,28 @@ def _supervisor_loop(root: Path, account_label: str, poll_seconds: int, env_file
         raise SystemExit(msg)
 
     specs = _build_worker_specs(env_file_vars)
+    lane_mode = str(os.getenv("FB_MODE") or os.getenv("MODE") or "").strip().upper()
+    fleet_risk_owner = _file_first_str(env_file_vars, "FLEET_RISK_OWNER_LABEL", "flashback01") or "flashback01"
+    fleet_risk_owner = fleet_risk_owner.strip().lower()
+    if specs["risk_daemon"].enabled and str(account_label or "").strip().lower() != fleet_risk_owner:
+        specs["risk_daemon"].enabled = False
+        log.info(
+            "Disabling risk_daemon for label=%s; fleet risk owner is %s",
+            account_label,
+            fleet_risk_owner,
+        )
+    if lane_mode and lane_mode != "LIVE" and specs["trade_outcomes"].enabled:
+        specs["trade_outcomes"].enabled = False
+        log.info(
+            "Disabling trade_outcomes for label=%s; lane mode is %s and paper lanes now write canonical outcomes directly.",
+            account_label,
+            lane_mode,
+        )
+    if not specs["paper_price_feeder"].enabled:
+        log.info("paper_price_feeder disabled for label=%s; stub worker is no longer launched by default.", account_label)
 
     log.info(
-        "Flags (file-first): WS=%s EXEC=%s TP/SL=%s PILOT=%s ROUTER=%s RISK=%s OUTCOMES=%s PAPER_FEED=%s",
+        "Flags (file-first): WS=%s EXEC=%s TP/SL=%s PILOT=%s ROUTER=%s RISK=%s OUTCOMES=%s SPINE=%s PAPER_FEED=%s",
         specs["ws_switchboard"].enabled,
         specs["executor_v2"].enabled,
         specs["tp_sl_manager"].enabled,
@@ -807,6 +1017,7 @@ def _supervisor_loop(root: Path, account_label: str, poll_seconds: int, env_file
         specs["ai_action_router"].enabled,
         specs["risk_daemon"].enabled,
         specs["trade_outcomes"].enabled,
+        specs["ai_events_spine"].enabled,
         specs["paper_price_feeder"].enabled,
     )
 
@@ -846,16 +1057,16 @@ def _supervisor_loop(root: Path, account_label: str, poll_seconds: int, env_file
                 enabled_names.append(name)
 
             if not spec.enabled:
-                if spec.process is not None and spec.process.is_alive():
+                if _worker_is_alive(spec):
                     log.info("Worker %s disabled -> stopping.", name)
                     _stop_worker(log, spec)
                 _ops_write(f"worker_{name}", account_label, True, {"enabled": False, "state": "disabled"})
                 continue
 
-            alive = (spec.process is not None and spec.process.is_alive())
+            alive = _worker_is_alive(spec)
             if not alive:
                 if spec.process is not None:
-                    spec.last_exitcode = spec.process.exitcode
+                    spec.last_exitcode = spec.process.returncode
                     spec.restart_count += 1
                     spec.last_restart_ms = _now_ms()
                     spec.last_reason = f"died exitcode={spec.last_exitcode}"
@@ -870,10 +1081,10 @@ def _supervisor_loop(root: Path, account_label: str, poll_seconds: int, env_file
                 else:
                     spec.last_reason = "not_started"
 
-                _start_worker(log, spec, expected_py)
+                _start_worker(log, spec, expected_py, account_label)
 
-            alive = (spec.process is not None and spec.process.is_alive())
-            pid = spec.process.pid if spec.process is not None else None
+            alive = _worker_is_alive(spec)
+            pid = _worker_pid(spec)
             if alive:
                 running_names.append(name)
             else:
@@ -891,6 +1102,8 @@ def _supervisor_loop(root: Path, account_label: str, poll_seconds: int, env_file
                     "restart_count": spec.restart_count,
                     "last_restart_ms": spec.last_restart_ms,
                     "last_reason": spec.last_reason,
+                    "stdout_log": str(spec.stdout_path) if spec.stdout_path else None,
+                    "stderr_log": str(spec.stderr_path) if spec.stderr_path else None,
                 },
             )
 
@@ -958,4 +1171,3 @@ if __name__ == "__main__":
     except Exception:
         pass
     main()
-
